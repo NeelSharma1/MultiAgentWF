@@ -1,0 +1,24 @@
+[project]
+name = "multi-agent-workspace"
+version = "0.1.0"
+description = "MCP-backed workspace for a team of specialized AI agents"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "mcp[cli]>=1.9",
+  "openai-agents>=0.2",
+  "openai>=2.45",
+  "python-dotenv>=1.0",
+  "python-multipart>=0.0.20",
+  "httpx>=0.28",
+  "PyYAML>=6.0",
+  "pyte>=0.8.2",
+  "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

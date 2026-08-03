@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Team Workspace</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260802-24">
+  <style>.header-actions{display:flex;gap:10px;align-items:center}.model-row{display:flex;gap:8px}.model-row select{flex:1;min-width:0}.compact{width:auto;margin:0}.chat-overrides{display:flex;gap:10px;padding:8px 28px 0;border-top:1px solid var(--line)}.chat-overrides label{margin:0;min-width:190px}.chat-overrides select{padding:7px;font-size:11px}.divider{border-top:1px solid var(--line);margin:22px 0 0;text-align:center}.divider span{position:relative;top:-11px;background:white;padding:0 9px;color:var(--muted);font-size:11px}#agent-form{padding:24px}.connections-wrap{padding:24px}.connections-intro{color:var(--muted);margin:8px 0 18px}.connection-card{display:grid;grid-template-columns:1fr auto;gap:16px;border-top:1px solid var(--line);padding:16px 0}.connection-card h3{margin:0}.connection-card p{color:var(--muted);font-size:12px}.connection-card>div:last-child{display:flex;align-items:center;gap:7px}.connection-card input{margin-top:9px;width:100%}.connection-state{font-size:10px;text-transform:uppercase}.connection-state.connected{color:var(--green)}#codex-login-output{white-space:pre-wrap;font-size:11px;max-width:390px;background:#f3f5f2;padding:8px;border-radius:6px;display:none}</style>
+</head>
+<body>
+  <header><div class="brand" id="home-button"><span class="brand-mark">M</span><div><span class="eyebrow">MCP workspace</span><h1>MultiAgent</h1></div></div><div class="header-actions"><button id="skills-button" class="settings-button">Skills</button><button id="connections-button" class="settings-button">Accounts</button><span id="status" class="status">Connecting…</span></div></header>
+  <section id="dashboard" class="dashboard">
+    <aside class="project-rail"><div class="rail-title"><span class="eyebrow">Workspaces</span><button id="new-project" title="New project">＋</button></div><nav id="projects"></nav></aside>
+    <div class="project-main">
+      <div class="project-heading"><div><span class="eyebrow">Agent command structure</span><h2 id="project-name">Your team</h2><p id="project-description">Drag agents to rearrange the flow. Change “reports to” to redraw relationships.</p></div><div><button id="add-agent-dashboard" class="settings-button">＋ Agent</button><button id="open-workspace">Open workspace →</button></div></div>
+      <div id="flowchart" class="flowchart"><svg id="flow-lines" aria-hidden="true"></svg><div id="flow-nodes"></div><div class="flow-help">Blue square: commands (solid) · green dot: reports to (dotted) · drag either onto any agent</div></div>
+    </div>
+  </section>
+  <div id="agent-context-menu" class="agent-context-menu hidden" role="menu">
+    <button data-agent-action="runtime">⚙ Change provider / model</button>
+    <button data-agent-action="template">▣ Save description as template</button>
+    <button data-agent-action="delete" class="delete-action">⌫ Remove agent</button>
+  </div>
+  <main id="workspace" class="workspace hidden">
+    <aside>
+      <h2>Team members</h2>
+      <nav id="agents"></nav>
+      <button id="new-agent" class="secondary">＋ Add team member</button>
+      <button id="new-context" class="secondary">＋ Add shared context</button>
+    </aside>
+    <section class="chat-panel">
+      <div class="agent-heading"><div id="avatar" class="avatar">O</div><div class="agent-copy"><div class="name-row"><h2 id="agent-name">Orchestrator</h2><span id="runtime-badge" class="runtime-badge"></span></div><p id="agent-brief"></p><small id="agent-skills" class="agent-skills"></small></div><button id="runtime-settings" class="settings-button">⚙ Runtime</button></div>
+      <div id="messages" class="messages"><div class="empty"><strong>Start a conversation</strong><span>Each team member remembers their own thread, receives team commands and reports, and can read shared MCP context.</span></div></div>
+      <div id="chat-activity" class="chat-activity hidden" role="status" aria-live="polite"></div>
+      <div class="chat-overrides"><label>Chat model<select id="chat-model"><option value="">Agent default</option></select></label><label>Effort<select id="chat-effort"><option value="">Agent default</option></select></label></div>
+      <div id="reply-preview" class="reply-preview hidden"><div><span>Replying to</span><strong id="reply-author"></strong><p id="reply-text"></p></div><button id="cancel-reply" type="button" title="Cancel reply">×</button></div>
+      <div id="attachment-tray" class="attachment-tray hidden"></div>
+      <form id="chat-form"><button type="button" id="attach-button" class="attach-button" title="Attach files">＋</button><input id="attachment-input" type="file" multiple hidden><div class="composer"><textarea id="message" placeholder="Message this agent… Type / for commands" required></textarea><div id="command-menu" class="command-menu hidden"></div></div><button id="send-button" type="submit">Send <span>↗</span></button></form>
+    </section>
+    <aside class="context-panel">
+      <div class="context-title"><div><span class="eyebrow">Team memory</span><h2>Shared context</h2></div><span id="context-count">0</span></div>
+      <div id="context-list"></div>
+    </aside>
+  </main>
+  <dialog id="project-dialog">
+    <form id="project-form"><div class="dialog-head"><div><span class="eyebrow">New workspace</span><h2>Create project</h2></div><button type="button" id="close-project" class="icon">×</button></div>
+      <label>Name<input id="project-name-input" required maxlength="120" placeholder="Website redesign"></label>
+      <label>Folder path<input id="project-path-input" placeholder="/Users/you/Projects/website"><small>Optional reference to the local working folder. The app will not create or modify it.</small></label>
+      <label>Description<textarea id="project-description-input" rows="4" placeholder="What this team is working on"></textarea></label>
+      <div class="dialog-actions"><span></span><button type="submit">Create project</button></div>
+    </form>
+  </dialog>
+  <dialog id="context-dialog">
+    <form id="context-form"><input type="hidden" id="context-id"><div class="dialog-head"><h2>Shared context</h2><button type="button" id="close-dialog" class="icon">×</button></div>
+      <label>Title<input id="context-title-input" maxlength="200" required></label>
+      <label>Content<textarea id="context-content" rows="9" required></textarea></label>
+      <fieldset><legend>Visible to</legend><p>Choose none to share with everyone.</p><div id="role-checks"></div></fieldset>
+      <div class="dialog-actions"><button type="button" id="delete-context" class="danger">Delete</button><button type="submit">Save context</button></div>
+    </form>
+  </dialog>
+  <dialog id="runtime-dialog">
+    <form id="runtime-form"><div class="dialog-head"><div><span class="eyebrow">Agent runtime</span><h2 id="runtime-title">Configure agent</h2></div><button type="button" id="close-runtime" class="icon">×</button></div>
+      <label>Provider<select id="provider-select" required></select></label>
+      <div id="provider-help" class="provider-help"></div>
+      <label id="model-field">Model<div class="model-row"><select id="model-input" required><option>Choose a provider first</option></select><button type="button" id="load-models" class="secondary compact">Refresh</button></div></label>
+      <label id="effort-field">Default reasoning effort<select id="effort-input"><option value="">Model default</option></select></label>
+      <label id="base-url-field">OpenAI-compatible base URL<input id="base-url-input" type="url" placeholder="http://192.168.1.20:11434/v1"></label>
+      <label id="key-env-field">API key environment variable<input id="key-env-input" placeholder="LOCAL_API_KEY"><small>The secret stays in .env.local; only this variable name is stored.</small></label>
+      <div class="runtime-notice">Changing runtime preserves the agent's conversation transcript. Tool calling requires the selected model and endpoint to support OpenAI-style function tools.</div>
+      <div class="dialog-actions"><button type="button" id="clear-history" class="danger">Clear conversation</button><button type="submit">Save runtime</button></div>
+    </form>
+  </dialog>
+  <dialog id="agent-dialog">
+    <form id="agent-form"><div class="dialog-head"><div><span class="eyebrow">Team design</span><h2>Add team member</h2></div><button type="button" id="close-agent" class="icon">×</button></div>
+      <label>Generate role with Codex<textarea id="agent-prompt" rows="3" placeholder="Example: A security architect who threat-models designs and writes mitigations"></textarea></label>
+      <button type="button" id="generate-agent" class="secondary">Generate role draft</button>
+      <label>Start from saved template<select id="agent-template-select"><option value="">No template</option></select></label>
+      <div class="divider"><span>or define manually</span></div>
+      <label>Name<input id="agent-name-input" required placeholder="Security Architect"></label>
+      <label>Role ID<input id="agent-role-input" placeholder="security_architect"><small>Optional; generated from the name if blank.</small></label>
+      <label>Role summary<input id="agent-brief-input" required placeholder="Threat-models designs and identifies mitigations."></label>
+      <label>Detailed instructions<textarea id="agent-instructions-input" rows="7" required></textarea></label>
+      <div class="dialog-actions"><span></span><button type="submit">Add to team</button></div>
+    </form>
+  </dialog>
+  <dialog id="skills-dialog">
+    <div class="skills-shell"><div class="dialog-head"><div><span class="eyebrow">Portable Agent Skills</span><h2>ACP skills library</h2><p class="skills-intro">Skills are stored as portable <code>SKILL.md</code> packages with optional resources and OS-specific versions.</p></div><div class="skills-heading-actions"><button type="button" id="open-skill-marketplace" class="secondary compact">Marketplace</button><button type="button" id="new-skill" class="secondary compact">＋ New</button><button type="button" id="close-skills" class="icon">×</button></div></div>
+      <div class="skills-layout"><aside class="skills-library"><div class="skills-library-head"><strong>Library</strong><span id="skills-count">0</span></div><input id="skill-library-search" class="skill-library-search" type="search" placeholder="Search installed skills"><div class="skill-library-filters"><select id="skill-library-type"><option value="">All types</option><option value="development">Development</option><option value="research">Research</option><option value="documentation">Documentation</option><option value="automation">Automation</option><option value="data">Data</option><option value="security">Security</option><option value="ai-agents">AI / Agents</option><option value="other">Other</option></select><select id="skill-library-sort"><option value="name">Name</option><option value="type">Type</option><option value="recent">Recently updated</option><option value="source">Source</option></select></div><div id="skills-list"></div></aside><section class="skill-editor"><form id="skill-form"><input type="hidden" id="skill-id"><label>Generate an ACP skill from a prompt<textarea id="skill-prompt" rows="2" placeholder="Example: Extract action items from a meeting transcript and return JSON"></textarea></label><button type="button" id="generate-skill" class="secondary">Generate draft with Codex</button><div class="divider"><span>SKILL.md package</span></div><div class="skill-form-grid"><label>Display name<input id="skill-name" required maxlength="120" placeholder="Meeting Action Items"></label><label>ACP name / folder ID<input id="skill-slug" maxlength="80" placeholder="meeting-action-items"></label></div><div class="skill-form-grid"><label>Version<input id="skill-version" maxlength="64" value="1.0.0" placeholder="1.0.0"></label><label>Type<select id="skill-type"><option value="general">General</option><option value="development">Development</option><option value="research">Research</option><option value="documentation">Documentation</option><option value="automation">Automation</option><option value="data">Data</option><option value="security">Security</option><option value="ai-agents">AI / Agents</option><option value="other">Other</option></select></label></div><label>Description<textarea id="skill-summary" rows="2" required maxlength="2000" placeholder="What this skill does and when an agent should use it."></textarea></label><div class="skill-form-grid"><label>Language<select id="skill-language"><option value="none">Instructions only</option><option value="python">Python</option><option value="javascript">JavaScript / Node</option><option value="shell">POSIX shell</option><option value="powershell">PowerShell</option><option value="ruby">Ruby</option><option value="batch">Windows batch</option></select></label><label>Output format<select id="skill-output-format"><option value="text">Text</option><option value="markdown">Markdown</option><option value="json">JSON</option><option value="diff">Git diff</option><option value="table">Table</option><option value="code">Code</option></select></label></div><div class="skill-form-grid"><label>Compatibility<input id="skill-compatibility" maxlength="500" placeholder="Requires git and Python 3.11+"></label><label>License<input id="skill-license" maxlength="200" placeholder="Apache-2.0"></label></div><label>Assigned agents<small>Choose which agents can use this package in the current workspace.</small><div id="skill-agent-checks" class="skill-agent-checks"></div><div class="skill-form-grid"><label>Inputs (JSON schema)<textarea id="skill-inputs" rows="6" spellcheck="false">{}</textarea></label><label>Outputs (JSON schema)<textarea id="skill-outputs" rows="6" spellcheck="false">{}</textarea></label></div><label>Instructions (SKILL.md body)<textarea id="skill-body" rows="9" spellcheck="false" placeholder="# Skill instructions\n\nExplain the workflow and when to use it."></textarea></label><label>Default executable helper<small>Optional. Read one JSON object from stdin or <code>SKILL_INPUT_JSON</code>; print one JSON value to stdout.</small><textarea id="skill-script" rows="9" spellcheck="false" placeholder="import json, sys\ninputs = json.load(sys.stdin)\nprint(json.dumps({\"result\": inputs}))"></textarea><label>OS / version variants (JSON)<small>Keys can be <code>macos</code>, <code>linux</code>, <code>windows</code>, or <code>any</code>. Each value may override version, language, script, body, and schemas.</small><textarea id="skill-platform-variants" rows="6" spellcheck="false">{}</textarea><div class="skill-run-panel"><div><strong>Try this skill</strong><p>Run the selected OS/version helper for an assigned agent.</p></div><select id="skill-run-agent"><option value="">Choose an assigned agent</option></select><textarea id="skill-run-inputs" rows="3" spellcheck="false">{}</textarea><button type="button" id="skill-run" class="secondary">▶ Run skill</button></div><div class="dialog-actions"><button type="button" id="skill-delete" class="danger">Delete skill</button><span></span><button type="submit">Save ACP skill</button></div></form></section></div></div>
+  </dialog>
+  <dialog id="skills-marketplace-dialog"><div class="skills-marketplace-shell"><div class="dialog-head"><div><span class="eyebrow">Community catalog</span><h2>ACP skill marketplace</h2><p class="skills-intro">Search portable SKILL.md packages and import a reviewed copy into your local library.</p></div><button type="button" id="close-skill-marketplace" class="icon">×</button></div><div class="marketplace-search-row"><input id="marketplace-query" type="search" placeholder="Search git, testing, research…"><select id="marketplace-category"><option value="">All types</option><option value="data-ai">Data / AI</option><option value="devops">DevOps</option><option value="frontend">Frontend</option><option value="backend">Backend</option><option value="security">Security</option><option value="automation-tools">Automation</option></select><select id="marketplace-sort"><option value="stars">Most starred</option><option value="recent">Recently updated</option></select><button type="button" id="marketplace-search-button">Search</button></div><p id="marketplace-status" class="marketplace-status"></p><div id="marketplace-results" class="marketplace-results"></div></div></dialog>
+  <dialog id="code-terminal-dialog">
+    <div class="code-terminal-wrap"><div class="dialog-head"><div><span class="eyebrow">Local terminal</span><h2>Code output</h2><p id="code-terminal-meta"></p></div><div class="code-terminal-heading-actions"><span id="code-terminal-status" class="code-terminal-status"></span><button type="button" id="close-code-terminal" class="icon">×</button></div></div><pre id="code-terminal-output" class="code-terminal-output"></pre></div>
+  </dialog>
+  <dialog id="connections-dialog">
+    <div class="connections-wrap"><div class="dialog-head"><div><span class="eyebrow">Authentication</span><h2>Provider accounts</h2></div><button type="button" id="close-connections" class="icon">×</button></div>
+      <p class="connections-intro">Credentials stay on this laptop and are never returned to the browser after saving.</p>
+      <section class="connection-card"><div><h3>Codex</h3><p>Uses your ChatGPT Codex subscription through device authorization.</p><pre id="codex-login-output"></pre></div><div><span id="codex-connection" class="connection-state"></span><button id="connect-codex">Connect</button><button id="disconnect-codex" class="danger">Disconnect</button></div></section>
+      <section class="connection-card"><div><h3>OpenAI API</h3><p>Used by agents configured for the OpenAI provider.</p><input id="openai-credential" type="password" autocomplete="off" placeholder="Paste a replacement key locally"></div><div><span id="openai-connection" class="connection-state"></span><button data-connect="openai">Save key</button><button data-disconnect="openai" class="danger">Remove</button></div></section>
+      <section class="connection-card"><div><h3>Google Gemini</h3><p>Use a Gemini auth key from Google AI Studio.</p><input id="google-credential" type="password" autocomplete="off" placeholder="Paste key locally"></div><div><span id="google-connection" class="connection-state"></span><button data-connect="google">Save key</button><button data-disconnect="google" class="danger">Remove</button></div></section>
+      <section class="connection-card"><div><h3>Anthropic Claude</h3><p>Use an API key from the Anthropic Console.</p><input id="anthropic-credential" type="password" autocomplete="off" placeholder="Paste key locally"></div><div><span id="anthropic-connection" class="connection-state"></span><button data-connect="anthropic">Save key</button><button data-disconnect="anthropic" class="danger">Remove</button></div></section>
+      <section class="connection-card"><div><h3>OpenAI-compatible endpoint</h3><p>Optional key for Ollama, LM Studio, vLLM, or a remote compatible server.</p><input id="compatible-credential" type="password" autocomplete="off" placeholder="Paste local/remote server key"></div><div><span id="compatible-connection" class="connection-state"></span><button data-connect="compatible">Save key</button><button data-disconnect="compatible" class="danger">Remove</button></div></section>
+    </div>
+  </dialog>
+  <script src="/static/app.js?v=20260802-29"></script>
+</body>
+</html>
