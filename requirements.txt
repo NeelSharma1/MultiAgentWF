@@ -1,0 +1,10 @@
+fastapi>=0.115
+mcp[cli]>=1.9
+openai-agents>=0.2
+openai>=2.45
+python-dotenv>=1.0
+python-multipart>=0.0.20
+httpx>=0.28
+PyYAML>=6.0
+pyte>=0.8.2
+uvicorn[standard]>=0.34
