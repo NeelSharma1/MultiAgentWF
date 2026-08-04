@@ -223,6 +223,92 @@ class GitWorkflowStore:
             "identity": {"name": user_name, "email": user_email}, "configuration": configuration,
         }
 
+    def overview(self, project_id: int, project_root: Path, agents: list[dict[str, str]]) -> dict[str, Any]:
+        """Return branch, worktree, and per-agent Git state for the version-control UI."""
+        result = self.status(project_id, project_root)
+        repository = self._repository(project_root)
+        if repository is None:
+            return {**result, "branches": [], "worktrees": [], "agents": []}
+        configuration = self.configuration(project_id) or {}
+        main_branch = self._main_branch(configuration) if configuration else ""
+        current = result["current_branch"]
+        branches: list[dict[str, Any]] = []
+        refs = self._run(
+            repository, "for-each-ref",
+            "--format=%(refname:short)\t%(objectname:short)\t%(upstream:short)\t%(HEAD)", "refs/heads",
+        ).stdout
+        for line in refs.splitlines():
+            name, short_hash, upstream, head = (line.split("\t") + ["", "", "", ""])[:4]
+            if not name:
+                continue
+            branches.append({
+                "name": name, "head": short_hash, "upstream": upstream, "current": head == "*" or name == current,
+                "main": name == main_branch,
+            })
+        worktrees: list[dict[str, Any]] = []
+        for block in self._run(repository, "worktree", "list", "--porcelain").stdout.strip().split("\n\n"):
+            if not block.strip():
+                continue
+            item: dict[str, Any] = {"path": "", "head": "", "branch": "", "detached": False}
+            for line in block.splitlines():
+                key, _, value = line.partition(" ")
+                if key == "worktree": item["path"] = value
+                elif key == "HEAD": item["head"] = value[:12]
+                elif key == "branch": item["branch"] = value.removeprefix("refs/heads/")
+                elif key == "detached": item["detached"] = True
+            item["primary"] = Path(item["path"]).resolve() == repository
+            worktrees.append(item)
+        agent_items: list[dict[str, Any]] = []
+        for agent in agents:
+            role = str(agent["role"])
+            branch = self._agent_branch(repository, role)
+            exists = self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
+            merged = bool(main_branch and exists and self._run(
+                repository, "merge-base", "--is-ancestor", f"refs/heads/{branch}", f"refs/heads/{main_branch}", check=False,
+            ).returncode == 0)
+            agent_items.append({
+                "role": role, "name": str(agent.get("name") or role), "enabled": self.agent_enabled(project_id, role),
+                "branch": branch, "branch_exists": exists, "merged_into_main": merged,
+            })
+        return {**result, "branches": branches, "worktrees": worktrees, "agents": agent_items}
+
+    def create_branch(self, project_id: int, project_root: Path, name: str, source: str = "") -> dict[str, str]:
+        repository = self._repository(project_root)
+        if repository is None:
+            raise GitWorkflowError("This project folder is not a Git repository")
+        branch = self._validate_branch(repository, name)
+        if self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
+            raise GitWorkflowError(f"Branch '{branch}' already exists")
+        configuration = self.configuration(project_id) or {}
+        base = str(source or self._main_branch(configuration) or self._run(repository, "branch", "--show-current").stdout.strip())
+        base = self._validate_branch(repository, base)
+        if self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{base}", check=False).returncode:
+            raise GitWorkflowError(f"Source branch '{base}' does not exist")
+        self._run(repository, "branch", branch, f"refs/heads/{base}")
+        return {"branch": branch, "source": base}
+
+    def checkout_branch(self, project_id: int, project_root: Path, name: str) -> dict[str, Any]:
+        configuration, repository = self._configured_repository(project_id, project_root)
+        branch = self._validate_branch(repository, name)
+        if self._run(repository, "status", "--porcelain").stdout.strip():
+            raise GitWorkflowError("Commit, stash, or discard working-tree changes before switching branches")
+        if self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode:
+            raise GitWorkflowError(f"Branch '{branch}' does not exist")
+        self._run(repository, "checkout", "--no-guess", branch)
+        return {"branch": branch, "main_branch": self._main_branch(configuration)}
+
+    def delete_branch(self, project_id: int, project_root: Path, name: str) -> dict[str, str]:
+        configuration, repository = self._configured_repository(project_id, project_root)
+        branch = self._validate_branch(repository, name)
+        if branch == self._main_branch(configuration):
+            raise GitWorkflowError("The configured main branch cannot be deleted")
+        if self._run(repository, "branch", "--show-current").stdout.strip() == branch:
+            raise GitWorkflowError("Check out another branch before deleting this branch")
+        if self.agent_enabled(project_id, branch):
+            raise GitWorkflowError("Disable this agent's Git workflow before deleting its branch")
+        self._run(repository, "branch", "-d", branch)
+        return {"deleted": branch}
+
     def _configured_repository(self, project_id: int, project_root: Path) -> tuple[dict[str, Any], Path]:
         configuration = self.configuration(project_id)
         if not configuration:

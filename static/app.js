@@ -49,6 +49,8 @@ const state={
   activeToolsetSlug: null,
   toolsetSearch: '',
   gitStatus: null,
+  gitOverview: null,
+  selectedVersionBranch: '',
   pendingGitAgent: null,
   pendingGitEnableAgent: null,
   marketplace: [],
@@ -654,6 +656,77 @@ async function openGitChanges(){
   const status=await loadGitStatus();
   renderGitChanges(status);
   if(!$('#git-changes-dialog').open)$('#git-changes-dialog').showModal()
+}
+async function loadVersionControl(){
+  if(!state.project)return null;
+  state.gitOverview=await api(`/api/projects/${state.project.id}/git/overview`);
+  renderVersionControl(state.gitOverview);
+  return state.gitOverview
+}
+function selectVersionBranch(name){
+  state.selectedVersionBranch=name;
+  renderVersionControl(state.gitOverview)
+}
+function renderVersionControl(data){
+  const status=$('#version-control-status'), topology=$('#worktree-topology'), branches=$('#version-branch-list'), agents=$('#version-agent-list'), source=$('#version-branch-source');
+  if(!data?.is_repository){
+    status.textContent='This project folder is not a Git repository. Configure Git to initialize it or add a remote.';
+    topology.innerHTML='<div class="version-empty">No repository topology is available.</div>';
+    branches.innerHTML=''; agents.innerHTML=''; source.innerHTML=''; return
+  }
+  status.textContent=`${data.repository} / current ${data.current_branch||'(detached HEAD)'}${data.main_branch?` / main ${data.main_branch}`:''}${data.clean?' / clean':' / uncommitted changes'}`;
+  const branchItems=data.branches||[];
+  if(!state.selectedVersionBranch||!branchItems.some(item=>item.name===state.selectedVersionBranch))state.selectedVersionBranch=data.current_branch||data.main_branch||branchItems[0]?.name||'';
+  topology.innerHTML='';
+  const diagram=document.createElement('div'); diagram.className='worktree-diagram';
+  const worktreeColumn=document.createElement('div'); worktreeColumn.className='worktree-column';
+  (data.worktrees||[]).forEach(item=>{
+    const card=document.createElement('button'); card.type='button'; card.className=`worktree-card${item.primary?' primary':''}`;
+    const title=document.createElement('strong'), meta=document.createElement('small');
+    title.textContent=item.branch||'(detached HEAD)'; meta.textContent=item.path||'Unknown worktree';
+    card.append(title,meta); card.onclick=()=>item.branch&&selectVersionBranch(item.branch); worktreeColumn.append(card)
+  });
+  const branchColumn=document.createElement('div'); branchColumn.className='branch-topology-column';
+  branchItems.forEach(item=>{
+    const node=document.createElement('button'); node.type='button'; node.className=`branch-topology-node${item.main?' main':''}${item.current?' current':''}${item.name===state.selectedVersionBranch?' selected':''}`;
+    node.textContent=item.name; node.title=item.upstream?`${item.name} tracks ${item.upstream}`:item.name;
+    node.onclick=()=>selectVersionBranch(item.name); branchColumn.append(node)
+  });
+  diagram.append(worktreeColumn,branchColumn); topology.append(diagram);
+  branches.innerHTML=''; source.innerHTML='';
+  branchItems.forEach(item=>{
+    const option=document.createElement('option'); option.value=item.name; option.textContent=item.main?`${item.name} (main)`:item.name; option.selected=item.name===(data.main_branch||data.current_branch); source.append(option);
+    const row=document.createElement('article'); row.className=`version-branch-row${item.name===state.selectedVersionBranch?' selected':''}`;
+    const info=document.createElement('button'); info.type='button'; info.className='version-branch-info';
+    const name=document.createElement('strong'), meta=document.createElement('small'); name.textContent=item.name;
+    meta.textContent=`${item.main?'main branch / ':''}${item.current?'checked out / ':''}${item.upstream?`tracks ${item.upstream}`:'local only'} / ${item.head||'no commits'}`;
+    info.append(name,meta); info.onclick=()=>selectVersionBranch(item.name);
+    const actions=document.createElement('div'); actions.className='version-branch-actions';
+    const checkout=document.createElement('button'); checkout.type='button'; checkout.className='secondary compact'; checkout.textContent=item.current?'Checked out':'Checkout'; checkout.disabled=item.current;
+    checkout.onclick=async()=>{try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}/checkout`,{method:'POST'});await loadVersionControl()}catch(err){alert(err.message)}};
+    const agentBranch=(data.agents||[]).some(agent=>agent.enabled&&agent.branch===item.name);
+    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent='Delete'; remove.disabled=item.main||item.current||agentBranch;
+    remove.onclick=async()=>{if(!confirm(`Delete branch '${item.name}'?`))return;try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}`,{method:'DELETE'});await loadVersionControl()}catch(err){alert(err.message)}};
+    actions.append(checkout,remove); row.append(info,actions); branches.append(row)
+  });
+  const selected=branchItems.find(item=>item.name===state.selectedVersionBranch);
+  $('#version-branch-detail').textContent=selected?`${selected.name}${selected.main?' is the configured main branch.':selected.current?' is checked out.':' is a local branch.'}`:'Select a branch to inspect it.';
+  agents.innerHTML='';
+  (data.agents||[]).forEach(item=>{
+    const card=document.createElement('article'); card.className='version-agent-card';
+    const copy=document.createElement('div'), title=document.createElement('strong'), meta=document.createElement('small'), actions=document.createElement('div');
+    title.textContent=item.name; meta.textContent=`${item.enabled?'Git enabled':'Git disabled'} / ${item.branch}${item.branch_exists?item.merged_into_main?' / merged into main':' / unmerged':''}`;
+    copy.append(title,meta); actions.className='version-agent-actions';
+    const toggle=document.createElement('button'); toggle.type='button'; toggle.className='secondary compact'; toggle.textContent=item.enabled?'Disable Git':'Enable Git';
+    toggle.onclick=async()=>{const agent=state.agents.find(value=>value.id===item.role);if(!agent)return;try{await toggleExistingAgentGit(agent);await loadVersionControl()}catch(err){alert(err.message)}};
+    const changes=document.createElement('button'); changes.type='button'; changes.className='secondary compact'; changes.textContent='Changes'; changes.disabled=!item.enabled;
+    changes.onclick=async()=>{state.active=item.role;selectAgent(item.role);try{await openGitChanges()}catch(err){alert(err.message)}};
+    actions.append(toggle,changes); card.append(copy,actions); agents.append(card)
+  })
+}
+async function openVersionControl(){
+  await loadVersionControl();
+  if(!$('#version-control-dialog').open)$('#version-control-dialog').showModal()
 }
 function renderMarketplace(){
   const list=$('#marketplace-results');
@@ -2594,6 +2667,16 @@ $('#close-dialog').onclick=()=>$('#context-dialog').close();
 $('#close-code-terminal').onclick=()=>$('#code-terminal-dialog').close();
 $('#tools-button').onclick=()=>openToolsDialog().catch(err=>alert(err.message));
 $('#close-tools').onclick=()=>$('#tools-dialog').close();
+$('#version-control-button').onclick=()=>openVersionControl().catch(err=>alert(err.message));
+$('#close-version-control').onclick=()=>$('#version-control-dialog').close();
+$('#version-control-configure').onclick=async()=>{
+  try{
+    state.pendingGitAgent=null;
+    state.pendingGitEnableAgent=null;
+    openGitSetup(await loadGitStatus(), null)
+  }
+  catch(err){alert(err.message)}
+};
 $('#git-changes-button').onclick=()=>openGitChanges().catch(err=>alert(err.message));
 $('#close-git-changes').onclick=()=>$('#git-changes-dialog').close();
 $('#close-git-setup').onclick=()=>{
@@ -2619,7 +2702,19 @@ $('#git-setup-form').onsubmit=async e=>{
     state.pendingGitAgent=null;
     state.pendingGitEnableAgent=null;
     if(pending)await createAgent(pending);
-    else if(pendingEnable)await saveExistingAgentGitEnabled(pendingEnable, true)
+    else if(pendingEnable)await saveExistingAgentGitEnabled(pendingEnable, true);
+    if($('#version-control-dialog').open)await loadVersionControl()
+  }
+  catch(err){alert(err.message)}
+};
+$('#version-branch-form').onsubmit=async e=>{
+  e.preventDefault();
+  try{
+    await api(`/api/projects/${state.project.id}/git/branches`, {
+      method:'POST', body:JSON.stringify({name:$('#version-branch-name').value,source:$('#version-branch-source').value})
+    });
+    $('#version-branch-name').value='';
+    await loadVersionControl()
   }
   catch(err){alert(err.message)}
 };

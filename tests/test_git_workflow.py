@@ -100,3 +100,27 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     ).stdout
     assert "refs/heads/team-main" in remote_refs
     assert "refs/heads/programmer" in remote_refs
+
+
+def test_version_control_overview_and_branch_management(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "topology.txt").write_text("graph\n", encoding="utf-8")
+    assert workflow.finish_agent_run(1, "programmer", "run-graph", repository, "Create graph")
+
+    created = workflow.create_branch(1, repository, "review", "team-main")
+    assert created == {"branch": "review", "source": "team-main"}
+    overview = workflow.overview(1, repository, [{"role": "programmer", "name": "Programmer"}])
+
+    assert {item["name"] for item in overview["branches"]} >= {"team-main", "programmer", "review"}
+    assert overview["worktrees"][0]["primary"] is True
+    assert overview["agents"] == [{
+        "role": "programmer", "name": "Programmer", "enabled": True, "branch": "programmer",
+        "branch_exists": True, "merged_into_main": True,
+    }]
+
+    assert workflow.checkout_branch(1, repository, "review")["branch"] == "review"
+    with pytest.raises(GitWorkflowError, match="configured main branch"):
+        workflow.delete_branch(1, repository, "team-main")
+    assert workflow.checkout_branch(1, repository, "team-main")["branch"] == "team-main"
+    assert workflow.delete_branch(1, repository, "review") == {"deleted": "review"}

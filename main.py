@@ -158,6 +158,11 @@ class GitAgentInput(BaseModel):
     enabled: bool
 
 
+class GitBranchInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    source: str = Field(default="", max_length=120)
+
+
 class GitDiffOpenInput(BaseModel):
     path: str = Field(min_length=1, max_length=2000)
     editor: str = Field(pattern="^(pycharm|vscode)$")
@@ -478,6 +483,18 @@ async def git_status(project_id: int):
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.get("/api/projects/{project_id}/git/overview")
+async def git_overview(project_id: int):
+    try:
+        root = _git_project_root(project_id)
+        agents = team.definitions.list(project_id)
+        return await asyncio.to_thread(team.git.overview, project_id, root, agents)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.put("/api/projects/{project_id}/git")
 async def configure_git(project_id: int, payload: GitWorkflowInput):
     try:
@@ -499,6 +516,38 @@ async def configure_agent_git(project_id: int, role: str, payload: GitAgentInput
         return await asyncio.to_thread(
             team.git.set_agent_enabled, project_id, role, payload.enabled, _git_project_root(project_id),
         )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/branches", status_code=201)
+async def create_git_branch(project_id: int, payload: GitBranchInput):
+    try:
+        return await asyncio.to_thread(
+            team.git.create_branch, project_id, _git_project_root(project_id), payload.name, payload.source,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/branches/{branch}/checkout")
+async def checkout_git_branch(project_id: int, branch: str):
+    try:
+        return await asyncio.to_thread(team.git.checkout_branch, project_id, _git_project_root(project_id), branch)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/git/branches/{branch}")
+async def delete_git_branch(project_id: int, branch: str):
+    try:
+        return await asyncio.to_thread(team.git.delete_branch, project_id, _git_project_root(project_id), branch)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except GitWorkflowError as exc:
