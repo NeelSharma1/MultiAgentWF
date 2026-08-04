@@ -84,8 +84,11 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
 
-    workflow.configure(1, repository, "team-main", remote="origin", remote_url=str(remote))
-    assert _git(workflow, repository, "remote", "get-url", "origin") == str(remote)
+    workflow.configure(1, repository, "team-main", remote="main", remote_url=str(remote))
+    assert _git(workflow, repository, "remote", "get-url", "main") == str(remote)
+    workflow.configure(1, repository, "team-main", remote="gh")
+    assert _git(workflow, repository, "remote", "get-url", "gh") == str(remote)
+    assert "main" not in _git(workflow, repository, "remote").splitlines()
 
     workflow.begin_agent_run(1, "programmer", repository)
     (repository / "pushed.txt").write_text("remote\n", encoding="utf-8")
@@ -93,6 +96,7 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     assert commit is not None
 
     pushed = workflow.push(1, repository, commit["commit_hash"])
+    assert pushed["remote"] == "gh"
     assert pushed["main_branch"] == "team-main"
     remote_refs = subprocess.run(
         ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"],

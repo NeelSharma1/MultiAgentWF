@@ -176,13 +176,19 @@ class GitWorkflowStore:
             repository = self._repository(root)
             assert repository is not None
         main_branch = self._validate_branch(repository, main_branch)
+        previous = self.configuration(project_id) or {}
         remote = str(remote or "").strip()
         remote_url = str(remote_url or "").strip()
         if remote and not REMOTE_RE.fullmatch(remote):
             raise GitWorkflowError("Remote names may contain letters, numbers, '.', '_', and '-' only")
         if remote_url and not remote:
-            remote = "origin"
+            remote = "gh"
         remotes = self._run(repository, "remote").stdout.splitlines()
+        previous_remote = str(previous.get("remote") or "").strip()
+        rename_source = previous_remote if previous_remote in remotes else (remotes[0] if len(remotes) == 1 else "")
+        if remote and remote not in remotes and rename_source:
+            self._run(repository, "remote", "rename", rename_source, remote)
+            remotes = self._run(repository, "remote").stdout.splitlines()
         if remote_url:
             if remote in remotes:
                 self._run(repository, "remote", "set-url", remote, remote_url)
@@ -486,7 +492,7 @@ class GitWorkflowStore:
     def push(self, project_id: int, project_root: Path, commit_hash: str, remote: str = "") -> dict[str, Any]:
         record = self.commit(project_id, commit_hash)
         configuration, repository = self._configured_repository(project_id, project_root)
-        selected = str(remote or configuration.get("remote") or "origin").strip()
+        selected = str(remote or configuration.get("remote") or "gh").strip()
         remotes = self._run(repository, "remote").stdout.splitlines()
         if selected not in remotes:
             raise GitWorkflowError(f"Remote '{selected}' does not exist")
