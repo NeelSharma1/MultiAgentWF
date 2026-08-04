@@ -539,7 +539,7 @@ function openGitSetup(status, pendingAgent){
     ? 'This project folder is not a Git repository. Choose its main branch and explicitly confirm initialization.'
     : `Repository: ${status.repository}\nCurrent branch: ${status.current_branch||'(detached HEAD)'}. Git-enabled agents work on role-named branches and merge into the selected main branch.`;
   $('#git-branch-input').value=status?.main_branch||status?.branch||((status?.current_branch&&status.current_branch!=='(detached HEAD)')?status.current_branch:'main');
-  $('#git-remote-name-input').value=status?.configuration?.remote||status?.remotes?.[0]?.name||'';
+  $('#git-remote-name-input').value='gh';
   $('#git-remote-url-input').value='';
   $('#git-initialize-label').classList.toggle('hidden', !noRepository);
   $('#git-initialize-input').checked=noRepository;
@@ -2679,6 +2679,14 @@ $('#version-control-configure').onclick=async()=>{
 };
 $('#git-changes-button').onclick=()=>openGitChanges().catch(err=>alert(err.message));
 $('#close-git-changes').onclick=()=>$('#git-changes-dialog').close();
+$('#configure-git').onclick=async()=>{
+  try{
+    state.pendingGitAgent=null;
+    state.pendingGitEnableAgent=null;
+    openGitSetup(await loadGitStatus(), null)
+  }
+  catch(err){alert(err.message)}
+};
 $('#close-git-setup').onclick=()=>{
   state.pendingGitAgent=null;
   state.pendingGitEnableAgent=null;

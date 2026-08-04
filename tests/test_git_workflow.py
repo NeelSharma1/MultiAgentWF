@@ -84,8 +84,11 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
 
-    workflow.configure(1, repository, "team-main", remote="origin", remote_url=str(remote))
-    assert _git(workflow, repository, "remote", "get-url", "origin") == str(remote)
+    workflow.configure(1, repository, "team-main", remote="main", remote_url=str(remote))
+    assert _git(workflow, repository, "remote", "get-url", "main") == str(remote)
+    workflow.configure(1, repository, "team-main", remote="gh")
+    assert _git(workflow, repository, "remote", "get-url", "gh") == str(remote)
+    assert "main" not in _git(workflow, repository, "remote").splitlines()
 
     workflow.begin_agent_run(1, "programmer", repository)
     (repository / "pushed.txt").write_text("remote\n", encoding="utf-8")
@@ -93,6 +96,7 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     assert commit is not None
 
     pushed = workflow.push(1, repository, commit["commit_hash"])
+    assert pushed["remote"] == "gh"
     assert pushed["main_branch"] == "team-main"
     remote_refs = subprocess.run(
         ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"],
@@ -100,6 +104,21 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     ).stdout
     assert "refs/heads/team-main" in remote_refs
     assert "refs/heads/programmer" in remote_refs
+
+
+def test_main_branch_is_unambiguous_when_a_tag_has_the_same_name(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "seed.txt").write_text("seed\n", encoding="utf-8")
+    first = workflow.finish_agent_run(1, "programmer", "run-seed", repository, "Seed main")
+    assert first is not None
+    _git(workflow, repository, "tag", "team-main")
+    _git(workflow, repository, "checkout", "programmer")
+
+    run = workflow.begin_agent_run(1, "programmer", repository)
+
+    assert run["branch"] == "programmer"
+    assert _git(workflow, repository, "branch", "--show-current") == "programmer"
 
 
 def test_version_control_overview_and_branch_management(tmp_path):
