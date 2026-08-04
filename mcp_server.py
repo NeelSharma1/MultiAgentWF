@@ -11,6 +11,7 @@ from agent_definitions import AgentDefinitionStore
 from runtime_config import RuntimeConfigStore
 from credentials import LocalCredentialStore
 from skills import SkillStore, run_skill_script, skill_secret_names
+from toolsets import ToolsetStore
 
 
 DB_PATH = Path(os.getenv("WORKSPACE_DB", Path(__file__).parent / "data" / "workspace.db"))
@@ -19,6 +20,7 @@ projects = ProjectStore(DB_PATH)
 definitions = AgentDefinitionStore(DB_PATH)
 messages = RuntimeConfigStore(DB_PATH)
 skills = SkillStore(DB_PATH)
+toolsets = ToolsetStore()
 credentials = LocalCredentialStore(Path(__file__).parent / ".env.local")
 skill_credentials = LocalCredentialStore(Path(__file__).parent / "data" / ".skill-secrets.local")
 mcp = FastMCP("Shared Team Context")
@@ -114,6 +116,27 @@ def run_assigned_skill(skill_id: int, role: str, inputs: dict, project_id: int =
         secret_values.update(skill_credentials.values_for(names))
         return run_skill_script(skill, inputs, cwd, secret_values=secret_values)
     except (KeyError, ValueError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def list_assigned_toolsets(role: str, project_id: int = 1) -> list[dict]:
+    """List the short descriptions and TOOLSET.md filenames assigned to an agent."""
+    project = projects.get(project_id)
+    definitions.get(role, project_id)
+    root = Path(str(project.get("root_path") or Path(__file__).parent)).expanduser().resolve()
+    return toolsets.list(root, project_id, role)
+
+
+@mcp.tool()
+def load_toolset_summary(slug: str, role: str, project_id: int = 1) -> dict:
+    """Load only the summary section of an assigned local command-line toolset."""
+    project = projects.get(project_id)
+    definitions.get(role, project_id)
+    root = Path(str(project.get("root_path") or Path(__file__).parent)).expanduser().resolve()
+    try:
+        return toolsets.summary(root, project_id, role, slug)
+    except (KeyError, PermissionError, ValueError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
 

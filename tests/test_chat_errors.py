@@ -140,12 +140,35 @@ def test_codex_native_command_output_is_preserved_verbatim(tmp_path, monkeypatch
     assert history[-1]["content"] == "exact native status panel"
 
 
+def test_codex_prompt_requires_chatgpt_login_before_starting_a_request(tmp_path, monkeypatch):
+    agent_team = AgentTeam(tmp_path)
+    agent_team.configs.save("researcher", "codex", "", "", "")
+    monkeypatch.setattr(agent_team, "_codex_command", lambda: "codex")
+
+    async def not_logged_in():
+        return {"connected": False, "detail": "Not logged in", "login_output": ""}
+
+    monkeypatch.setattr(agent_team, "codex_login_status", not_logged_in)
+    result = asyncio.run(agent_team.chat("researcher", "hello?"))
+
+    assert result["ok"] is False
+    assert result["error"]["status_code"] == 401
+    assert result["error"]["code"] == "codex_not_authenticated"
+    assert "Open Connections" in result["response"]
+    assert "Missing bearer" not in result["response"]
+
+
 def test_codex_resume_places_working_directory_before_resume_and_keeps_diagnostics(tmp_path, monkeypatch):
     team = AgentTeam(tmp_path)
     team.configs.save("researcher", "codex", "gpt-test", "", "")
     team.configs.save_codex_session("researcher", 1, "session-123", "gpt-test", "")
     monkeypatch.setattr(team, "_codex_command", lambda: "/usr/bin/codex")
     monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+
+    async def logged_in():
+        return {"connected": True, "detail": "Logged in using ChatGPT", "login_output": ""}
+
+    monkeypatch.setattr(team, "codex_login_status", logged_in)
     captured = {}
 
     class FakeProcess:

@@ -1,4 +1,5 @@
 const COMMAND_HISTORY_KEY='multiagent-provider-command-history';
+const CHAT_OVERRIDES_KEY='multiagent-chat-overrides';
 const INTERNAL_CONTINUATION_PROMPT='Process the queued team messages now. Follow each command, use reports as context, and send a concise report to the requesting agent when the work is complete.';
 function loadCommandHistory(){
   try{
@@ -14,6 +15,28 @@ function loadCommandHistory(){
     return[]
   }
 }
+function loadChatOverrides(){
+  try{
+    const value=JSON.parse(localStorage.getItem(CHAT_OVERRIDES_KEY)||'{}');
+    return value&&typeof value==='object'&&!Array.isArray(value)?value:{}
+  }
+  catch{
+    return{}
+  }
+}
+function chatOverrideKey(projectId, role){
+  return `${projectId}:${role}`
+}
+function chatOverride(projectId, role){
+  const value=state.chatOverrides[chatOverrideKey(projectId, role)];
+  return value&&typeof value==='object'?value:{model:'', effort:''}
+}
+function saveChatOverride(projectId, role, model, effort){
+  const key=chatOverrideKey(projectId, role);
+  if(!model&&!effort)delete state.chatOverrides[key];
+  else state.chatOverrides[key]={model, effort};
+  localStorage.setItem(CHAT_OVERRIDES_KEY, JSON.stringify(state.chatOverrides));
+}
 const state={
   agents: [],
   providers: [],
@@ -21,8 +44,13 @@ const state={
   skills: [],
   activeSkillId: null,
   skillSearch: '',
-  skillType: '',
   skillSort: 'name',
+  toolsets: [],
+  activeToolsetSlug: null,
+  toolsetSearch: '',
+  gitStatus: null,
+  pendingGitAgent: null,
+  pendingGitEnableAgent: null,
   marketplace: [],
   project: null,
   layout: [],
@@ -44,7 +72,10 @@ const state={
   commandIndex: 0,
   drawingLink: null,
   runPollPromise: null,
-  runWatchers: {}
+  runWatchers: {},
+  chatOverrides: loadChatOverrides(),
+  runtimeModelRequest: 0,
+  chatControlsRequest: 0
 };
 const $=s=>document.querySelector(s);
 const commands=[
@@ -227,13 +258,6 @@ function ensureSkillSecretEditor(){
   label.append(help, textarea, status);
   bodyLabel.parentElement.insertBefore(label, bodyLabel);
 }
-function updateSkillRunAvailability(skill){
-  const button=$('#skill-run');
-  if(!button)return;
-  const missing=(skill?.secret_status||[]).filter(item=>item.required!==false&&!item.configured);
-  button.disabled=!skill||!skill.id||missing.length>0;
-  button.title=missing.length?`Configure required secret(s): ${missing.map(item=>item.name).join(', ')}`:'';
-}
 function renderSkillSecretStatus(skill, statuses=null){
   ensureSkillSecretEditor();
   const box=$('#skill-secret-status');
@@ -241,13 +265,11 @@ function renderSkillSecretStatus(skill, statuses=null){
   box.innerHTML='';
   if(!skill||!skill.id){
     box.textContent='Save the skill first, then configure any declared keys here.';
-    updateSkillRunAvailability(null);
     return
   }
   const refs=statuses||skill.secret_status||skill.required_secrets||[];
   if(!refs.length){
     box.textContent='No skill-specific secrets declared.';
-    updateSkillRunAvailability(skill);
     return
   }
   refs.forEach(ref=>{
@@ -288,7 +310,6 @@ function renderSkillSecretStatus(skill, statuses=null){
     };
     info.append(title, description); actions.append(stateLabel, save, clear); row.append(info, input, actions); box.append(row)
   });
-  updateSkillRunAvailability(skill)
 }
 async function loadSkillSecretStatus(skill){
   if(!skill?.id)return;
@@ -301,29 +322,19 @@ async function loadSkillSecretStatus(skill){
     if(Number(state.activeSkillId)===Number(skill.id)){
       const box=$('#skill-secret-status');
       if(box)box.textContent=`Could not load secret status: ${err.message}`;
-      updateSkillRunAvailability(skill)
     }
   }
 }
 function renderSkillsList(){
   const list=$('#skills-list');
   if(!list)return;
-  const skillTypes=[['general','General'],['development','Development'],['research','Research'],['documentation','Documentation'],['automation','Automation'],['data','Data'],['security','Security'],['frontend','Frontend'],['backend','Backend'],['devops','DevOps'],['ai-agents','AI / Agents'],['productivity','Productivity'],['other','Other']];
-  ['#skill-library-type','#skill-type'].forEach(selector=>{
-    const select=$(selector);
-    if(!select)return;
-    skillTypes.forEach(([value,label])=>{
-      if(![...select.options].some(option=>option.value===value))select.append(new Option(label,value))
-    })
-  });
   const count=$('#skills-count');
-  const query=state.skillSearch.trim().toLowerCase(), type=state.skillType;
+  const query=state.skillSearch.trim().toLowerCase();
   const filtered=state.skills.filter(skill=>{
-    const text=`${skill.name} ${skill.summary} ${skill.slug} ${skill.type||skill.skill_type||''} ${skill.author||''}`.toLowerCase();
-    return (!query||text.includes(query))&&(!type||(skill.type||skill.skill_type)==type)
+    const text=`${skill.name} ${skill.summary} ${skill.slug} ${skill.author||''}`.toLowerCase();
+    return !query||text.includes(query)
   });
   filtered.sort((a,b)=>{
-    if(state.skillSort==='type')return String(a.type||'').localeCompare(String(b.type||''))||String(a.name).localeCompare(String(b.name));
     if(state.skillSort==='recent')return String(b.updated_at||'').localeCompare(String(a.updated_at||''));
     if(state.skillSort==='source')return String(a.source||'').localeCompare(String(b.source||''))||String(a.name).localeCompare(String(b.name));
     return String(a.name||'').localeCompare(String(b.name||''))
@@ -342,17 +353,16 @@ function renderSkillsList(){
     name.textContent=skill.name;
     summary.textContent=skill.summary;
     const missingSecrets=(skill.secret_status||[]).filter(item=>item.required!==false&&!item.configured).length;
-    assigned.textContent=`${skill.type||'general'} · ${skill.version||'1.0.0'} · ${skill.source||'local'} · ${skill.assigned_roles?.length||0} agent${skill.assigned_roles?.length===1?'':'s'}${missingSecrets?` · ${missingSecrets} key${missingSecrets===1?'':'s'} missing`:''}`;
+    assigned.textContent=`${skill.version||'1.0.0'} / ${skill.source||'local'} / ${skill.assigned_roles?.length||0} assigned agent${skill.assigned_roles?.length===1?'':'s'}${missingSecrets?` / ${missingSecrets} missing key${missingSecrets===1?'':'s'}`:''}`;
     button.append(name, summary, assigned);
     button.onclick=()=>selectSkill(skill.id);
     list.append(button)
   })
 }
 function renderSkillAssignments(skill){
-  const checks=$('#skill-agent-checks'), runAgent=$('#skill-run-agent');
-  if(!checks||!runAgent)return;
+  const checks=$('#skill-agent-checks');
+  if(!checks)return;
   checks.innerHTML='';
-  runAgent.innerHTML='<option value="">Choose an assigned agent</option>';
   state.agents.forEach(agent=>{
     const label=document.createElement('label'), input=document.createElement('input');
     input.type='checkbox';
@@ -360,14 +370,7 @@ function renderSkillAssignments(skill){
     input.checked=Boolean(skill?.assigned_roles?.includes(agent.id));
     label.append(input, document.createTextNode(` ${agent.name}`));
     checks.append(label);
-    if(input.checked){
-      const option=document.createElement('option');
-      option.value=agent.id;
-      option.textContent=agent.name;
-      runAgent.append(option)
-    }
   });
-  if(skill?.assigned_roles?.includes(state.active))runAgent.value=state.active
 }
 function fillSkillEditor(skill=null){
   ensureSkillSecretEditor();
@@ -375,36 +378,14 @@ function fillSkillEditor(skill=null){
   $('#skill-name').value=skill?.name||'';
   $('#skill-slug').value=skill?.slug||'';
   $('#skill-version').value=skill?.version||'1.0.0';
-  $('#skill-type').value=skill?.type||skill?.skill_type||'general';
   $('#skill-summary').value=skill?.summary||'';
-  $('#skill-language').value=skill?.language||'none';
-  $('#skill-output-format').value=skill?.output_format||'text';
   $('#skill-compatibility').value=skill?.compatibility||'';
   $('#skill-license').value=skill?.license||'';
-  $('#skill-inputs').value=skillSchemaText(skill?.inputs);
-  $('#skill-outputs').value=skillSchemaText(skill?.outputs);
+  $('#skill-allowed-tools').value=skill?.allowed_tools||skill?.manifest?.['allowed-tools']||'';
   $('#skill-body').value=skill?.body||'';
-  $('#skill-script').value=skill?.script||'';
   $('#skill-required-secrets').value=skillSchemaText(skill?.required_secrets||[]);
-  const variants={};
-  (skill?.versions||[]).filter(item=>item.platform!==skill?.platform||item.version!==skill?.version).forEach(item=>{
-    if(variants[item.platform])return;
-    variants[item.platform]={
-      version:item.version,
-      language:item.language,
-      output_format:item.output_format,
-      inputs:item.inputs||{},
-      outputs:item.outputs||{},
-      body:item.body||'',
-      script:item.script||'',
-      required_secrets:item.required_secrets||skill?.required_secrets||[]
-    }
-  });
-  $('#skill-platform-variants').value=skillSchemaText(variants);
   $('#skill-delete').disabled=!skill;
   renderSkillSecretStatus(skill, skill?.secret_status||null);
-  updateSkillRunAvailability(skill);
-  $('#skill-run-inputs').value='{}';
   renderSkillAssignments(skill)
 }
 async function selectSkill(id){
@@ -440,11 +421,239 @@ function renderActiveSkillSummary(){
 }
 function openSkillsDialog(skillId=state.activeSkillId){
   $('#skill-library-search').value=state.skillSearch;
-  $('#skill-library-type').value=state.skillType;
   $('#skill-library-sort').value=state.skillSort;
   renderSkillsList();
   selectSkill(skillId||state.skills[0]?.id||null);
   $('#skills-dialog').showModal()
+}
+function toolsetBySlug(slug){
+  return state.toolsets.find(item=>item.slug===slug)||null
+}
+function renderToolsetsList(){
+  const list=$('#toolsets-list');
+  if(!list)return;
+  const query=state.toolsetSearch.trim().toLowerCase();
+  const filtered=state.toolsets.filter(item=>`${item.name} ${item.slug} ${item.description}`.toLowerCase().includes(query));
+  $('#toolsets-count').textContent=filtered.length===state.toolsets.length?state.toolsets.length:`${filtered.length}/${state.toolsets.length}`;
+  list.innerHTML='';
+  if(!filtered.length){
+    list.innerHTML=`<div class="skills-empty">${state.toolsets.length?'No toolsets match this search.':'No toolsets yet. Create one to expose local CLI capabilities.'}</div>`;
+    return
+  }
+  filtered.forEach(item=>{
+    const button=document.createElement('button'), name=document.createElement('strong'), description=document.createElement('span'), meta=document.createElement('small');
+    button.type='button';
+    button.className=`skill-list-item ${item.slug===state.activeToolsetSlug?'active':''}`;
+    name.textContent=item.name;
+    description.textContent=item.description;
+    meta.textContent=`${item.tools?.length||0} tool${item.tools?.length===1?'':'s'} / ${item.assigned_roles?.length||0} assigned agent${item.assigned_roles?.length===1?'':'s'}`;
+    button.append(name, description, meta);
+    button.onclick=()=>selectToolset(item.slug);
+    list.append(button)
+  })
+}
+function renderToolsetAssignments(toolset){
+  const checks=$('#toolset-agent-checks');
+  checks.innerHTML='';
+  state.agents.forEach(agent=>{
+    const label=document.createElement('label'), input=document.createElement('input');
+    input.type='checkbox';
+    input.value=agent.id;
+    input.checked=Boolean(toolset?.assigned_roles?.includes(agent.id));
+    label.append(input, document.createTextNode(` ${agent.name}`));
+    checks.append(label)
+  })
+}
+function addToolDefinition(tool={}){
+  const card=document.createElement('section');
+  card.className='tool-definition-card';
+  card.innerHTML='<div class="tool-card-head"><strong>Tool definition</strong><button type="button" class="remove-tool-definition">Remove</button></div><div class="skill-form-grid"><label>Tool name<input class="tool-name" required maxlength="80" placeholder="search-web"></label><label>Executable filename<input class="tool-filename" required maxlength="500" placeholder="search.py"></label></div><label>Description<textarea class="tool-description" rows="2" required maxlength="2000" placeholder="Searches the public web for a query."></textarea></label><div class="skill-form-grid"><label>Inputs<textarea class="tool-inputs" rows="2" maxlength="4000" placeholder="1. Query string; 2. Maximum result count."></textarea></label><label>Outputs<textarea class="tool-outputs" rows="2" maxlength="4000" placeholder="JSON array of matching pages."></textarea></label></div><div class="skill-form-grid"><label>Chat output format<select class="tool-output-format"><option value="text">Text</option><option value="markdown">Markdown</option><option value="json">JSON</option><option value="code">Code block</option></select></label><label>Environment variable names<input class="tool-env-vars" maxlength="2000" placeholder="SEARCH_API_KEY, HTTP_PROXY"></label></div><label>Result template<small>Supported markers: {stdout}, {stderr}, {exit_code}, {toolset}, and {tool}.</small><textarea class="tool-result-template" rows="2" maxlength="20000">{stdout}</textarea></label><label>Executable source<textarea class="tool-source" rows="10" spellcheck="false" maxlength="500000"></textarea></label>';
+  card.querySelector('.tool-name').value=tool.name||'';
+  card.querySelector('.tool-filename').value=tool.filename||'';
+  card.querySelector('.tool-description').value=tool.description||'';
+  card.querySelector('.tool-inputs').value=tool.inputs||'No arguments.';
+  card.querySelector('.tool-outputs').value=tool.outputs||'Text output.';
+  card.querySelector('.tool-output-format').value=tool.output_format||'text';
+  card.querySelector('.tool-env-vars').value=(tool.env_vars||[]).join(', ');
+  card.querySelector('.tool-result-template').value=tool.result_template||'{stdout}';
+  card.querySelector('.tool-source').value=tool.source||'';
+  card.querySelector('.remove-tool-definition').onclick=()=>card.remove();
+  $('#tool-definitions').append(card)
+}
+function fillToolsetEditor(toolset=null){
+  const persisted=Boolean(toolset?.slug&&Array.isArray(toolset?.assigned_roles));
+  state.activeToolsetSlug=persisted?toolset.slug:null;
+  $('#toolset-existing-slug').value=persisted?toolset.slug:'';
+  $('#toolset-name').value=toolset?.name||'';
+  $('#toolset-slug').value=toolset?.slug||'';
+  $('#toolset-slug').disabled=persisted;
+  $('#toolset-description').value=toolset?.description||'';
+  $('#toolset-details').value=toolset?.details||'';
+  $('#toolset-delete').disabled=!persisted;
+  $('#tool-definitions').innerHTML='';
+  const tools=toolset?.tools?.length?toolset.tools:[{
+    name:'', filename:'tool.py', description:'', inputs:'No arguments.', outputs:'Text output.',
+    output_format:'text', result_template:'{stdout}', env_vars:[],
+    source:'import sys\n\nprint(" ".join(sys.argv[1:]))\n'
+  }];
+  tools.forEach(addToolDefinition);
+  renderToolsetAssignments(toolset);
+  renderToolsetsList()
+}
+async function selectToolset(slug){
+  if(!slug){fillToolsetEditor(null);return}
+  state.activeToolsetSlug=slug;
+  const listed=toolsetBySlug(slug);
+  if(listed)fillToolsetEditor(listed);
+  try{
+    const detail=await api(`/api/toolsets/${encodeURIComponent(slug)}?project_id=${state.project.id}`);
+    if(state.activeToolsetSlug!==slug)return;
+    state.toolsets=state.toolsets.map(item=>item.slug===slug?detail:item);
+    fillToolsetEditor(detail)
+  }
+  catch(err){alert(err.message)}
+}
+async function loadToolsets(){
+  if(!state.project){state.toolsets=[];return}
+  state.toolsets=await api(`/api/toolsets?project_id=${state.project.id}`);
+  renderToolsetsList()
+}
+async function openToolsDialog(){
+  await loadToolsets();
+  $('#toolset-search').value=state.toolsetSearch;
+  renderToolsetsList();
+  await selectToolset(state.activeToolsetSlug&&toolsetBySlug(state.activeToolsetSlug)?state.activeToolsetSlug:state.toolsets[0]?.slug||null);
+  $('#tools-dialog').showModal()
+}
+async function loadGitStatus(){
+  if(!state.project)return null;
+  state.gitStatus=await api(`/api/projects/${state.project.id}/git`);
+  return state.gitStatus
+}
+function openGitSetup(status, pendingAgent){
+  state.pendingGitAgent=pendingAgent||null;
+  const noRepository=!status?.is_repository;
+  $('#git-setup-status').textContent=noRepository
+    ? 'This project folder is not a Git repository. Choose its main branch and explicitly confirm initialization.'
+    : `Repository: ${status.repository}\nCurrent branch: ${status.current_branch||'(detached HEAD)'}. Git-enabled agents work on role-named branches and merge into the selected main branch.`;
+  $('#git-branch-input').value=status?.main_branch||status?.branch||((status?.current_branch&&status.current_branch!=='(detached HEAD)')?status.current_branch:'main');
+  $('#git-remote-name-input').value=status?.configuration?.remote||status?.remotes?.[0]?.name||'';
+  $('#git-remote-url-input').value='';
+  $('#git-initialize-label').classList.toggle('hidden', !noRepository);
+  $('#git-initialize-input').checked=noRepository;
+  $('#git-setup-dialog').showModal()
+}
+async function refreshAgentsAfterGitChange(activeRole=state.active){
+  state.agents=await api(`/api/agents?project_id=${state.project.id}`);
+  state.active=activeRole;
+  renderAgents();
+  renderFlowchart();
+  if(activeRole)selectAgent(activeRole)
+}
+async function saveExistingAgentGitEnabled(agent, enabled){
+  await api(`/api/projects/${state.project.id}/git/agents/${encodeURIComponent(agent.id)}`, {
+    method:'PUT', body:JSON.stringify({enabled})
+  });
+  await refreshAgentsAfterGitChange(agent.id)
+}
+async function toggleExistingAgentGit(agent){
+  if(agent.git_enabled){
+    if(!confirm(`Disable the shared Git workflow for ${agent.name}? Future runs will no longer be auto-committed.`))return;
+    await saveExistingAgentGitEnabled(agent, false);
+    return
+  }
+  const status=await loadGitStatus();
+  if(status?.configured){
+    await saveExistingAgentGitEnabled(agent, true);
+    return
+  }
+  state.pendingGitEnableAgent=agent;
+  openGitSetup(status, null)
+}
+async function createAgent(payload){
+  const created=await api('/api/agents', {method:'POST', body:JSON.stringify(payload)});
+  $('#agent-dialog').close();
+  state.agents=await api(`/api/agents?project_id=${state.project.id}`);
+  state.layout=await api(`/api/projects/${state.project.id}/layout`);
+  renderAgents();
+  renderFlowchart();
+  selectAgent(created.role)
+}
+async function prepareGitAgent(payload){
+  const status=await loadGitStatus();
+  if(status?.configured){
+    await createAgent(payload);
+    return
+  }
+  openGitSetup(status, payload)
+}
+function gitCommitCard(commit){
+  const card=document.createElement('article'), head=document.createElement('div'), title=document.createElement('div'), hash=document.createElement('strong'), meta=document.createElement('span'), actions=document.createElement('div'), files=document.createElement('div');
+  card.className='git-commit-card'; head.className='git-commit-head'; actions.className='git-commit-actions'; files.className='git-file-list';
+  hash.textContent=commit.commit_hash.slice(0,12);
+  meta.textContent=`${commit.message} / ${commit.agent_branch||commit.role} → ${commit.main_branch||state.gitStatus?.main_branch||state.gitStatus?.branch||'main'} / ${commit.state}${commit.pushed?' / pushed':''}`;
+  title.append(hash, meta); head.append(title, actions);
+  const invoke=async(path, method, body=null)=>{
+    await api(`/api/projects/${state.project.id}/git/commits/${commit.commit_hash}/${path}`, {method, body:body?JSON.stringify(body):undefined});
+    await openGitChanges()
+  };
+  const revert=document.createElement('button'); revert.type='button'; revert.className='secondary compact'; revert.textContent='Revert';
+  revert.onclick=async()=>{
+    if(!confirm(`Create a new commit that reverts ${commit.commit_hash.slice(0,12)}?`))return;
+    try{await invoke('revert','POST')}catch(err){alert(err.message)}
+  };
+  const rollback=document.createElement('button'); rollback.type='button'; rollback.className='danger compact'; rollback.textContent='Rollback HEAD';
+  rollback.onclick=async()=>{
+    if(!confirm(`Hard-reset the main branch to remove ${commit.commit_hash.slice(0,12)}? This discards that merged agent change from the current branch.`))return;
+    try{await invoke('rollback','POST')}catch(err){alert(err.message)}
+  };
+  const push=document.createElement('button'); push.type='button'; push.className='secondary compact'; push.textContent='Push';
+  push.onclick=async()=>{
+    const remote=prompt('Remote to push to', state.gitStatus?.configuration?.remote||'origin');
+    if(remote===null)return;
+    try{await invoke('push','POST',{remote})}catch(err){alert(err.message)}
+  };
+  if(commit.state==='committed'){actions.append(revert, rollback, push)}
+  (commit.files||[]).forEach(file=>{
+    const row=document.createElement('div'), status=document.createElement('span'), path=document.createElement('code'), stats=document.createElement('span'), fileActions=document.createElement('div'), diff=document.createElement('button'), pycharm=document.createElement('button'), vscode=document.createElement('button');
+    row.className='git-file-row'; status.className='git-file-status'; path.textContent=file.path; stats.className='git-file-stats'; fileActions.className='git-file-actions';
+    status.textContent=file.status; stats.textContent=`+${file.additions??'?'} / -${file.deletions??'?'}`;
+    diff.type='button'; diff.className='secondary compact'; diff.textContent='View diff';
+    diff.onclick=async()=>{
+      const out=await api(`/api/projects/${state.project.id}/git/commits/${commit.commit_hash}/diff?path=${encodeURIComponent(file.path)}`);
+      let preview=row.querySelector('.git-diff-preview');
+      if(!preview){preview=document.createElement('pre');preview.className='git-diff-preview';row.append(preview)}
+      preview.textContent=out.diff||'(No textual diff available.)'
+    };
+    pycharm.type='button'; pycharm.className='secondary compact'; pycharm.textContent='PyCharm';
+    pycharm.onclick=()=>invoke('open-diff','POST',{path:file.path,editor:'pycharm'}).catch(err=>alert(err.message));
+    vscode.type='button'; vscode.className='secondary compact'; vscode.textContent='VS Code';
+    vscode.onclick=()=>invoke('open-diff','POST',{path:file.path,editor:'vscode'}).catch(err=>alert(err.message));
+    fileActions.append(diff, pycharm, vscode); row.append(status,path,stats,fileActions); files.append(row)
+  });
+  card.append(head, files);
+  return card
+}
+function renderGitChanges(status){
+  const list=$('#git-changes-list'), agent=activeAgent();
+  $('#git-changes-title').textContent=agent?`${agent.name} Git changes`:'Git changes';
+  if(!status?.configured){
+    $('#git-changes-status').textContent=status?.is_repository
+      ? 'No Git workflow is configured. Enable Git for an agent to choose the main branch.'
+      : 'This project folder is not a Git repository.';
+    list.innerHTML='<div class="git-empty">No shared Git workflow is active.</div>';
+    return
+  }
+  $('#git-changes-status').textContent=`${status.repository} / main branch ${status.main_branch||status.branch} / ${status.clean?'clean':'uncommitted changes'}${status.identity_configured?'':' / Git identity missing'}`;
+  const commits=(status.commits||[]).filter(commit=>!agent||commit.role===agent.id);
+  list.innerHTML='';
+  if(!commits.length){list.innerHTML='<div class="git-empty">This agent has not created a tracked commit yet.</div>';return}
+  commits.forEach(commit=>list.append(gitCommitCard(commit)))
+}
+async function openGitChanges(){
+  const status=await loadGitStatus();
+  renderGitChanges(status);
+  if(!$('#git-changes-dialog').open)$('#git-changes-dialog').showModal()
 }
 function renderMarketplace(){
   const list=$('#marketplace-results');
@@ -597,7 +806,8 @@ async function selectProject(id){
   $('#project-description').textContent=state.project.description||state.project.root_path||'Draw any number of command and reporting relationships between agents.';
   [state.layout,
   state.edges,
-  state.skills]=await Promise.all([api(`/api/projects/${id}/layout`), api(`/api/projects/${id}/edges`), api(`/api/skills?project_id=${id}`)]);
+  state.skills,
+  state.toolsets]=await Promise.all([api(`/api/projects/${id}/layout`), api(`/api/projects/${id}/edges`), api(`/api/skills?project_id=${id}`), api(`/api/toolsets?project_id=${id}`)]);
   renderAgents();
   if(state.active){
     selectAgent(state.active);
@@ -829,7 +1039,7 @@ function renderAgents(){
     const b=document.createElement('button');
     b.className=`agent-button ${a.id===state.active?'active':''}`;
     b.innerHTML=`<span class="mini-avatar">${a.name[0]}</span><div><strong>${a.name}</strong><small></small></div>`;
-    b.querySelector('small').textContent=runtimeLabel(a.runtime);
+    b.querySelector('small').textContent=`${runtimeLabel(a.runtime)}${a.git_enabled?' / shared Git':''}`;
     b.onclick=()=>selectAgent(a.id);
     nav.append(b)
   });
@@ -1784,6 +1994,9 @@ function openAgentContextMenu(event, agent){
   event.stopPropagation();
   state.contextAgent=agent;
   const menu=$('#agent-context-menu');
+  menu.querySelector('[data-agent-action="git"]').textContent=agent.git_enabled
+    ? '⌁ Disable shared Git workflow'
+    : '⌁ Enable shared Git workflow';
   menu.style.left=`${Math.min(event.clientX,window.innerWidth-245)}px`;
   menu.style.top=`${Math.min(event.clientY,window.innerHeight-150)}px`;
   menu.classList.remove('hidden')
@@ -2119,7 +2332,8 @@ function fillEfforts(box, models, modelId, selected='', defaultLabel='Model defa
   box.disabled=!efforts.length
 }
 async function loadModels(selected='', effort=''){
-  const box=$('#model-input'),
+  const request=++state.runtimeModelRequest,
+  box=$('#model-input'),
   provider=$('#provider-select').value;
   box.innerHTML='<option value="">Loading models…</option>';
   box.disabled=true;
@@ -2128,12 +2342,16 @@ async function loadModels(selected='', effort=''){
       base_url: $('#base-url-input').value, api_key_env: $('#key-env-input').value
     });
     const out=await api(`/api/providers/${provider}/models?${q}`);
+    if(request!==state.runtimeModelRequest)return;
     state.runtimeModels=out.models;
-    box.innerHTML=out.models.map(m=>`<option value="${m.id}">${modelLabel(m)}</option>`).join('')||'<option value="">No models returned</option>';
-    if(selected&&out.models.some(m=>m.id===selected))box.value=selected;
+    const models=[...out.models];
+    if(selected&&!models.some(m=>m.id===selected))models.unshift({id:selected, displayName:`${selected} (saved)`, hidden:true});
+    box.innerHTML=models.map(m=>`<option value="${m.id}">${modelLabel(m)}</option>`).join('')||'<option value="">No models returned</option>';
+    if(selected)box.value=selected;
     fillEfforts($('#effort-input'), out.models, box.value, effort)
   }
   catch(err){
+    if(request!==state.runtimeModelRequest)return;
     box.innerHTML=`<option value="">${err.message}</option>`;
     $('#effort-input').innerHTML='<option value="">Unavailable</option>'
   }
@@ -2143,6 +2361,9 @@ async function loadModels(selected='', effort=''){
 }
 async function loadChatControls(){
   const a=activeAgent(),
+  projectId=state.project?.id,
+  request=++state.chatControlsRequest,
+  override=chatOverride(projectId, a.id),
   modelBox=$('#chat-model'),
   effortBox=$('#chat-effort'),
   attach=$('#attach-button');
@@ -2160,15 +2381,19 @@ async function loadChatControls(){
     });
     const [out,
     capabilities]=await Promise.all([api(`/api/providers/${a.runtime.provider}/models?${q}`), api(`/api/agents/${a.id}/attachment-capabilities?project_id=${state.project.id}`)]);
-    if(a.id!==state.active)return;
+    if(request!==state.chatControlsRequest||a.id!==state.active||state.project?.id!==projectId)return;
     state.chatModels=out.models;
-    modelBox.innerHTML=`<option value="">Agent default (${a.runtime.model||'provider default'})</option>`+out.models.map(m=>`<option value="${m.id}">${modelLabel(m)}</option>`).join('');
-    fillEfforts(effortBox, out.models, a.runtime.model, '', 'Agent default');
+    const models=[...out.models];
+    if(override.model&&!models.some(m=>m.id===override.model))models.unshift({id:override.model, displayName:`${override.model} (saved)`, hidden:true});
+    modelBox.innerHTML=`<option value="">Agent default (${a.runtime.model||'provider default'})</option>`+models.map(m=>`<option value="${m.id}">${modelLabel(m)}</option>`).join('');
+    if(override.model)modelBox.value=override.model;
+    fillEfforts(effortBox, out.models, modelBox.value||a.runtime.model, override.effort, 'Agent default');
     attach.dataset.enabled=String(capabilities.enabled);
     attach.title=capabilities.enabled?`Attach files · ${capabilities.note}`: 'Attachments unavailable for this runtime';
     $('#attachment-input').accept=capabilities.accept.join(',')
   }
   catch{
+    if(request!==state.chatControlsRequest||a.id!==state.active||state.project?.id!==projectId)return;
     modelBox.innerHTML='<option value="">Agent default</option>';
     effortBox.innerHTML='<option value="">Agent default</option>';
     attach.title='Attachments unavailable'
@@ -2292,17 +2517,14 @@ $('#agent-form').onsubmit=async e=>{
     role: $('#agent-role-input').value,
     brief: $('#agent-brief-input').value,
     instructions: $('#agent-instructions-input').value,
-    project_id: state.project.id
+    project_id: state.project.id,
+    git_enabled: $('#agent-git-enabled').checked
   };
-  const created=await api('/api/agents', {
-    method: 'POST', body: JSON.stringify(payload)
-  });
-  $('#agent-dialog').close();
-  state.agents=await api(`/api/agents?project_id=${state.project.id}`);
-  state.layout=await api(`/api/projects/${state.project.id}/layout`);
-  renderAgents();
-  renderFlowchart();
-  selectAgent(created.role)
+  try{
+    if(payload.git_enabled)await prepareGitAgent(payload);
+    else await createAgent(payload)
+  }
+  catch(err){alert(err.message)}
 };
 $('#generate-agent').onclick=async e=>{
   const button=e.currentTarget;
@@ -2355,10 +2577,14 @@ $('#delete-context').onclick=async()=>{
 };
 function openAgentDialog(){
   $('#agent-form').reset();
+  state.pendingGitAgent=null;
   $('#agent-dialog').showModal()
 }
 function selectedSkillRoles(){
   return [...document.querySelectorAll('#skill-agent-checks input:checked')].map(input=>input.value)
+}
+function selectedToolsetRoles(){
+  return [...document.querySelectorAll('#toolset-agent-checks input:checked')].map(input=>input.value)
 }
 $('#new-context').onclick=()=>openContext();
 $('#new-agent').onclick=openAgentDialog;
@@ -2366,6 +2592,98 @@ $('#add-agent-dashboard').onclick=openAgentDialog;
 $('#close-agent').onclick=()=>$('#agent-dialog').close();
 $('#close-dialog').onclick=()=>$('#context-dialog').close();
 $('#close-code-terminal').onclick=()=>$('#code-terminal-dialog').close();
+$('#tools-button').onclick=()=>openToolsDialog().catch(err=>alert(err.message));
+$('#close-tools').onclick=()=>$('#tools-dialog').close();
+$('#git-changes-button').onclick=()=>openGitChanges().catch(err=>alert(err.message));
+$('#close-git-changes').onclick=()=>$('#git-changes-dialog').close();
+$('#close-git-setup').onclick=()=>{
+  state.pendingGitAgent=null;
+  state.pendingGitEnableAgent=null;
+  $('#git-setup-dialog').close()
+};
+$('#git-setup-form').onsubmit=async e=>{
+  e.preventDefault();
+  const pending=state.pendingGitAgent;
+  const pendingEnable=state.pendingGitEnableAgent;
+  try{
+    state.gitStatus=await api(`/api/projects/${state.project.id}/git`, {
+      method:'PUT',
+      body:JSON.stringify({
+        main_branch:$('#git-branch-input').value,
+        initialize:$('#git-initialize-input').checked,
+        remote:$('#git-remote-name-input').value,
+        remote_url:$('#git-remote-url-input').value
+      })
+    });
+    $('#git-setup-dialog').close();
+    state.pendingGitAgent=null;
+    state.pendingGitEnableAgent=null;
+    if(pending)await createAgent(pending);
+    else if(pendingEnable)await saveExistingAgentGitEnabled(pendingEnable, true)
+  }
+  catch(err){alert(err.message)}
+};
+$('#new-toolset').onclick=()=>fillToolsetEditor(null);
+$('#toolset-search').oninput=e=>{state.toolsetSearch=e.target.value;renderToolsetsList()};
+$('#add-tool-definition').onclick=()=>addToolDefinition();
+$('#generate-toolset').onclick=async e=>{
+  const prompt=$('#toolset-prompt').value.trim(), button=e.currentTarget;
+  if(!prompt)return alert('Describe the command-line toolset you want Codex to create.');
+  button.classList.add('loading');
+  try{
+    const draft=await api('/api/toolsets/generate', {method:'POST', body:JSON.stringify({prompt})});
+    fillToolsetEditor(draft)
+  }
+  catch(err){alert(err.message)}
+  finally{button.classList.remove('loading')}
+};
+$('#toolset-form').onsubmit=async e=>{
+  e.preventDefault();
+  const definitions=[...document.querySelectorAll('.tool-definition-card')].map(card=>({
+    name:card.querySelector('.tool-name').value,
+    filename:card.querySelector('.tool-filename').value,
+    description:card.querySelector('.tool-description').value,
+    inputs:card.querySelector('.tool-inputs').value,
+    outputs:card.querySelector('.tool-outputs').value,
+    output_format:card.querySelector('.tool-output-format').value,
+    env_vars:card.querySelector('.tool-env-vars').value.split(',').map(value=>value.trim()).filter(Boolean),
+    result_template:card.querySelector('.tool-result-template').value||'{stdout}',
+    source:card.querySelector('.tool-source').value
+  }));
+  if(!definitions.length)return alert('Add at least one tool to this toolset.');
+  const existing=$('#toolset-existing-slug').value,
+  payload={
+    name:$('#toolset-name').value,
+    slug:$('#toolset-slug').value,
+    description:$('#toolset-description').value,
+    details:$('#toolset-details').value,
+    tools:definitions,
+    roles:selectedToolsetRoles(),
+    project_id:state.project.id
+  },
+  submit=e.submitter||$('#toolset-form button[type="submit"]');
+  submit.disabled=true;
+  try{
+    const saved=await api(existing?`/api/toolsets/${encodeURIComponent(existing)}`:'/api/toolsets', {
+      method:existing?'PUT':'POST', body:JSON.stringify(payload)
+    });
+    await loadToolsets();
+    await selectToolset(saved.slug)
+  }
+  catch(err){alert(err.message)}
+  finally{submit.disabled=false}
+};
+$('#toolset-delete').onclick=async()=>{
+  const slug=$('#toolset-existing-slug').value, toolset=toolsetBySlug(slug);
+  if(!slug||!toolset||!confirm(`Delete toolset “${toolset.name}” and its files from .agents/tools/${slug}?`))return;
+  try{
+    await api(`/api/toolsets/${encodeURIComponent(slug)}?project_id=${state.project.id}`, {method:'DELETE'});
+    state.activeToolsetSlug=null;
+    await loadToolsets();
+    await selectToolset(state.toolsets[0]?.slug||null)
+  }
+  catch(err){alert(err.message)}
+};
 $('#skills-button').onclick=()=>openSkillsDialog();
 $('#close-skills').onclick=()=>$('#skills-dialog').close();
 $('#open-skill-marketplace').onclick=()=>{
@@ -2376,50 +2694,26 @@ $('#close-skill-marketplace').onclick=()=>$('#skills-marketplace-dialog').close(
 $('#marketplace-search-button').onclick=searchMarketplace;
 $('#marketplace-query').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();searchMarketplace()}};
 $('#skill-library-search').oninput=e=>{state.skillSearch=e.target.value;renderSkillsList()};
-$('#skill-library-type').onchange=e=>{state.skillType=e.target.value;renderSkillsList()};
 $('#skill-library-sort').onchange=e=>{state.skillSort=e.target.value;renderSkillsList()};
 $('#new-skill').onclick=()=>selectSkill(null);
-$('#skill-agent-checks').onchange=()=>{
-  const current=$('#skill-run-agent').value;
-  $('#skill-run-agent').innerHTML='<option value="">Choose an assigned agent</option>';
-  selectedSkillRoles().forEach(role=>{
-    const option=document.createElement('option');
-    option.value=role;
-    option.textContent=state.agents.find(agent=>agent.id===role)?.name||role;
-    $('#skill-run-agent').append(option)
-  });
-  if(selectedSkillRoles().includes(current))$('#skill-run-agent').value=current;
-  else if(selectedSkillRoles().includes(state.active))$('#skill-run-agent').value=state.active
-};
 $('#skill-form').onsubmit=async e=>{
   e.preventDefault();
-  let inputs, outputs, platformVariants, requiredSecrets;
+  let requiredSecrets;
   try{
-    inputs=JSON.parse($('#skill-inputs').value||'{}');
-    outputs=JSON.parse($('#skill-outputs').value||'{}');
-    platformVariants=JSON.parse($('#skill-platform-variants').value||'{}');
     requiredSecrets=JSON.parse($('#skill-required-secrets').value||'[]');
-    if(!inputs||Array.isArray(inputs)||!outputs||Array.isArray(outputs))throw new Error('Schemas must be JSON objects.');
-    if(!platformVariants||Array.isArray(platformVariants))throw new Error('OS variants must be a JSON object.');
     if(!Array.isArray(requiredSecrets))throw new Error('Required secrets must be a JSON array.');
   }
-  catch(err){alert(`Inputs, outputs, and OS variants must be valid JSON; required secrets must be a JSON array. ${err.message}`);return}
+  catch(err){alert(`Required secrets must be a valid JSON array. ${err.message}`);return}
   const id=$('#skill-id').value,
   payload={
     name:$('#skill-name').value,
     slug:$('#skill-slug').value,
     version:$('#skill-version').value||'1.0.0',
     summary:$('#skill-summary').value,
-    inputs,
-    outputs,
-    platform_variants:platformVariants,
-    language:$('#skill-language').value,
-    script:$('#skill-script').value,
-    skill_type:$('#skill-type').value,
     body:$('#skill-body').value,
-    output_format:$('#skill-output-format').value,
     compatibility:$('#skill-compatibility').value,
     license:$('#skill-license').value,
+    allowed_tools:$('#skill-allowed-tools').value,
     required_secrets:requiredSecrets,
     created_by:'human'
   },
@@ -2457,20 +2751,6 @@ $('#skill-delete').onclick=async()=>{
   }
   catch(err){alert(err.message)}
 };
-$('#skill-run').onclick=async e=>{
-  const id=$('#skill-id').value, role=$('#skill-run-agent').value;
-  if(!id||!role)return alert('Save the skill and choose an assigned agent first.');
-  let inputs;
-  try{
-    inputs=JSON.parse($('#skill-run-inputs').value||'{}');
-    if(!inputs||Array.isArray(inputs))throw new Error('Inputs must be a JSON object.');
-  }
-  catch(err){return alert(`Skill inputs must be valid JSON. ${err.message}`)}
-  const button=e.currentTarget;
-  button.classList.add('loading');
-  try{await runAssignedSkill(id, role, inputs, true)}
-  finally{button.classList.remove('loading')}
-};
 $('#runtime-settings').onclick=openRuntime;
 $('#close-runtime').onclick=()=>$('#runtime-dialog').close();
 $('#load-models').onclick=()=>loadModels($('#model-input').value);
@@ -2480,7 +2760,19 @@ $('#provider-select').onchange=()=>{
   loadModels()
 };
 $('#model-input').onchange=()=>fillEfforts($('#effort-input'), state.runtimeModels, $('#model-input').value);
-$('#chat-model').onchange=()=>fillEfforts($('#chat-effort'), state.chatModels, $('#chat-model').value||activeAgent().runtime.model, '', 'Agent default');
+$('#chat-model').onchange=()=>{
+  const model=$('#chat-model').value,
+  projectId=state.project?.id,
+  role=state.active;
+  saveChatOverride(projectId, role, model, '');
+  fillEfforts($('#chat-effort'), state.chatModels, model||activeAgent().runtime.model, '', 'Agent default');
+};
+$('#chat-effort').onchange=()=>{
+  const projectId=state.project?.id,
+  role=state.active,
+  model=$('#chat-model').value;
+  saveChatOverride(projectId, role, model, $('#chat-effort').value);
+};
 $('#agent-template-select').onchange=e=>{
   const template=state.templates.find(t=>t.id===Number(e.target.value));
   if(!template)return;
@@ -2499,6 +2791,7 @@ document.querySelectorAll('#agent-context-menu [data-agent-action]').forEach(but
       state.active=agent.id;
       await openRuntime()
     }
+    else if(action==='git')await toggleExistingAgentGit(agent)
     else if(action==='template'){
       const name=prompt('Template name', `${agent.name} template`);
       if(name!==null){

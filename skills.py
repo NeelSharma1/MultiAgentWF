@@ -676,6 +676,7 @@ class SkillStore:
             "author": base.get("author", "") or "",
             "license": base.get("license", "") or "",
             "compatibility": base.get("compatibility", "") or "",
+            "allowed_tools": "",
             "assigned_roles": [assignment["role"] for assignment in assignments],
             "assigned": bool(role and any(assignment["role"] == role for assignment in assignments)),
             "created_at": base.get("created_at", ""),
@@ -699,6 +700,7 @@ class SkillStore:
                 "manifest": manifest,
                 "required_secrets": skill_secret_refs({"manifest": manifest}),
             })
+            result["allowed_tools"] = str(manifest.get("allowed-tools") or "")
             if include_body:
                 result["script"] = selected["script"]
                 result["body"] = selected["body"]

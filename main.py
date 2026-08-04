@@ -50,6 +50,7 @@ from credentials import LocalCredentialStore  # noqa: E402
 from project_store import ProjectStore  # noqa: E402
 from github_status import GitReportError, collect_git_report, format_git_report  # noqa: E402
 from skills import normalize_skill_secret_refs, run_skill_script_async, skill_secret_names  # noqa: E402
+from git_workflow import GitWorkflowError  # noqa: E402
 
 store = ContextStore(ROOT / "data" / "workspace.db")
 team = AgentTeam(ROOT)
@@ -57,6 +58,7 @@ credentials = LocalCredentialStore(ROOT / ".env.local")
 skill_credentials = LocalCredentialStore(ROOT / "data" / ".skill-secrets.local")
 projects = ProjectStore(ROOT / "data" / "workspace.db")
 chat_tasks: set[asyncio.Task] = set()
+git_run_locks: dict[int, asyncio.Lock] = {}
 agent_dispatch_task: asyncio.Task | None = None
 AUTOMATIC_AGENT_PROMPT = (
     "Process the queued team messages now. Follow each command, use reports as context, "
@@ -139,9 +141,30 @@ class AgentInput(BaseModel):
     brief: str
     instructions: str
     project_id: int = 1
+    git_enabled: bool = False
 
 class GenerateAgentInput(BaseModel):
     prompt: str = Field(min_length=3, max_length=5000)
+
+
+class GitWorkflowInput(BaseModel):
+    main_branch: str = Field(min_length=1, max_length=120)
+    initialize: bool = False
+    remote: str = Field(default="", max_length=120)
+    remote_url: str = Field(default="", max_length=2000)
+
+
+class GitAgentInput(BaseModel):
+    enabled: bool
+
+
+class GitDiffOpenInput(BaseModel):
+    path: str = Field(min_length=1, max_length=2000)
+    editor: str = Field(pattern="^(pycharm|vscode)$")
+
+
+class GitPushInput(BaseModel):
+    remote: str = Field(default="", max_length=120)
 
 class CredentialInput(BaseModel):
     credential: str = Field(min_length=1, max_length=10000)
@@ -222,6 +245,32 @@ class SkillRunInput(BaseModel):
     project_id: int = 1
     role: str
     inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolDefinitionInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=2000)
+    inputs: str = Field(default="No arguments.", max_length=4000)
+    outputs: str = Field(default="Text output.", max_length=4000)
+    filename: str = Field(min_length=1, max_length=500)
+    output_format: str = Field(default="text", pattern="^(text|markdown|json|code)$")
+    result_template: str = Field(default="{stdout}", max_length=20_000)
+    env_vars: list[str] = Field(default_factory=list, max_length=100)
+    source: str = Field(default="", max_length=500_000)
+
+
+class ToolsetInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    slug: str = Field(default="", max_length=80)
+    description: str = Field(min_length=1, max_length=2000)
+    details: str = Field(default="", max_length=50_000)
+    tools: list[ToolDefinitionInput] = Field(min_length=1, max_length=50)
+    roles: list[str] = Field(default_factory=list, max_length=100)
+    project_id: int = 1
+
+
+class ToolsetGenerateInput(BaseModel):
+    prompt: str = Field(min_length=3, max_length=10_000)
 
 
 CODE_LANGUAGE_ALIASES = {
@@ -361,7 +410,7 @@ async def agents(project_id: int = 1):
         raise HTTPException(404, str(exc)) from exc
     definitions = team.definitions.list(project_id)
     configs = {item["role"]: item for item in team.configs.list([item["role"] for item in definitions], project_id)}
-    return [{"id": item["role"], "name": item["name"], "brief": item["brief"], "instructions": item["instructions"], "built_in": bool(item["built_in"]), "runtime": configs[item["role"]]} for item in definitions]
+    return [{"id": item["role"], "name": item["name"], "brief": item["brief"], "instructions": item["instructions"], "built_in": bool(item["built_in"]), "runtime": configs[item["role"]], "git_enabled": team.git.agent_enabled(project_id, item["role"])} for item in definitions]
 
 @app.get("/api/projects")
 async def list_projects():
@@ -382,6 +431,7 @@ async def delete_project(project_id: int):
         team.configs.remove_project(project_id)
         team.context.delete_project(project_id)
         team.definitions.delete_project(project_id)
+        team.git.remove_project(project_id)
         projects.delete(project_id)
     except KeyError as exc: raise HTTPException(404, str(exc)) from exc
 
@@ -409,14 +459,131 @@ async def update_project_edges(project_id: int, payload: EdgeInput):
     except KeyError as exc: raise HTTPException(404, str(exc)) from exc
     except ValueError as exc: raise HTTPException(422, str(exc)) from exc
 
+
+def _git_project_root(project_id: int) -> Path:
+    projects.get(project_id)
+    return team._project_root(project_id)
+
+
+@app.get("/api/projects/{project_id}/git")
+async def git_status(project_id: int):
+    try:
+        root = _git_project_root(project_id)
+        status = await asyncio.to_thread(team.git.status, project_id, root)
+        status["commits"] = team.git.agent_commits(project_id)
+        return status
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/git")
+async def configure_git(project_id: int, payload: GitWorkflowInput):
+    try:
+        return await asyncio.to_thread(
+            team.git.configure, project_id, _git_project_root(project_id), payload.main_branch,
+            initialize=payload.initialize, remote=payload.remote, remote_url=payload.remote_url,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/git/agents/{role}")
+async def configure_agent_git(project_id: int, role: str, payload: GitAgentInput):
+    try:
+        team.definitions.get(role, project_id)
+        projects.get(project_id)
+        return await asyncio.to_thread(
+            team.git.set_agent_enabled, project_id, role, payload.enabled, _git_project_root(project_id),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/git/agents/{role}/changes")
+async def agent_git_changes(project_id: int, role: str):
+    try:
+        team.definitions.get(role, project_id)
+        projects.get(project_id)
+        return {"role": role, "commits": team.git.agent_commits(project_id, role)}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/git/commits/{commit_hash}/diff")
+async def git_file_diff(project_id: int, commit_hash: str, path: str):
+    try:
+        return await asyncio.to_thread(team.git.file_diff, project_id, _git_project_root(project_id), commit_hash, path)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/open-diff")
+async def open_git_diff(project_id: int, commit_hash: str, payload: GitDiffOpenInput):
+    try:
+        return await asyncio.to_thread(
+            team.git.open_diff, project_id, _git_project_root(project_id), commit_hash, payload.path, payload.editor,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/revert")
+async def revert_git_commit(project_id: int, commit_hash: str):
+    try:
+        return await asyncio.to_thread(team.git.revert, project_id, _git_project_root(project_id), commit_hash)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/rollback")
+async def rollback_git_commit(project_id: int, commit_hash: str):
+    try:
+        return await asyncio.to_thread(team.git.rollback, project_id, _git_project_root(project_id), commit_hash)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/push")
+async def push_git_commit(project_id: int, commit_hash: str, payload: GitPushInput):
+    try:
+        return await asyncio.to_thread(
+            team.git.push, project_id, _git_project_root(project_id), commit_hash, payload.remote,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
 @app.post("/api/agents", status_code=201)
 async def create_agent(payload: AgentInput):
     try:
         projects.get(payload.project_id)
-        return team.definitions.save(payload.name, payload.brief, payload.instructions, payload.role, payload.project_id)
+        if payload.git_enabled and not team.git.configuration(payload.project_id):
+            raise ValueError("Configure a shared Git branch before enabling Git for this agent")
+        created = team.definitions.save(payload.name, payload.brief, payload.instructions, payload.role, payload.project_id)
+        await asyncio.to_thread(
+            team.git.set_agent_enabled, payload.project_id, created["role"], payload.git_enabled,
+            _git_project_root(payload.project_id),
+        )
+        created["git_enabled"] = payload.git_enabled
+        return created
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+    except (ValueError, GitWorkflowError) as exc: raise HTTPException(422, str(exc)) from exc
 
 @app.get("/api/agent-templates")
 async def list_agent_templates():
@@ -438,6 +605,7 @@ async def delete_agent(role: str, project_id: int = 1):
         projects.get(project_id)
         attachments = team.configs.attachments_for(role, project_id)
         team.definitions.delete(role, project_id)
+        team.git.remove_agent(project_id, role)
         for attachment in attachments:
             Path(attachment["path"]).unlink(missing_ok=True)
         team.configs.remove_agent(role, project_id)
@@ -533,6 +701,96 @@ async def execute_code(payload: CodeExecutionInput):
         raise HTTPException(502, f"Could not start the code runner: {exc}") from exc
 
 
+def _toolset_project(project_id: int) -> Path:
+    projects.get(project_id)
+    return team._project_root(project_id)
+
+
+@app.get("/api/toolsets")
+async def list_toolsets(project_id: int = 1, role: str = ""):
+    try:
+        project_root = _toolset_project(project_id)
+        if role:
+            team.definitions.get(role, project_id)
+        return team.toolsets.list(project_root, project_id, role or None)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/toolsets/{slug}")
+async def get_toolset(slug: str, project_id: int = 1):
+    try:
+        project_root = _toolset_project(project_id)
+        toolset = team.toolsets.get(project_root, slug)
+        if not toolset:
+            raise HTTPException(404, f"Toolset '{slug}' was not found")
+        assigned = next(
+            (item for item in team.toolsets.list(project_root, project_id) if item["slug"] == toolset["slug"]),
+            None,
+        )
+        toolset["assigned_roles"] = assigned.get("assigned_roles", []) if assigned else []
+        return toolset
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _save_toolset_payload(payload: ToolsetInput, existing_slug: str = "") -> dict[str, Any]:
+    project_root = _toolset_project(payload.project_id)
+    data = payload.model_dump()
+    if existing_slug:
+        data["slug"] = existing_slug
+    valid_roles = {item["role"] for item in team.definitions.list(payload.project_id)}
+    unknown = [role for role in payload.roles if role not in valid_roles]
+    if unknown:
+        raise ValueError(f"Unknown agent role(s): {', '.join(unknown)}")
+    saved = team.toolsets.save(project_root, data)
+    assignment = team.toolsets.assign(project_root, payload.project_id, saved["slug"], payload.roles)
+    saved["assigned_roles"] = assignment["roles"]
+    return saved
+
+
+@app.post("/api/toolsets", status_code=201)
+async def create_toolset(payload: ToolsetInput):
+    try:
+        return _save_toolset_payload(payload)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/toolsets/generate")
+async def generate_toolset(payload: ToolsetGenerateInput):
+    try:
+        return await team.generate_toolset_definition(payload.prompt)
+    except Exception as exc:
+        raise HTTPException(502, f"Codex toolset generation failed: {exc}") from exc
+
+
+@app.put("/api/toolsets/{slug}")
+async def update_toolset(slug: str, payload: ToolsetInput):
+    try:
+        if not team.toolsets.get(_toolset_project(payload.project_id), slug, include_source=False):
+            raise HTTPException(404, f"Toolset '{slug}' was not found")
+        return _save_toolset_payload(payload, slug)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/toolsets/{slug}", status_code=204)
+async def delete_toolset(slug: str, project_id: int = 1):
+    try:
+        team.toolsets.delete(_toolset_project(project_id), slug)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.get("/api/skills")
 async def list_skills(project_id: int = 1, role: str = "", q: str = "", type: str = "", sort: str = "name", platform: str = ""):
     try:
@@ -571,8 +829,8 @@ def _save_skill_payload(payload: SkillInput, skill_id: int | None = None) -> dic
         payload.language, payload.script, payload.slug, skill_id=skill_id,
         created_by=payload.created_by, version=payload.version, platform=payload.platform,
         skill_type=payload.skill_type, body=payload.body, output_format=payload.output_format,
-        license_name=payload.license, compatibility=payload.compatibility,
-        allowed_tools=payload.allowed_tools, source=payload.source, source_url=payload.source_url,
+        license_name=payload.license, compatibility=payload.compatibility, allowed_tools=payload.allowed_tools,
+        source=payload.source, source_url=payload.source_url,
         author=payload.author, metadata=payload.metadata, required_secrets=payload.required_secrets,
     )
     for variant_platform, variant in payload.platform_variants.items():
@@ -1065,11 +1323,40 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
             flush=True,
         )
         team.configs.update_chat_run(run_id, "running")
-        result = await team.chat(
-            role, payload.message.strip(), payload.model, payload.reasoning_effort, payload.project_id,
-            payload.reply_to_id, payload.attachment_ids, payload.record_user_message,
-            payload.user_message_id,
-        )
+        async def call_provider() -> dict[str, Any]:
+            return await team.chat(
+                role, payload.message.strip(), payload.model, payload.reasoning_effort, payload.project_id,
+                payload.reply_to_id, payload.attachment_ids, payload.record_user_message,
+                payload.user_message_id,
+            )
+
+        if team.git.agent_enabled(payload.project_id, role):
+            lock = git_run_locks.setdefault(payload.project_id, asyncio.Lock())
+            async with lock:
+                root = team._project_root(payload.project_id)
+                await asyncio.to_thread(team.git.begin_agent_run, payload.project_id, role, root)
+                result = await call_provider()
+                try:
+                    commit = await asyncio.to_thread(
+                        team.git.finish_agent_run, payload.project_id, role, run_id, root, payload.message,
+                    )
+                except GitWorkflowError as exc:
+                    message = f"Git workflow could not commit this agent run: {exc}"
+                    team.configs.add_message(role, "error", message, "git", "", payload.project_id)
+                    result["ok"] = False
+                    result["response"] = message
+                else:
+                    if commit:
+                        result["git_commit"] = commit
+                        team.configs.add_message(
+                            role, "app",
+                            f"Committed {commit['commit_hash'][:12]} on agent branch '{commit['agent_branch']}' and "
+                            f"merged it into the main branch '{commit['main_branch']}': {commit['message']} "
+                            f"({len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''}).",
+                            "git", commit["commit_hash"], payload.project_id,
+                        )
+        else:
+            result = await call_provider()
         status = "error" if result.get("ok") is False else "completed"
         team.configs.update_chat_run(run_id, status, result=result,
                                      error=result.get("response", "") if status == "error" else "")

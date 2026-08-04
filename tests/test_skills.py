@@ -95,16 +95,19 @@ def test_codex_skill_generation_uses_strict_safe_schema_and_restores_objects(tmp
             schema_path = self.args[self.args.index("--output-schema") + 1]
             output_path = self.args[self.args.index("--output-last-message") + 1]
             schema = json.loads(Path(schema_path).read_text())
-            assert schema["properties"]["inputs"]["type"] == "string"
-            assert schema["properties"]["outputs"]["type"] == "string"
+            assert "inputs" not in schema["properties"]
+            assert "outputs" not in schema["properties"]
+            assert "allowed_tools" in schema["properties"]
             Path(output_path).write_text(json.dumps({
                 "name": "Echo Text",
                 "slug": "echo_text",
                 "summary": "Echoes a text value.",
-                "inputs": '{"type":"object","required":["text"]}',
-                "outputs": '{"type":"object","properties":{"text":{"type":"string"}}}',
-                "language": "python",
-                "script": "print('{}')",
+                "version": "1.0.0",
+                "body": "# Echo Text\n\nEcho the provided text.",
+                "compatibility": "",
+                "license": "",
+                "allowed_tools": "",
+                "required_secrets": "[]",
             }))
             return b"", b""
 
@@ -116,8 +119,10 @@ def test_codex_skill_generation_uses_strict_safe_schema_and_restores_objects(tmp
 
     result = asyncio.run(team.generate_skill_definition("Echo text"))
 
-    assert result["inputs"] == {"type": "object", "required": ["text"]}
-    assert result["outputs"]["properties"]["text"]["type"] == "string"
+    assert result["name"] == "Echo Text"
+    assert result["slug"] == "echo_text"
+    assert result["body"].startswith("# Echo Text")
+    assert result["required_secrets"] == []
 
 
 def test_codex_skill_generation_keeps_structured_cli_diagnostic(tmp_path, monkeypatch):

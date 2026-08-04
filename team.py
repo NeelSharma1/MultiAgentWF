@@ -29,6 +29,8 @@ from skills import (
     SkillStore, normalize_skill_language, normalize_skill_platform, normalize_skill_secret_refs,
     normalize_skill_type, skill_slug,
 )
+from toolsets import ToolsetStore, resolve_tool_calls, toolset_slug
+from git_workflow import GitWorkflowStore
 
 
 ROLE_BRIEFS = {
@@ -72,7 +74,8 @@ GOOGLE_TEXT_ONLY_INSTRUCTION = (
     "This is a direct Gemini API bridge. The only function tools available are "
     "send_agent_message and list_agent_messages. Use them only when inter-agent coordination is needed; "
     "list_shared_context, publish_shared_context, and skill tools are not available on this bridge. "
-    "Do not emit tool calls or function calls other than these explicitly supplied tools. Answer the user directly in plain text using the "
+    "Do not emit tool calls or function calls other than these explicitly supplied provider tools. A textual TOOLCALL marker "
+    "described by an assigned local toolset is allowed and will be handled after this response. Answer the user directly using the "
     "conversation and shared context included here."
 )
 
@@ -274,6 +277,34 @@ def codex_process_args(args: list[str]) -> list[str]:
     return args
 
 
+def codex_process_env() -> dict[str, str]:
+    """Give every Codex subprocess the same ChatGPT login profile."""
+    env = os.environ.copy()
+    user_home = str(Path.home())
+    env.setdefault("HOME", user_home)
+    env.setdefault("USERPROFILE", user_home)
+    if os.name == "nt":
+        env.setdefault("HOMEDRIVE", Path(user_home).drive)
+        env.setdefault("HOMEPATH", str(Path(user_home).relative_to(Path(user_home).anchor)))
+    env.setdefault("CODEX_HOME", str(Path(user_home) / ".codex"))
+    return env
+
+
+CODEX_AUTH_MESSAGE = (
+    "Codex is not authenticated with your ChatGPT account. "
+    "Open Connections, choose Connect Codex, complete the OpenAI sign-in, and try again."
+)
+
+
+def _codex_auth_failure(diagnostic: str) -> bool:
+    """Recognize the CLI's missing or expired ChatGPT credential diagnostics."""
+    lowered = diagnostic.lower()
+    return "401 unauthorized" in lowered and any(
+        marker in lowered
+        for marker in ("missing bearer", "basic authentication", "not authenticated", "invalid api key")
+    )
+
+
 class AgentTeam:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -285,6 +316,8 @@ class AgentTeam:
         self.definitions = AgentDefinitionStore(self.db_path)
         self.context = ContextStore(self.db_path)
         self.skills = SkillStore(self.db_path)
+        self.toolsets = ToolsetStore()
+        self.git = GitWorkflowStore(self.db_path)
         self.mcp: MCPServerStdio | None = None
         self.codex_login_process: asyncio.subprocess.Process | None = None
         self.codex_login_output = ""
@@ -329,10 +362,11 @@ class AgentTeam:
             *codex_process_args([command, "login", "status"]),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=codex_process_env(),
         )
         output, _ = await process.communicate()
         detail = output.decode(errors="replace").strip()
-        connected = process.returncode == 0 and "logged in" in detail.lower()
+        connected = process.returncode == 0
         return {"connected": connected, "detail": detail, "login_output": self.codex_login_output,
                 "command": command}
 
@@ -347,6 +381,7 @@ class AgentTeam:
             *codex_process_args([command, "login", "--device-auth"]),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=codex_process_env(),
         )
         asyncio.create_task(self._capture_codex_login())
         await asyncio.sleep(0.5)
@@ -368,6 +403,7 @@ class AgentTeam:
             *codex_process_args([command, "logout"]),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=codex_process_env(),
         )
         await process.communicate()
         if process.returncode:
@@ -417,6 +453,46 @@ class AgentTeam:
             return "\n\nNo reusable skills are assigned to you in this workspace."
         return skill_guidance
 
+    def _tool_guidance(self, role: str, project_id: int = 1) -> str:
+        project_root = self._project_root(project_id)
+        assigned = self.toolsets.list(project_root, project_id, role)
+        if not assigned:
+            return "\n\nNo local command-line toolsets are assigned to you in this workspace."
+        lines = "\n".join(
+            f"- {item['name']}: {item['description']} (file: {item['filename']})"
+            for item in assigned
+        )
+        return (
+            "\n\nYou have access to the following tools. When applicable, ALWAYS use the tools below to "
+            "complete a task. Each entry is a short description of one toolset and gives its filename in "
+            "the working directory's .agents/tools folder:\n"
+            f"{lines}\n\n"
+            "If a toolset is needed, load its listed TOOLSET.md file and inspect only the Tool summary section. "
+            "If direct file access is unavailable, use load_toolset_summary. That section contains each tool's "
+            "name, short description, inputs, outputs, and executable filename. If a tool is useful, emit this "
+            "exact marker on its own line:\n\n"
+            "TOOLCALL - <toolset>/<tool name> - [arguments].\n\n"
+            "Arguments must be one valid JSON list in positional order and the marker must end with a period. "
+            "Do not wrap the marker in Markdown. The local workspace will execute the configured file and replace "
+            "the marker with the tool's formatted result in the chat. Never invent a toolset or tool name."
+        )
+
+    def _git_guidance(self, role: str, project_id: int = 1) -> str:
+        if not self.git.agent_enabled(project_id, role):
+            return ""
+        configuration = self.git.configuration(project_id)
+        if not configuration:
+            return ""
+        main_branch = configuration.get("main_branch") or configuration["branch"]
+        return (
+            f"\n\nThis is a Git-enabled agent workflow. The app checks out your dedicated '{role}' branch from "
+            f"the main branch '{main_branch}' before you work, then commits and merges it into '{main_branch}' "
+            "after your response. "
+            "Work only in the current working tree. Never create, switch, merge, rebase, reset, or delete Git branches, "
+            "and do not run git commit, git add, git push, git pull, git revert, or git reset. The workspace captures "
+            "the completed series of file changes as one commit and handles the merge automatically."
+        )
+
     def _instructions(self, role: str, project_id: int = 1) -> str:
         definition = self.definitions.get(role, project_id)
         roster = ", ".join(
@@ -441,6 +517,8 @@ class AgentTeam:
             "Never claim another agent completed work unless the conversation or shared context shows it. "
             f"Be direct, practical, and identify assumptions. Your role is {definition['name']}: {definition['instructions']}"
             f"{self._skill_guidance(role, project_id)}"
+            f"{self._tool_guidance(role, project_id)}"
+            f"{self._git_guidance(role, project_id)}"
         )
 
     def _model(self, config: dict[str, str]):
@@ -828,6 +906,14 @@ class AgentTeam:
         command = self._codex_command()
         if not command:
             raise ProviderError("Codex CLI was not found. Set CODEX_COMMAND or install and sign in to Codex CLI.")
+        login = await self.codex_login_status()
+        if not login["connected"]:
+            raise ProviderError(
+                CODEX_AUTH_MESSAGE,
+                provider="codex",
+                status_code=401,
+                code="codex_not_authenticated",
+            )
         working_root = self._project_root(project_id)
         shared = self.context.list(role, project_id)
         context_text = "\n\n".join(f"[{item['title']}]\n{item['content']}" for item in shared) or "No shared context."
@@ -841,8 +927,8 @@ class AgentTeam:
         attachment_prompt = f"\n\n{attachment_prompt}" if attachment_prompt else ""
         if existing:
             prompt = (
-                f"The shared team context and reusable skill assignments may have changed since the prior turn.\n"
-                f"{shared_prompt}\n{self._skill_guidance(role, project_id)}\n\n"
+                f"The shared team context, reusable skill assignments, and local toolsets may have changed since the prior turn.\n"
+                f"{shared_prompt}\n{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
                 f"User: {message}{reply_prompt}{attachment_prompt}"
             )
         else:
@@ -879,12 +965,20 @@ class AgentTeam:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=codex_process_env(),
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(prompt.encode()), timeout=600)
             if process.returncode:
                 diagnostic = _codex_diagnostic(stdout, stderr)
                 if existing and any(token in diagnostic.lower() for token in ("session", "thread", "resume", "conversation")):
                     self.configs.clear_codex_session(role, project_id)
+                if _codex_auth_failure(diagnostic):
+                    raise ProviderError(
+                        CODEX_AUTH_MESSAGE,
+                        provider="codex",
+                        status_code=401,
+                        code="codex_not_authenticated",
+                    )
                 raise ProviderError(
                     f"Codex failed (exit code {process.returncode}):\n{diagnostic}",
                     provider="codex", status_code=process.returncode,
@@ -963,6 +1057,7 @@ class AgentTeam:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=codex_process_env(),
         )
         assert process.stdin and process.stdout
         request_id = 0
@@ -1024,6 +1119,7 @@ class AgentTeam:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                env=codex_process_env(),
             )
             _, stderr = await asyncio.wait_for(process.communicate(task.encode()), timeout=600)
             if process.returncode:
@@ -1043,27 +1139,16 @@ class AgentTeam:
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Human-facing skill name in title case"},
-                "slug": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{1,79}$", "description": "Stable lowercase local ID; it will be normalized to an ACP hyphenated name"},
-                "summary": {"type": "string", "description": "One or two sentence explanation of what the skill does"},
-                # Codex uses OpenAI strict structured outputs.  Every object
-                # in that schema must declare additionalProperties=false,
-                # which is incompatible with the arbitrary property names a
-                # user-facing input/output schema needs.  Ask Codex for JSON
-                # encoded strings and normalize them back to objects below.
-                "inputs": {"type": "string", "description": "A JSON-encoded compact schema object describing required and optional inputs"},
-                "outputs": {"type": "string", "description": "A JSON-encoded compact schema object describing returned output"},
-                "language": {"type": "string", "enum": ["none", "python", "javascript", "shell", "powershell", "ruby", "batch"]},
-                "script": {"type": "string", "description": "Executable script that reads one JSON object from stdin or SKILL_INPUT_JSON and prints JSON output to stdout"},
+                "slug": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{1,79}$", "description": "Stable lowercase ACP name/folder ID"},
+                "summary": {"type": "string", "description": "One or two sentence SKILL.md description"},
                 "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$", "description": "Portable skill package version"},
-                "skill_type": {"type": "string", "enum": ["general", "development", "research", "documentation", "automation", "data", "security", "frontend", "backend", "devops", "ai-agents", "other"]},
                 "body": {"type": "string", "description": "Markdown instructions for the SKILL.md body, including when to use the skill, workflow, and safety boundaries"},
-                "output_format": {"type": "string", "enum": ["text", "markdown", "json", "diff", "table", "code"]},
                 "compatibility": {"type": "string", "description": "Optional OS, tool, runtime, or dependency requirements"},
                 "license": {"type": "string", "description": "Optional license identifier"},
-                "platform_variants": {"type": "string", "description": "JSON-encoded object mapping macos, linux, windows, or any to version/language/script/body overrides"},
+                "allowed_tools": {"type": "string", "description": "Optional ACP allowed-tools frontmatter value"},
                 "required_secrets": {"type": "string", "description": "JSON-encoded array of secret references, each with name, label, description, and required; never include secret values"},
             },
-            "required": ["name", "slug", "summary", "inputs", "outputs", "language", "script", "version", "skill_type", "body", "output_format", "compatibility", "license", "platform_variants", "required_secrets"],
+            "required": ["name", "slug", "summary", "version", "body", "compatibility", "license", "allowed_tools", "required_secrets"],
             "additionalProperties": False,
         }
         with tempfile.TemporaryDirectory(prefix="agent-team-skill-") as temp_dir:
@@ -1071,11 +1156,9 @@ class AgentTeam:
             output_path = Path(temp_dir) / "output.json"
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
             task = (
-                "Design one reusable terminal-backed agent skill from this request: "
+                "Design one reusable portable Agent Skill from this request: "
                 f"{prompt}. Return only the requested structured fields. The skill must be deterministic and "
-                "self-contained. Its script must read a JSON object from stdin (also available as SKILL_INPUT_JSON), "
-                "perform the operation, and print one JSON value to stdout; do not print Markdown fences or explanations. "
-                "Return inputs, outputs, and platform_variants as JSON-encoded object strings, not nested objects. "
+                "self-contained. Do not create an executable script, input/output JSON schemas, or OS-specific variants. "
                 "Return required_secrets as a JSON-encoded array of declarations such as "
                 '[{"name":"WEATHER_API_KEY","label":"Weather API key","description":"Used for the weather service","required":true}]. '
                 "Declare names only; never include API keys, tokens, passwords, or other secret values. "
@@ -1090,6 +1173,7 @@ class AgentTeam:
                     "--output-last-message", str(output_path), "-",
                 ]),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=codex_process_env(),
             )
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(task.encode()), timeout=600)
@@ -1121,44 +1205,139 @@ class AgentTeam:
                     "Codex returned an invalid skill definition. "
                     f"{diagnostic}", provider="codex", body=raw_output[-4000:]
                 ) from exc
-        draft["language"] = normalize_skill_language(draft.get("language", "python"))
         draft["slug"] = skill_slug(draft.get("slug") or draft.get("name"))
-        for field in ("inputs", "outputs", "platform_variants"):
-            if isinstance(draft.get(field), str):
-                try:
-                    draft[field] = json.loads(draft[field])
-                except json.JSONDecodeError:
-                    draft[field] = {"description": draft[field]} if field != "platform_variants" else {}
-            if not isinstance(draft.get(field), dict):
-                draft[field] = {}
         draft["version"] = str(draft.get("version") or "1.0.0")
-        draft["skill_type"] = normalize_skill_type(draft.get("skill_type", "general"))
-        draft["output_format"] = str(draft.get("output_format") or "text").lower()
         draft["compatibility"] = str(draft.get("compatibility") or "")
+        draft["allowed_tools"] = str(draft.get("allowed_tools") or "")
         draft["license"] = str(draft.get("license") or "")
         draft["body"] = str(draft.get("body") or "").strip()
         try:
             draft["required_secrets"] = normalize_skill_secret_refs(draft.get("required_secrets", []))
         except ValueError:
             draft["required_secrets"] = []
-        variants = {}
-        for platform, variant in draft["platform_variants"].items():
-            if isinstance(variant, dict):
-                if "required_secrets" in variant:
-                    try:
-                        variant["required_secrets"] = normalize_skill_secret_refs(variant["required_secrets"])
-                    except ValueError:
-                        variant["required_secrets"] = draft["required_secrets"]
-                variants[normalize_skill_platform(platform)] = variant
-        draft["platform_variants"] = variants
         if not draft["body"]:
             draft["body"] = f"# {draft['name']}\n\n{draft['summary']}"
+        return draft
+
+    async def generate_toolset_definition(self, prompt: str) -> dict[str, Any]:
+        command = self._codex_command()
+        if not command:
+            raise ProviderError("Codex CLI was not found")
+        tool_properties = {
+            "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$", "description": "Stable hyphenated tool name"},
+            "description": {"type": "string", "description": "One-sentence description of when this tool is useful"},
+            "inputs": {"type": "string", "description": "Ordered positional argument contract, including optional arguments"},
+            "outputs": {"type": "string", "description": "Exact stdout/result contract"},
+            "filename": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}\\.py$", "description": "Unique Python executable filename"},
+            "output_format": {"type": "string", "enum": ["text", "markdown", "json", "code"]},
+            "result_template": {"type": "string", "description": "Chat template using stdout, stderr, exit_code, toolset, or tool markers in braces"},
+            "env_vars": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+                "description": "Environment-variable names required by this tool; names only, never values",
+            },
+            "source": {"type": "string", "description": "Complete cross-platform Python 3 source code"},
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Human-facing toolset name"},
+                "slug": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$", "description": "Stable toolset folder ID"},
+                "description": {"type": "string", "description": "One-sentence summary used in prompt discovery"},
+                "details": {"type": "string", "description": "Concise shared constraints and usage guidance"},
+                "tools": {
+                    "type": "array", "minItems": 1, "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": tool_properties,
+                        "required": list(tool_properties),
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["name", "slug", "description", "details", "tools"],
+            "additionalProperties": False,
+        }
+        with tempfile.TemporaryDirectory(prefix="agent-team-toolset-") as temp_dir:
+            schema_path = Path(temp_dir) / "schema.json"
+            output_path = Path(temp_dir) / "output.json"
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
+            task = (
+                "Design one focused local command-line toolset from this request: "
+                f"{prompt}. Return only the requested structured fields. Create between one and eight narrowly useful "
+                "tools. Every tool must be a complete cross-platform Python 3 program that uses only the standard "
+                "library, reads positional arguments from sys.argv[1:], writes its documented result to stdout, writes "
+                "diagnostics to stderr, and exits nonzero on failure. A tool may invoke an installed command-line "
+                "program with subprocess.run using an argument list and shell=False. Never interpolate arguments into "
+                "a shell command. Internet tools should use urllib and set a descriptive User-Agent. Do not access .env "
+                "files or embed API keys, tokens, passwords, cookies, or other secret values. If credentials are needed, "
+                "declare environment-variable names only in env_vars. Make filenames and tool names unique. Describe "
+                "inputs in exact positional order. Use {stdout} as the default result_template unless a small Markdown "
+                "wrapper materially improves the chat result. Keep the toolset discovery description to one sentence."
+            )
+            process = await asyncio.create_subprocess_exec(
+                *codex_process_args([
+                    command, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
+                    "-C", str(self.root), "--output-schema", str(schema_path),
+                    "--output-last-message", str(output_path), "-",
+                ]),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=codex_process_env(),
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(task.encode()), timeout=600)
+            except asyncio.TimeoutError as exc:
+                process.kill()
+                stdout, stderr = await process.communicate()
+                raise ProviderError(
+                    "Codex toolset generation timed out after 600 seconds. "
+                    f"{_codex_diagnostic(stdout, stderr)}", provider="codex"
+                ) from exc
+            if process.returncode:
+                diagnostic = _codex_diagnostic(stdout, stderr)
+                if _codex_auth_failure(diagnostic):
+                    raise ProviderError(CODEX_AUTH_MESSAGE, provider="codex", status_code=401,
+                                        code="codex_not_authenticated")
+                raise ProviderError(
+                    f"Codex toolset generation failed (exit code {process.returncode}): {diagnostic}",
+                    provider="codex", status_code=process.returncode,
+                )
+            if not output_path.is_file():
+                raise ProviderError(
+                    "Codex completed without creating its structured toolset response file. "
+                    f"{_codex_diagnostic(stdout, stderr)}", provider="codex"
+                )
+            raw_output = output_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                draft = _json_from_codex_output(raw_output)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ProviderError(
+                    "Codex returned an invalid toolset definition. "
+                    f"{_codex_diagnostic(stdout, stderr)}", provider="codex", body=raw_output[-4000:]
+                ) from exc
+        try:
+            draft["slug"] = toolset_slug(draft.get("slug") or draft.get("name"))
+            draft["name"] = str(draft.get("name") or "Generated toolset").strip()
+            draft["description"] = str(draft.get("description") or "").strip()
+            draft["details"] = str(draft.get("details") or "").strip()
+            draft["tools"] = [self.toolsets._normalize_tool(item) for item in draft.get("tools", [])]
+            if not draft["tools"]:
+                raise ValueError("Codex did not define any tools")
+            for tool in draft["tools"]:
+                compile(tool["source"], tool["filename"], "exec")
+        except ValueError as exc:
+            raise ProviderError(f"Codex generated an invalid toolset: {exc}", provider="codex") from exc
+        except SyntaxError as exc:
+            raise ProviderError(
+                f"Codex generated invalid Python for {exc.filename}: {exc.msg} (line {exc.lineno})",
+                provider="codex",
+            ) from exc
         return draft
 
     def _codex_tui_command(self, executable: str, command_text: str, config: dict[str, str],
                            session_id: str = "", working_root: Path | None = None) -> str:
         terminal = create_terminal(rows=40, columns=120)
-        env = os.environ.copy()
+        env = codex_process_env()
         env.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40"})
         working_root = working_root or self.root
         if session_id:
@@ -1339,6 +1518,12 @@ class AgentTeam:
                     [int(item["id"]) for item in inbound_messages], delivery_run_id,
                 )
                 raise
+            resolved_response, tool_calls = await resolve_tool_calls(
+                result["response"], self.toolsets, self._project_root(project_id), project_id, role,
+            )
+            result["response"] = resolved_response
+            if tool_calls:
+                result["tool_calls"] = tool_calls
             print(result, flush=True)
             user_message = existing_user_message
             if user_message is None and record_user_message:

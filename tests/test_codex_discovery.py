@@ -61,3 +61,23 @@ def test_windows_codex_shim_prefers_adjacent_native_binary(tmp_path, monkeypatch
     monkeypatch.setenv("CODEX_COMMAND", str(shim))
 
     assert team.resolve_codex_command() == str(native.resolve())
+
+
+def test_codex_process_env_uses_the_user_profile_for_chatgpt_auth(tmp_path, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setattr(team.Path, "home", classmethod(lambda cls: tmp_path))
+
+    env = team.codex_process_env()
+
+    assert env["HOME"] == str(tmp_path)
+    assert env["USERPROFILE"] == str(tmp_path)
+    assert env["CODEX_HOME"] == str(tmp_path / ".codex")
+
+
+def test_codex_auth_failure_detects_missing_bearer_message():
+    assert team._codex_auth_failure(
+        "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+    )
+    assert not team._codex_auth_failure("unexpected status 500 Internal Server Error")
