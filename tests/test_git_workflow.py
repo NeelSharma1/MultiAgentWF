@@ -100,3 +100,18 @@ def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
     ).stdout
     assert "refs/heads/team-main" in remote_refs
     assert "refs/heads/programmer" in remote_refs
+
+
+def test_main_branch_is_unambiguous_when_a_tag_has_the_same_name(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "seed.txt").write_text("seed\n", encoding="utf-8")
+    first = workflow.finish_agent_run(1, "programmer", "run-seed", repository, "Seed main")
+    assert first is not None
+    _git(workflow, repository, "tag", "team-main")
+    _git(workflow, repository, "checkout", "programmer")
+
+    run = workflow.begin_agent_run(1, "programmer", repository)
+
+    assert run["branch"] == "programmer"
+    assert _git(workflow, repository, "branch", "--show-current") == "programmer"

@@ -242,15 +242,15 @@ class GitWorkflowStore:
             return
         local = self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{main_branch}", check=False)
         if local.returncode == 0:
-            self._run(repository, "checkout", main_branch)
+            self._run(repository, "checkout", "--no-guess", main_branch)
             return
         remote_ref = f"refs/remotes/{remote}/{main_branch}" if remote else ""
         if remote_ref and self._run(repository, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0:
             if current == main_branch and not has_head:
-                self._run(repository, "checkout", "-B", main_branch, f"{remote}/{main_branch}")
-                self._run(repository, "branch", "--set-upstream-to", f"{remote}/{main_branch}", main_branch)
+                self._run(repository, "checkout", "-B", main_branch, remote_ref)
+                self._run(repository, "branch", "--set-upstream-to", remote_ref, f"refs/heads/{main_branch}")
             else:
-                self._run(repository, "checkout", "-b", main_branch, "--track", f"{remote}/{main_branch}")
+                self._run(repository, "checkout", "-b", main_branch, "--track", remote_ref)
             return
         if self._run(repository, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
             self._run(repository, "checkout", "-b", main_branch)
@@ -261,15 +261,16 @@ class GitWorkflowStore:
         """Start an agent branch at main only after its previous work is merged."""
         exists = self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{agent_branch}", check=False)
         if exists.returncode == 0:
-            merged = self._run(repository, "merge-base", "--is-ancestor", agent_branch, main_branch, check=False)
+            merged = self._run(repository, "merge-base", "--is-ancestor", f"refs/heads/{agent_branch}",
+                               f"refs/heads/{main_branch}", check=False)
             if merged.returncode:
                 raise GitWorkflowError(
                     f"Agent branch '{agent_branch}' has unmerged work. Resolve it before starting another run."
                 )
-            self._run(repository, "branch", "-f", agent_branch, main_branch)
-            self._run(repository, "checkout", agent_branch)
+            self._run(repository, "branch", "-f", agent_branch, f"refs/heads/{main_branch}")
+            self._run(repository, "checkout", "--no-guess", agent_branch)
         else:
-            self._run(repository, "checkout", "-b", agent_branch, main_branch)
+            self._run(repository, "checkout", "-b", agent_branch, f"refs/heads/{main_branch}")
 
     def _ensure_initial_main_commit(self, repository: Path, main_branch: str) -> None:
         if self._run(repository, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
@@ -317,7 +318,7 @@ class GitWorkflowStore:
         main_parent = self._run(repository, "rev-parse", "HEAD").stdout.strip()
         merge_message = f"Merge agent {role}: {subject}"
         try:
-            self._run(repository, "merge", "--no-ff", agent_branch, "-m", merge_message, timeout=60)
+            self._run(repository, "merge", "--no-ff", f"refs/heads/{agent_branch}", "-m", merge_message, timeout=60)
         except GitWorkflowError as exc:
             raise GitWorkflowError(
                 f"Automatic merge of '{agent_branch}' into '{main_branch}' failed. Resolve the Git merge conflict, then retry. {exc}"
@@ -490,9 +491,11 @@ class GitWorkflowStore:
         if selected not in remotes:
             raise GitWorkflowError(f"Remote '{selected}' does not exist")
         main_branch = self._main_branch(configuration)
-        self._run(repository, "push", "--set-upstream", selected, main_branch, timeout=120)
+        main_ref = f"refs/heads/{main_branch}:refs/heads/{main_branch}"
+        self._run(repository, "push", "--set-upstream", selected, main_ref, timeout=120)
         agent_branch = record.get("agent_branch") or self._agent_branch(repository, record["role"])
-        self._run(repository, "push", "--set-upstream", selected, agent_branch, timeout=120)
+        agent_ref = f"refs/heads/{agent_branch}:refs/heads/{agent_branch}"
+        self._run(repository, "push", "--set-upstream", selected, agent_ref, timeout=120)
         with self._connect() as db:
             db.execute("UPDATE agent_git_commits SET pushed=1 WHERE project_id=? AND commit_hash=?",
                        (project_id, commit_hash))
