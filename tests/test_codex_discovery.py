@@ -1,5 +1,9 @@
 import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 import team
 
@@ -27,3 +31,33 @@ def test_resolve_codex_command_uses_jetbrains_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(team.subprocess, "run", lambda *args, **kwargs: None)
 
     assert team.resolve_codex_command() == str(command.resolve())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher shim test")
+def test_windows_codex_cmd_shim_can_be_invoked(tmp_path):
+    command = tmp_path / "codex.cmd"
+    command.write_text("@echo off\necho codex-shim %*\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        team.codex_process_args([str(command), "login", "status"]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "codex-shim login status" in completed.stdout.lower()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows native Codex discovery test")
+def test_windows_codex_shim_prefers_adjacent_native_binary(tmp_path, monkeypatch):
+    node_modules = tmp_path / "node_modules"
+    shim = node_modules / ".bin" / "codex.cmd"
+    native = node_modules / "@openai" / "codex-win32-x64" / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe"
+    shim.parent.mkdir(parents=True)
+    native.parent.mkdir(parents=True)
+    shim.write_text("@echo off\n", encoding="utf-8")
+    native.write_bytes(b"native-test")
+    monkeypatch.setenv("CODEX_COMMAND", str(shim))
+
+    assert team.resolve_codex_command() == str(native.resolve())

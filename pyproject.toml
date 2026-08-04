@@ -14,6 +14,7 @@ dependencies = [
   "PyYAML>=6.0",
   "pyte>=0.8.2",
   "uvicorn[standard]>=0.34",
+  "pywinpty>=3.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

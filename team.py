@@ -9,11 +9,7 @@ import json
 import re
 import uuid
 import subprocess
-import fcntl
-import pty
-import select
-import struct
-import termios
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +20,7 @@ from openai import AsyncOpenAI
 import httpx
 import pyte
 
+from terminal import create_terminal
 from runtime_config import PROVIDERS, RuntimeConfigStore
 from agent_definitions import AgentDefinitionStore
 from shared_context import ContextStore, ROLES
@@ -173,17 +170,52 @@ def _json_from_codex_output(raw: str) -> dict[str, Any]:
     return parsed
 
 
+def _prefer_windows_native_codex(command: str) -> str:
+    """Prefer the native Codex binary beside an npm launcher shim."""
+    if os.name != "nt":
+        return command
+    command_path = Path(command)
+    if command_path.suffix.lower() not in {".cmd", ".bat", ".ps1"}:
+        return command
+    node_modules = command_path.parent.parent
+    candidates = sorted(
+        node_modules.glob("@openai/codex-win32-*/vendor/*/bin/codex.exe"),
+        reverse=True,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return command
+
+
 def resolve_codex_command() -> str | None:
     """Find Codex even when a GUI-launched server has a minimal PATH."""
     configured = os.getenv("CODEX_COMMAND", "").strip()
     if configured:
         configured_path = Path(configured).expanduser()
         if configured_path.is_file() and os.access(configured_path, os.X_OK):
-            return str(configured_path.resolve())
+            return _prefer_windows_native_codex(str(configured_path.resolve()))
+        configured_command = shutil.which(configured)
+        if configured_command:
+            return _prefer_windows_native_codex(str(Path(configured_command).resolve()))
 
-    discovered = shutil.which("codex")
-    if discovered:
-        return str(Path(discovered).resolve())
+    command_names = ("codex.exe", "codex.cmd", "codex.bat", "codex") if os.name == "nt" else ("codex",)
+    for command_name in command_names:
+        discovered = shutil.which(command_name)
+        if discovered:
+            return _prefer_windows_native_codex(str(Path(discovered).resolve()))
+
+    if os.name == "nt":
+        jetbrains_windows_root = Path.home() / "AppData" / "Local" / "JetBrains"
+        patterns = (
+            "*/acp-agents/.runtimes/node/*/npm-cache/_npx/*/node_modules/@openai/"
+            "codex-win32-*/vendor/*/bin/codex.exe",
+            "*/acp-agents/.runtimes/node/*/npm-cache/_npx/*/node_modules/.bin/codex.cmd",
+        )
+        for pattern in patterns:
+            for candidate in sorted(jetbrains_windows_root.glob(pattern), reverse=True):
+                if candidate.is_file():
+                    return _prefer_windows_native_codex(str(candidate.resolve()))
 
     # JetBrains launches Python with a smaller PATH than an interactive shell.
     # Include conventional install locations before checking its bundled runtime.
@@ -227,6 +259,21 @@ def resolve_codex_command() -> str | None:
     return None
 
 
+def codex_process_args(args: list[str]) -> list[str]:
+    """Return an executable argument vector that works with Windows shims."""
+    if not args or os.name != "nt":
+        return args
+    command = Path(args[0])
+    suffix = command.suffix.lower()
+    if suffix in {".cmd", ".bat"}:
+        shell = os.getenv("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+        return [shell, "/d", "/s", "/c", subprocess.list2cmdline(args)]
+    if suffix == ".ps1":
+        powershell = shutil.which("powershell.exe") or "powershell.exe"
+        return [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *args]
+    return args
+
+
 class AgentTeam:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -256,10 +303,11 @@ class AgentTeam:
             return self.root.resolve()
 
     async def start(self) -> None:
+        python_command = os.getenv("PYTHON", "").strip() or sys.executable
         self.mcp = MCPServerStdio(
             name="shared-context",
             params={
-                "command": os.getenv("PYTHON", str(self.root / ".venv" / "bin" / "python")),
+                "command": python_command,
                 "args": [str(self.root / "mcp_server.py")],
                 "env": {"WORKSPACE_DB": str(self.db_path)},
             },
@@ -277,7 +325,11 @@ class AgentTeam:
         command = self._codex_command()
         if not command:
             return {"connected": False, "detail": "Codex CLI not found", "login_output": self.codex_login_output}
-        process = await asyncio.create_subprocess_exec(command, "login", "status", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        process = await asyncio.create_subprocess_exec(
+            *codex_process_args([command, "login", "status"]),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
         output, _ = await process.communicate()
         detail = output.decode(errors="replace").strip()
         connected = process.returncode == 0 and "logged in" in detail.lower()
@@ -291,7 +343,11 @@ class AgentTeam:
         if self.codex_login_process and self.codex_login_process.returncode is None:
             return await self.codex_login_status()
         self.codex_login_output = "Starting Codex device login…"
-        self.codex_login_process = await asyncio.create_subprocess_exec(command, "login", "--device-auth", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        self.codex_login_process = await asyncio.create_subprocess_exec(
+            *codex_process_args([command, "login", "--device-auth"]),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
         asyncio.create_task(self._capture_codex_login())
         await asyncio.sleep(0.5)
         return await self.codex_login_status()
@@ -308,7 +364,11 @@ class AgentTeam:
         command = self._codex_command()
         if not command:
             raise ProviderError("Codex CLI not found")
-        process = await asyncio.create_subprocess_exec(command, "logout", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        process = await asyncio.create_subprocess_exec(
+            *codex_process_args([command, "logout"]),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
         await process.communicate()
         if process.returncode:
             raise ProviderError("Codex logout failed")
@@ -792,7 +852,8 @@ class AgentTeam:
                 "Keep continuity with future turns in this Codex session.\n\n"
                 f"{shared_prompt}\n\nUser: {message}{reply_prompt}{attachment_prompt}"
             )
-        with tempfile.NamedTemporaryFile(prefix="agent-team-", suffix=".txt") as output:
+        with tempfile.TemporaryDirectory(prefix="agent-team-") as temp_dir:
+            output_path = Path(temp_dir) / "last-message.txt"
             if existing:
                 # `-C/--cd` belongs to the top-level `exec` command in current
                 # Codex CLI releases. Putting it after `resume` makes the CLI
@@ -808,13 +869,13 @@ class AgentTeam:
             for item in attachments:
                 if item["mime_type"].startswith("image/"):
                     args.extend(["--image" if not existing else "-i", item["path"]])
-            args.extend(["--json", "--output-last-message", output.name])
+            args.extend(["--json", "--output-last-message", str(output_path)])
             if existing:
                 args.extend([existing["session_id"], "-"])
             else:
                 args.append("-")
             process = await asyncio.create_subprocess_exec(
-                *args,
+                *codex_process_args(args),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -843,8 +904,7 @@ class AgentTeam:
             self.configs.save_codex_session(
                 role, project_id, session_id, config.get("model", ""), config.get("reasoning_effort", "")
             )
-            output.seek(0)
-            response = output.read().decode().strip()
+            response = output_path.read_text(encoding="utf-8", errors="replace").strip()
         if not response:
             raise ProviderError("Codex completed without a final response")
         return {"response": response, "answered_by": self.definitions.get(role, project_id)["name"]}
@@ -898,8 +958,12 @@ class AgentTeam:
         command = self._codex_command()
         if not command:
             raise ProviderError("Codex CLI was not found")
-        process = await asyncio.create_subprocess_exec(command, "app-server", "--stdio",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(
+            *codex_process_args([command, "app-server", "--stdio"]),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         assert process.stdin and process.stdout
         request_id = 0
 
@@ -946,15 +1010,25 @@ class AgentTeam:
             "brief":{"type":"string","description":"One-sentence summary of the specialist's responsibility"},
             "instructions":{"type":"string","description":"Specific operational instructions defining behavior, outputs, and boundaries"}},
             "required":["name","role","brief","instructions"],"additionalProperties":False}
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as schema_file, tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as output:
-            json.dump(schema, schema_file); schema_file.flush()
+        with tempfile.TemporaryDirectory(prefix="agent-team-definition-") as temp_dir:
+            schema_path = Path(temp_dir) / "schema.json"
+            output_path = Path(temp_dir) / "output.json"
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
             task = f"Design one focused AI team-member role from this request: {prompt}. Return only the requested structured fields. The role must be a lowercase snake_case ID. Instructions should be specific and operational."
-            process = await asyncio.create_subprocess_exec(command,"exec","--ephemeral","--sandbox","read-only","--skip-git-repo-check","-C",str(self.root),"--output-schema",schema_file.name,"--output-last-message",output.name,"-",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.PIPE)
+            process = await asyncio.create_subprocess_exec(
+                *codex_process_args([
+                    command, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
+                    "-C", str(self.root), "--output-schema", str(schema_path),
+                    "--output-last-message", str(output_path), "-",
+                ]),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
             _, stderr = await asyncio.wait_for(process.communicate(task.encode()), timeout=600)
             if process.returncode:
                 raise ProviderError(stderr.decode(errors="replace").strip().splitlines()[-1])
-            output.seek(0)
-            draft = json.load(output)
+            draft = json.loads(output_path.read_text(encoding="utf-8"))
             if "_" in draft["name"] and draft["name"].lower() == draft["name"]:
                 draft["name"] = draft["name"].replace("_", " ").title()
             if not re.fullmatch(r"[a-z][a-z0-9_]{1,39}", draft["role"]):
@@ -1010,8 +1084,11 @@ class AgentTeam:
                 "Keep discovery metadata concise because it is shown to agents before the body is loaded."
             )
             process = await asyncio.create_subprocess_exec(
-                command, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "-C", str(self.root),
-                "--output-schema", str(schema_path), "--output-last-message", str(output_path), "-",
+                *codex_process_args([
+                    command, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
+                    "-C", str(self.root), "--output-schema", str(schema_path),
+                    "--output-last-message", str(output_path), "-",
+                ]),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             try:
@@ -1080,8 +1157,7 @@ class AgentTeam:
 
     def _codex_tui_command(self, executable: str, command_text: str, config: dict[str, str],
                            session_id: str = "", working_root: Path | None = None) -> str:
-        master_fd, slave_fd = pty.openpty()
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        terminal = create_terminal(rows=40, columns=120)
         env = os.environ.copy()
         env.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40"})
         working_root = working_root or self.root
@@ -1095,27 +1171,22 @@ class AgentTeam:
             args.extend(["-c", f'model_reasoning_effort="{config["reasoning_effort"]}"'])
         if session_id:
             args.append(session_id)
-        process = subprocess.Popen(args, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                                   env=env, start_new_session=True, close_fds=True)
-        os.close(slave_fd)
+        args = codex_process_args(args)
         screen = pyte.Screen(120, 40)
         stream = pyte.Stream(screen)
 
         def drain(duration: float) -> None:
             deadline = time.monotonic() + duration
-            while time.monotonic() < deadline and process.poll() is None:
-                readable, _, _ = select.select([master_fd], [], [], 0.15)
-                if not readable:
-                    continue
+            while time.monotonic() < deadline and terminal.is_alive():
+                chunk = terminal.read_available(0.15)
                 try:
-                    chunk = os.read(master_fd, 65_536)
-                except OSError:
+                    if chunk:
+                        stream.feed(chunk)
+                except (OSError, ValueError):
                     break
-                if not chunk:
-                    break
-                stream.feed(chunk.decode(errors="replace"))
 
         try:
+            terminal.spawn(args, env=env, cwd=working_root)
             # Let the real TUI finish loading its model and MCP status before entering the command.
             ready = False
             for _ in range(30):
@@ -1131,24 +1202,19 @@ class AgentTeam:
             # The TUI processes key events, not pasted stdin; pace characters so its slash
             # completion state consumes the full command before Enter selects it.
             for character in command_text:
-                os.write(master_fd, character.encode())
+                terminal.write(character.encode())
                 time.sleep(0.025)
                 drain(0.01)
             time.sleep(0.1)
-            os.write(master_fd, b"\r")
+            terminal.write(b"\r")
             drain(2.5)
             output = "\n".join(line.rstrip() for line in screen.display).strip()
             if not output:
                 raise ProviderError("Codex returned an empty terminal screen")
             return output
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            os.close(master_fd)
+            terminal.terminate()
+            terminal.close()
 
     async def native_command(self, role: str, command_text: str, project_id: int = 1) -> dict[str, str]:
         command_name = command_text.partition(" ")[0]

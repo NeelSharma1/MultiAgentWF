@@ -39,7 +39,7 @@ def collect_git_report(project_path: str | Path) -> dict[str, Any]:
     if not path.is_dir():
         raise GitReportError(f"Project folder does not exist: {path}")
 
-    top_level = _run_git(path, "rev-parse", "--show-toplevel")
+    top_level = str(Path(_run_git(path, "rev-parse", "--show-toplevel")))
     branch = _run_git(path, "branch", "--show-current") or "(detached HEAD)"
     head = _run_git(path, "log", "-1", "--oneline", "--decorate", tolerate_no_commits=True) or "(no commits yet)"
     status = _run_git(path, "status", "--short", "--branch") or "(clean)"

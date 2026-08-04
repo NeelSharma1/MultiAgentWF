@@ -898,10 +898,10 @@ class SkillStore:
             for item in self.assigned(project_id, role)
         ]
 
-    def load_assigned(self, skill_id: int, project_id: int, role: str) -> dict[str, Any] | None:
+    def load_assigned(self, skill_id: int, project_id: int, role: str, *, platform: str = "") -> dict[str, Any] | None:
         if not self.is_assigned(skill_id, project_id, role):
             return None
-        skill = self.get(skill_id)
+        skill = self.get(skill_id, platform=platform)
         if not skill:
             return None
         return {

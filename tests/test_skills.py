@@ -161,11 +161,11 @@ def test_acp_packages_select_the_current_os_version_and_support_progressive_disc
     assert selected["version"] == "2.0.0"
     assert selected["format"] == "agent-skills/v1"
     assert parse_skill_md(selected["skill_md"])["name"] == "git-diff"
-    loaded = store.load_assigned(skill["id"], project["id"], "researcher")
+    loaded = store.load_assigned(skill["id"], project["id"], "researcher", platform="macos")
     assert loaded["body"] == "# Git Diff macOS"
 
     materialized = store.materialize(tmp_path, project["id"], "researcher")
-    assert materialized[0]["path"].endswith(".agents/skills/git-diff")
+    assert Path(materialized[0]["path"]).parts[-3:] == (".agents", "skills", "git-diff")
     assert (tmp_path / ".agents/skills/git-diff/SKILL.md").is_file()
 
 

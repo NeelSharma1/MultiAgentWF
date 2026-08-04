@@ -942,6 +942,62 @@ function escapeHtml(value){
     "'": '&#39;'
   }[character]))
 }
+const ANSI_COLOR_CLASSES={
+  30:'ansi-black',31:'ansi-red',32:'ansi-green',33:'ansi-yellow',34:'ansi-blue',35:'ansi-magenta',36:'ansi-cyan',37:'ansi-white',
+  90:'ansi-bright-black',91:'ansi-bright-red',92:'ansi-bright-green',93:'ansi-bright-yellow',94:'ansi-bright-blue',95:'ansi-bright-magenta',96:'ansi-bright-cyan',97:'ansi-bright-white'
+};
+function linkifyTerminalText(value){
+  const source=String(value??''), pattern=/https?:\/\/[^\s<]+/gi;
+  let html='', index=0, match;
+  while((match=pattern.exec(source))){
+    html+=escapeHtml(source.slice(index, match.index));
+    let url=match[0], trailing='';
+    while(/[.,!?;:)]$/.test(url)){
+      trailing=url.slice(-1)+trailing;
+      url=url.slice(0,-1)
+    }
+    const href=markdownUrl(url);
+    html+=href
+      ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>${escapeHtml(trailing)}`
+      : escapeHtml(match[0]);
+    index=match.index+match[0].length
+  }
+  return html+escapeHtml(source.slice(index))
+}
+function renderAnsiTerminal(value){
+  const source=String(value??''), pattern=/\x1b\[([0-?]*)(?:[ -/]*)([@-~])/g;
+  let html='', index=0, match, bold=false, dim=false, foreground='';
+  const renderSegment=text=>{
+    text=text.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g,'').replace(/\x1b/g,'');
+    if(!text)return'';
+    const classes=[];
+    if(bold)classes.push('ansi-bold');
+    if(dim)classes.push('ansi-dim');
+    if(foreground)classes.push(foreground);
+    const content=linkifyTerminalText(text);
+    return classes.length?`<span class="${classes.join(' ')}">${content}</span>`:content
+  };
+  const applySgr=codes=>{
+    if(!codes.length)codes=[0];
+    codes.forEach(code=>{
+      if(code===0){bold=false;dim=false;foreground=''}
+      else if(code===1)bold=true;
+      else if(code===2)dim=true;
+      else if(code===22){bold=false;dim=false}
+      else if(code===39)foreground='';
+      else if(ANSI_COLOR_CLASSES[code])foreground=ANSI_COLOR_CLASSES[code]
+    })
+  };
+  while((match=pattern.exec(source))){
+    html+=renderSegment(source.slice(index, match.index));
+    if(match[2]==='m'){
+      const codes=(match[1]||'0').split(';').map(Number).filter(Number.isFinite);
+      applySgr(codes)
+    }
+    index=match.index+match[0].length
+  }
+  return html+renderSegment(source.slice(index))
+}
 const CODE_LANGUAGE_ALIASES={
   js: 'javascript',
   jsx: 'jsx',
@@ -2501,7 +2557,7 @@ async function loadConnections(){
     el.className=`connection-state ${connected?'connected':''}`
   }
   const output=data.codex.login_output||data.codex.detail||'';
-  $('#codex-login-output').textContent=output;
+  $('#codex-login-output').innerHTML=renderAnsiTerminal(output);
   $('#codex-login-output').style.display=output?'block': 'none';
   return data
 }
