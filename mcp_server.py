@@ -40,6 +40,14 @@ def send_agent_message(sender_role: str, recipient_role: str, relationship: str,
     projects.get(project_id)
     definitions.get(sender_role, project_id)
     definitions.get(recipient_role, project_id)
+    project = projects.get(project_id)
+    if project.get("enforce_relationships") and not any(
+        edge["source_role"] == sender_role
+        and edge["target_role"] == recipient_role
+        and edge["relationship"] == relationship
+        for edge in projects.edges(project_id)
+    ):
+        raise ValueError("Relationship enforcement blocks this inter-agent message")
     message = messages.send_agent_message(sender_role, recipient_role, content, relationship, project_id)
     active = messages.active_chat_run(recipient_role, project_id)
     message["recipient_active"] = bool(active)
@@ -101,6 +109,16 @@ def read_skill_resource(skill_id: int, role: str, path: str, project_id: int = 1
 @mcp.tool()
 def run_assigned_skill(skill_id: int, role: str, inputs: dict, project_id: int = 1) -> dict:
     """Run an assigned skill's selected OS/version helper with JSON inputs."""
+    permissions = projects.agent_action_permissions(project_id, role)
+    project = projects.get(project_id)
+    full_workspace_access = bool(project.get("auto_approve_agent_actions")) or (
+        bool(permissions["allow_commands"]) and bool(permissions["allow_file_edits"])
+    )
+    if not permissions["full_system_access"] and not full_workspace_access:
+        return {
+            "ok": False,
+            "error": "This agent must request in-chat approval before executing a local command",
+        }
     if not skills.is_assigned(skill_id, project_id, role):
         return {"ok": False, "error": f"Skill {skill_id} is not assigned to {role} in workspace {project_id}"}
     skill = skills.get(skill_id)

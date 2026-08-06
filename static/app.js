@@ -1,5 +1,6 @@
 const COMMAND_HISTORY_KEY='multiagent-provider-command-history';
 const CHAT_OVERRIDES_KEY='multiagent-chat-overrides';
+const THEME_KEY='multiagent-theme';
 const INTERNAL_CONTINUATION_PROMPT='Process the queued team messages now. Follow each command, use reports as context, and send a concise report to the requesting agent when the work is complete.';
 function loadCommandHistory(){
   try{
@@ -37,6 +38,20 @@ function saveChatOverride(projectId, role, model, effort){
   else state.chatOverrides[key]={model, effort};
   localStorage.setItem(CHAT_OVERRIDES_KEY, JSON.stringify(state.chatOverrides));
 }
+function preferredTheme(){
+  const saved=localStorage.getItem(THEME_KEY);
+  return saved==='dark'||saved==='light'?saved:(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')
+}
+function applyTheme(theme){
+  const dark=theme==='dark';
+  document.documentElement.dataset.theme=dark?'dark':'light';
+  localStorage.setItem(THEME_KEY,dark?'dark':'light');
+  const button=$('#theme-toggle');
+  if(button){
+    button.textContent=dark?'Light mode':'Dark mode';
+    button.setAttribute('aria-pressed',String(dark))
+  }
+}
 const state={
   agents: [],
   providers: [],
@@ -51,6 +66,7 @@ const state={
   gitStatus: null,
   gitOverview: null,
   selectedVersionBranch: '',
+  selectedVersionCommit: '',
   pendingGitAgent: null,
   pendingGitEnableAgent: null,
   marketplace: [],
@@ -58,6 +74,10 @@ const state={
   layout: [],
   edges: [],
   templates: [],
+  workflowTemplates: [],
+  actionPermissions: null,
+  workflowMemories: [],
+  activeWorkflowMemoryId: 0,
   contextAgent: null,
   active: 'orchestrator',
   context: [],
@@ -73,8 +93,13 @@ const state={
   commandHistory: loadCommandHistory(),
   commandIndex: 0,
   drawingLink: null,
+  relationshipMode: 'move',
   runPollPromise: null,
   runWatchers: {},
+  historyLoads: {},
+  contextUsage: {},
+  contextUsageFetchedAt: {},
+  contextUsageLoads: {},
   chatOverrides: loadChatOverrides(),
   runtimeModelRequest: 0,
   chatControlsRequest: 0
@@ -147,8 +172,10 @@ async function api(path, options={}){
     let d;
     try{
       d=await r.json()
-    }
-    catch{}throw new Error(errorText(d?.detail, `Request failed (${r.status})`))
+    } catch{}
+    const error=new Error(errorText(d?.detail, `Request failed (${r.status})`));
+    error.status=r.status;
+    throw error
   }
   return r.status===204?null: r.json()
 }
@@ -667,6 +694,61 @@ function selectVersionBranch(name){
   state.selectedVersionBranch=name;
   renderVersionControl(state.gitOverview)
 }
+function selectVersionCommit(hash){
+  state.selectedVersionCommit=hash;
+  renderVersionCommitGraph(state.gitOverview)
+}
+function renderVersionCommitGraph(data){
+  const host=$('#version-commit-graph'), detail=$('#version-commit-detail'), commits=data?.commits||[];
+  host.innerHTML='';
+  if(!commits.length){
+    host.innerHTML='<div class="version-empty">No commits are available yet.</div>';
+    detail.textContent='Create a commit to populate the graph.';
+    return
+  }
+  if(!state.selectedVersionCommit||!commits.some(item=>item.hash===state.selectedVersionCommit))state.selectedVersionCommit=commits[0].hash;
+  const chronological=[...commits].reverse(), known=new Set(commits.map(item=>item.hash)), children=new Map(), laneByHash=new Map(), coordinates=new Map();
+  chronological.forEach(commit=>commit.parents.filter(parent=>known.has(parent)).forEach(parent=>{
+    if(!children.has(parent))children.set(parent,[]);
+    children.get(parent).push(commit.hash)
+  }));
+  let nextLane=0;
+  chronological.forEach((commit,index)=>{
+    const lane=laneByHash.has(commit.hash)?laneByHash.get(commit.hash):nextLane++;
+    laneByHash.set(commit.hash,lane);
+    coordinates.set(commit.hash,{x:42+index*88,y:42+lane*58,lane});
+    (children.get(commit.hash)||[]).forEach((child,index)=>{
+      if(!laneByHash.has(child))laneByHash.set(child,index===0?lane:nextLane++)
+    })
+  });
+  const maxLane=Math.max(0,...[...coordinates.values()].map(item=>item.lane)), width=Math.max(690,chronological.length*88+82), height=Math.max(128,(maxLane+1)*58+76), svgNs='http://www.w3.org/2000/svg';
+  const svg=document.createElementNS(svgNs,'svg'); svg.classList.add('version-commit-svg'); svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.setAttribute('role','img'); svg.setAttribute('aria-label','Interactive repository commit graph');
+  chronological.forEach(commit=>{
+    const child=coordinates.get(commit.hash);
+    commit.parents.filter(parent=>coordinates.has(parent)).forEach(parent=>{
+      const source=coordinates.get(parent), path=document.createElementNS(svgNs,'path');
+      path.setAttribute('class',`version-commit-edge lane-${child.lane%6}`);
+      path.setAttribute('d',`M ${source.x} ${source.y} C ${source.x+32} ${source.y}, ${child.x-32} ${child.y}, ${child.x} ${child.y}`);
+      svg.append(path)
+    })
+  });
+  chronological.forEach(commit=>{
+    const point=coordinates.get(commit.hash), group=document.createElementNS(svgNs,'g'), outer=document.createElementNS(svgNs,'circle'), title=document.createElementNS(svgNs,'title');
+    group.setAttribute('class','version-commit-node'); group.setAttribute('tabindex','0'); group.setAttribute('role','button'); group.setAttribute('aria-label',`${commit.short_hash}: ${commit.subject||'commit'}`);
+    outer.setAttribute('cx',String(point.x)); outer.setAttribute('cy',String(point.y)); outer.setAttribute('r','9'); outer.setAttribute('class',`lane-${point.lane%6}${commit.agent_commit?' agent':''}`);
+    title.textContent=`${commit.short_hash} ${commit.subject||''}`; group.append(outer,title);
+    if(commit.hash===state.selectedVersionCommit){
+      const inner=document.createElementNS(svgNs,'circle'); inner.setAttribute('cx',String(point.x)); inner.setAttribute('cy',String(point.y)); inner.setAttribute('r','3.5'); inner.setAttribute('class','version-commit-selected-dot'); group.append(inner)
+    }
+    group.onclick=()=>selectVersionCommit(commit.hash); group.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectVersionCommit(commit.hash)}}; svg.append(group)
+  });
+  host.append(svg);
+  const selected=commits.find(item=>item.hash===state.selectedVersionCommit);
+  if(selected){
+    const parentText=selected.parents.length?selected.parents.map(parent=>parent.slice(0,12)).join(', '):'none (root commit)';
+    detail.textContent=`${selected.short_hash} · parents: ${parentText}${selected.decorations?` · ${selected.decorations}`:''}${data.commits_truncated?' · showing the latest 1,000 commits.':''}`
+  }
+}
 function renderVersionControl(data){
   const status=$('#version-control-status'), topology=$('#worktree-topology'), branches=$('#version-branch-list'), agents=$('#version-agent-list'), source=$('#version-branch-source');
   if(!data?.is_repository){
@@ -674,7 +756,10 @@ function renderVersionControl(data){
     topology.innerHTML='<div class="version-empty">No repository topology is available.</div>';
     branches.innerHTML=''; agents.innerHTML=''; source.innerHTML=''; return
   }
-  status.textContent=`${data.repository} / current ${data.current_branch||'(detached HEAD)'}${data.main_branch?` / main ${data.main_branch}`:''}${data.clean?' / clean':' / uncommitted changes'}`;
+  const current=data.current_branch||'(detached HEAD)', main=data.main_branch||'';
+  status.textContent=current===main
+    ? `On main branch “${main}” · ${data.clean?'working tree clean':'uncommitted changes'}`
+    : `On branch “${current}”${main?` · main branch “${main}”`:''} · ${data.clean?'working tree clean':'uncommitted changes'}`;
   const branchItems=data.branches||[];
   if(!state.selectedVersionBranch||!branchItems.some(item=>item.name===state.selectedVersionBranch))state.selectedVersionBranch=data.current_branch||data.main_branch||branchItems[0]?.name||'';
   topology.innerHTML='';
@@ -693,6 +778,7 @@ function renderVersionControl(data){
     node.onclick=()=>selectVersionBranch(item.name); branchColumn.append(node)
   });
   diagram.append(worktreeColumn,branchColumn); topology.append(diagram);
+  renderVersionCommitGraph(data);
   branches.innerHTML=''; source.innerHTML='';
   branchItems.forEach(item=>{
     const option=document.createElement('option'); option.value=item.name; option.textContent=item.main?`${item.name} (main)`:item.name; option.selected=item.name===(data.main_branch||data.current_branch); source.append(option);
@@ -896,8 +982,250 @@ async function selectProject(id){
     if(state.project?.id===id)$('#status').textContent=`${health.agents} agents · MCP online`
   }).catch(()=>{})
 }
+async function loadWorkflowTemplates(){
+  if(!state.project)return;
+  state.workflowTemplates=await api(`/api/projects/${state.project.id}/workflow-templates`)
+}
+function fillAgentSelect(select, value=''){
+  select.innerHTML='';
+  state.agents.forEach(agent=>{
+    const option=document.createElement('option');
+    option.value=agent.id; option.textContent=agent.name;
+    option.selected=agent.id===value;
+    select.append(option)
+  })
+}
+function renderWorkflowDialog(){
+  const source=$('#relationship-source'), target=$('#relationship-target'), list=$('#relationship-editor-list');
+  $('#relationship-enforcement').checked=Boolean(state.project?.enforce_relationships);
+  const sourceValue=source.value, targetValue=target.value;
+  fillAgentSelect(source,sourceValue);
+  fillAgentSelect(target,targetValue);
+  list.innerHTML='';
+  if(!state.edges.length)list.innerHTML='<p class="workflow-empty">No relationships yet. Add one above or drag a map handle to another agent.</p>';
+  state.edges.forEach((edge,index)=>{
+    const row=document.createElement('div'); row.className='relationship-editor-row';
+    const from=document.createElement('select'), kind=document.createElement('select'), to=document.createElement('select');
+    fillAgentSelect(from,edge.source_role); fillAgentSelect(to,edge.target_role);
+    kind.innerHTML='<option value="command">Commands</option><option value="report">Reports to</option>'; kind.value=edge.relationship;
+    const update=()=>{
+      const next={source_role:from.value,target_role:to.value,relationship:kind.value};
+      if(next.source_role===next.target_role){alert('An agent cannot have a relationship with itself.'); renderWorkflowDialog(); return}
+      if(state.edges.some((item,itemIndex)=>itemIndex!==index&&item.source_role===next.source_role&&item.target_role===next.target_role&&item.relationship===next.relationship)){
+        alert('That relationship already exists.'); renderWorkflowDialog(); return
+      }
+      state.edges[index]=next; saveEdges(); renderWorkflowDialog(); renderFlowchart()
+    };
+    from.onchange=update; kind.onchange=update; to.onchange=update;
+    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent='Remove';
+    remove.onclick=()=>{state.edges.splice(index,1); saveEdges(); renderWorkflowDialog(); renderFlowchart()};
+    row.append(from,kind,to,remove); list.append(row)
+  });
+  const templateSelect=$('#workflow-template-select'), selectedId=Number(templateSelect.value)||state.workflowTemplates[0]?.id||0;
+  templateSelect.innerHTML='<option value="">Choose a saved workflow</option>';
+  state.workflowTemplates.forEach(template=>{
+    const option=document.createElement('option'); option.value=String(template.id); option.textContent=template.name; option.selected=template.id===selectedId;
+    templateSelect.append(option)
+  });
+  const selected=state.workflowTemplates.find(template=>template.id===Number(templateSelect.value));
+  $('#workflow-template-detail').textContent=selected?`${selected.layout.length} agent positions · ${selected.edges.length} relationships`:'Save the current map to reuse it in this or another workspace.';
+  const agents=$('#workflow-agent-list'); agents.innerHTML='';
+  state.agents.forEach(agent=>{
+    const row=document.createElement('div'); row.className='workflow-agent-row';
+    const text=document.createElement('div'), name=document.createElement('strong'), brief=document.createElement('small');
+    name.textContent=agent.name; brief.textContent=agent.brief; text.append(name,brief);
+    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent='Remove agent';
+    remove.onclick=async()=>{try{await deleteAgentFromMenu(agent); renderWorkflowDialog()}catch(err){alert(err.message)}};
+    row.append(text,remove); agents.append(row)
+  })
+}
+async function openWorkflowDialog(){
+  if(!state.project)return;
+  await loadWorkflowTemplates();
+  renderWorkflowDialog();
+  $('#workflow-dialog').showModal()
+}
+async function loadActionPermissions(){
+  if(!state.project)return;
+  state.actionPermissions=await api(`/api/projects/${state.project.id}/action-permissions`)
+}
+function updateAgentPermissions(role, permissions){
+  const agent=state.agents.find(item=>item.id===role);
+  if(agent)agent.permissions=permissions;
+  if(state.actionPermissions){
+    const index=state.actionPermissions.agents.findIndex(item=>item.role===role);
+    if(index>=0)state.actionPermissions.agents[index]=permissions
+  }
+}
+function renderExternalAccessButton(){
+  const button=$('#external-access-button'), agent=activeAgent();
+  if(!button)return;
+  const globalAccess=Boolean(state.project?.allow_full_system_access);
+  const individualAccess=Boolean(agent?.permissions?.allow_full_system_access);
+  button.hidden=!agent||agent.runtime?.provider!=='codex';
+  button.disabled=globalAccess;
+  button.textContent=globalAccess?'External access: global':individualAccess?'External access: on':'External access';
+  button.classList.toggle('external-access-enabled', individualAccess||globalAccess);
+  button.title=globalAccess
+    ? 'All agents already have unrestricted system access.'
+    : individualAccess
+      ? `Remove ${agent.name}'s access outside the project folder.`
+      : `Allow only ${agent.name} to work outside the project folder.`;
+}
+function renderContextMeter(){
+  const meter=$('#context-meter'), agent=activeAgent(), usage=state.contextUsage[state.active];
+  if(!meter)return;
+  meter.hidden=!agent;
+  if(!agent||!usage){
+    $('#context-remaining').textContent='—';
+    $('#context-progress').style.width='0%';
+    $('#context-detail').textContent='Estimating…';
+    return
+  }
+  const remaining=Math.max(0,Math.min(100,Number(usage.remaining_percent)||0));
+  $('#context-remaining').textContent=`${remaining}%`;
+  $('#context-progress').style.width=`${remaining}%`;
+  const countPrefix=usage.is_estimate?'~':'';
+  const sourceLabel=usage.is_estimate?'estimated':'provider reported';
+  $('#context-detail').textContent=`${countPrefix}${formatTokenCount(usage.used_tokens ?? usage.estimated_tokens)} used of ${formatTokenCount(usage.context_window_tokens)} tokens · ${sourceLabel}`;
+  meter.classList.toggle('warning',remaining<=25&&remaining>10);
+  meter.classList.toggle('critical',remaining<=10)
+}
+function formatTokenCount(value){
+  const tokens=Math.max(0,Number(value)||0);
+  return tokens>=1000?`${Math.round(tokens/100)/10}k`:String(tokens)
+}
+async function refreshContextUsage(role=state.active, force=false){
+  const projectId=state.project?.id, agent=state.agents.find(item=>item.id===role);
+  if(!projectId||!agent)return;
+  const now=Date.now();
+  if(!force&&now-(state.contextUsageFetchedAt[role]||0)<2000)return state.contextUsage[role];
+  if(state.contextUsageLoads[role])return state.contextUsageLoads[role];
+  const request=(async()=>{
+    try{
+      const usage=await api(`/api/agents/${role}/context-usage?project_id=${projectId}`);
+      if(state.project?.id!==projectId)return null;
+      state.contextUsage[role]=usage;
+      state.contextUsageFetchedAt[role]=Date.now();
+      if(state.active===role)renderContextMeter();
+      return usage
+    }
+    catch(err){
+      console.warn('Could not refresh context estimate',err);
+      return null
+    }
+    finally{
+      if(state.contextUsageLoads[role]===request)delete state.contextUsageLoads[role]
+    }
+  })();
+  state.contextUsageLoads[role]=request;
+  return request
+}
+function renderPermissionsDialog(){
+  const policy=state.actionPermissions||{auto_approve_agent_actions:false,allow_full_system_access:false,agents:[]};
+  const autonomous=Boolean(policy.auto_approve_agent_actions);
+  const fullSystemAccess=Boolean(policy.allow_full_system_access);
+  $('#auto-approve-agent-actions').checked=autonomous;
+  $('#allow-full-system-access').checked=fullSystemAccess;
+  const list=$('#agent-permissions-list'); list.innerHTML='';
+  state.agents.forEach(agent=>{
+    const permissions=policy.agents.find(item=>item.role===agent.id)||agent.permissions||{};
+    const row=document.createElement('article'); row.className='agent-permission-row';
+    const details=document.createElement('div'), name=document.createElement('strong'), summary=document.createElement('small');
+    name.textContent=agent.name;
+    const effectiveFullSystemAccess=Boolean(permissions.full_system_access);
+    summary.textContent=fullSystemAccess?'Unrestricted system access is enabled for every agent.':effectiveFullSystemAccess?'This agent has unrestricted system access.':autonomous?'Workspace autonomy is overriding individual grants.':`${permissions.allow_commands?'Commands allowed':'Commands blocked'} · ${permissions.allow_file_edits?'File edits allowed':'File edits blocked'}`;
+    details.append(name,summary);
+    const controls=document.createElement('div'); controls.className='agent-permission-controls';
+    const addToggle=(labelText,key)=>{
+      const label=document.createElement('label'), input=document.createElement('input'), text=document.createTextNode(labelText);
+      input.type='checkbox'; input.checked=Boolean(permissions[key]); input.disabled=autonomous||effectiveFullSystemAccess;
+      label.append(input,text); controls.append(label);
+      input.onchange=async()=>{
+        const next={allow_commands:key==='allow_commands'?input.checked:Boolean(permissions.allow_commands),allow_file_edits:key==='allow_file_edits'?input.checked:Boolean(permissions.allow_file_edits),allow_full_system_access:Boolean(permissions.allow_full_system_access)};
+        try{
+          const saved=await api(`/api/projects/${state.project.id}/agents/${agent.id}/action-permissions`, {method:'PUT',body:JSON.stringify(next)});
+          updateAgentPermissions(agent.id,saved); renderPermissionsDialog(); renderAgents()
+        }
+        catch(err){input.checked=!input.checked;alert(err.message)}
+      }
+    };
+    addToggle('Commands','allow_commands'); addToggle('Edit files','allow_file_edits');
+    row.append(details,controls); list.append(row)
+  })
+}
+async function openPermissionsDialog(){
+  await loadActionPermissions();
+  renderPermissionsDialog();
+  $('#permissions-dialog').showModal()
+}
+async function loadWorkflowMemories(){
+  if(!state.project)return;
+  const data=await api(`/api/projects/${state.project.id}/workflow-memories`);
+  state.workflowMemories=data.memories||[];
+  state.activeWorkflowMemoryId=Number(data.active_memory_id)||0
+}
+function fillWorkflowMemory(memory=null){
+  $('#workflow-memory-id').value=memory?.id||'';
+  $('#workflow-memory-name').value=memory?.name||'';
+  $('#workflow-memory-content').value=memory?.content||'';
+  $('#delete-workflow-memory').style.visibility=memory?'visible':'hidden'
+}
+function renderWorkflowMemories(){
+  const select=$('#workflow-memory-select'), editingId=Number($('#workflow-memory-id').value)||0;
+  select.innerHTML='<option value="">No active workflow memory</option>';
+  state.workflowMemories.forEach(memory=>{
+    const option=document.createElement('option'); option.value=String(memory.id); option.textContent=memory.name;
+    option.selected=memory.id===state.activeWorkflowMemoryId; select.append(option)
+  });
+  const editing=state.workflowMemories.find(memory=>memory.id===editingId);
+  if(editing)fillWorkflowMemory(editing);
+  else if(!editingId)fillWorkflowMemory(state.workflowMemories.find(memory=>memory.id===state.activeWorkflowMemoryId)||null)
+}
+async function openWorkflowMemories(){
+  await loadWorkflowMemories();
+  $('#workflow-memory-id').value='';
+  renderWorkflowMemories();
+  $('#memory-dialog').showModal()
+}
+function relationshipModeDescription(mode){
+  return {
+     move:'Move agents to arrange the map. Choose a relationship above to drag directly between agents.',
+     command:'Commands selected: drag from the commanding agent to the agent it commands.',
+     report:'Reports selected: drag from the reporting agent to the agent it reports to.',
+     supervisor:'Supervisor -> Employee selected: start dragging on the supervisor, then release on the employee. This creates command and report links in the expected directions.',
+     bidirectional:'Interconnected selected: drag from either agent to the other. Both agents will command and report to each other; the canvas shows both lines with arrows in both directions.',
+  }[mode]||''
+}
+function renderRelationshipToolbar(){
+  document.querySelectorAll('.relationship-toolbar [data-relationship-mode]').forEach(button=>{
+    const active=button.dataset.relationshipMode===state.relationshipMode;
+    button.classList.toggle('active',active);
+    button.setAttribute('aria-pressed',String(active));
+    if(button.dataset.relationshipMode==='supervisor')button.textContent='Supervisor -> Employee';
+    if(button.dataset.relationshipMode==='bidirectional')button.textContent='Interconnected (both ways)'
+  });
+  const chart=$('#flowchart'), help=$('#flow-help');
+  if(chart)chart.dataset.relationshipMode=state.relationshipMode;
+  if(help)help.textContent=relationshipModeDescription(state.relationshipMode);
+  let toolbarNote=$('#relationship-toolbar-note');
+  if(!toolbarNote){
+    const toolbar=document.querySelector('.relationship-toolbar');
+    if(toolbar){
+      toolbarNote=document.createElement('small');
+      toolbarNote.id='relationship-toolbar-note';
+      toolbar.append(toolbarNote)
+    }
+  }
+  if(toolbarNote)toolbarNote.textContent=relationshipModeDescription(state.relationshipMode)
+}
+function setRelationshipMode(mode){
+  state.relationshipMode=mode;
+  renderRelationshipToolbar()
+}
 function renderFlowchart(){
   if(!state.project)return;
+  renderRelationshipToolbar();
   const host=$('#flow-nodes');
   host.innerHTML='';
   state.layout.forEach(item=>{
@@ -916,6 +1244,16 @@ function renderFlowchart(){
     badge.textContent=label;
     badge.title=label;
     badge.dataset.provider=agent.runtime.provider;
+    const removeAgent=document.createElement('button');
+    removeAgent.type='button';
+    removeAgent.className='flow-node-remove';
+    removeAgent.textContent='Remove';
+    removeAgent.title=`Remove ${agent.name} from the team`;
+    removeAgent.onclick=async event=>{
+      event.stopPropagation();
+      try{await deleteAgentFromMenu(agent)}catch(err){alert(err.message)}
+    };
+    head.append(removeAgent);
     const brief=document.createElement('p');
     brief.textContent=agent.brief;
     const controls=document.createElement('div');
@@ -928,22 +1266,40 @@ function renderFlowchart(){
       controls.append(row)
     }
     const links=document.createElement('div');
-    links.className='relationship-list';
+     links.className='relationship-list';
+     const renderedInterconnected=new Set();
     state.edges.filter(edge=>edge.source_role===item.role).forEach(edge=>{
       const target=state.agents.find(a=>a.id===edge.target_role);
       const chip=document.createElement('span');
-      chip.className=`relationship-chip ${edge.relationship}`;
+       const interconnected=isInterconnectedPair(edge.source_role,edge.target_role), supervisorPair=supervisorEmployeePairForEdge(edge);
+       if(interconnected){
+         const pairKey=relationshipPairKey(edge.source_role,edge.target_role);
+         if(renderedInterconnected.has(pairKey))return;
+         renderedInterconnected.add(pairKey);
+         chip.className='relationship-chip interconnected';
+       }else if(supervisorPair)chip.className='relationship-chip supervisor';
+       else chip.className=`relationship-chip ${edge.relationship}`;
       chip.textContent=`${edge.relationship==='command'?'→':'⇢'} ${target?.name||edge.target_role}`;
-      const remove=document.createElement('button');
+       if(interconnected)chip.textContent=`INTERCONNECTED: ${target?.name||edge.target_role} (command + report both ways)`;
+       else if(supervisorPair)chip.textContent=edge.relationship==='command'
+         ? `SUPERVISOR -> EMPLOYEE: ${target?.name||edge.target_role}`
+         : `EMPLOYEE REPORTS TO: ${target?.name||edge.target_role}`;
+       if(!interconnected&&!supervisorPair)chip.textContent=`${edge.relationship==='command'?'COMMANDS':'REPORTS TO'}: ${target?.name||edge.target_role}`;
+       const remove=document.createElement('button');
       remove.type='button';
       remove.textContent='×';
       remove.title='Remove relationship';
-      remove.onclick=e=>{
-        e.stopPropagation();
-        state.edges=state.edges.filter(candidate=>candidate!==edge);
-        saveEdges();
-        renderFlowchart()
-      };
+       remove.onclick=e=>{
+         e.stopPropagation();
+         if(interconnected){
+           const roles=new Set([edge.source_role,edge.target_role]);
+           state.edges=state.edges.filter(candidate=>!(roles.has(candidate.source_role)&&roles.has(candidate.target_role)&&['command','report'].includes(candidate.relationship)));
+         }else if(supervisorPair){
+           state.edges=state.edges.filter(candidate=>!(candidate.source_role===supervisorPair.supervisor&&candidate.target_role===supervisorPair.employee&&candidate.relationship==='command')&&!(candidate.source_role===supervisorPair.employee&&candidate.target_role===supervisorPair.supervisor&&candidate.relationship==='report'));
+         }else state.edges=state.edges.filter(candidate=>candidate!==edge);
+         saveEdges();
+         renderFlowchart()
+       };
       chip.append(remove);
       links.append(chip)
     });
@@ -957,7 +1313,11 @@ function renderFlowchart(){
 }
 function enableDrag(node, item){
   node.onpointerdown=e=>{
-    if(e.target.closest('.relationship-control'))return;
+    if(e.target.closest('button, .relationship-control, .relationship-list'))return;
+    if(state.relationshipMode!=='move'){
+      startLinkDrawing(node,item,state.relationshipMode,e);
+      return
+    }
     e.preventDefault();
     node.setPointerCapture(e.pointerId);
     node.classList.add('dragging');
@@ -980,47 +1340,89 @@ function enableDrag(node, item){
     }
   }
 }
-function enableLinkDrawing(handle, item, relationship){
-  handle.onpointerdown=e=>{
-    e.preventDefault();
-    e.stopPropagation();
-    handle.setPointerCapture(e.pointerId);
-    const chart=$('#flowchart'),
-    rect=chart.getBoundingClientRect();
-    state.drawingLink={
-      role: item.role,
-      relationship,
-      x: e.clientX-rect.left+chart.scrollLeft,
-      y: e.clientY-rect.top+chart.scrollTop
-    };
-    handle.classList.add('active');
-    drawLines();
-    handle.onpointermove=move=>{
-      state.drawingLink.x=move.clientX-rect.left+chart.scrollLeft;
-      state.drawingLink.y=move.clientY-rect.top+chart.scrollTop;
-      drawLines()
-    };
-    handle.onpointerup=up=>{
-      const target=document.elementFromPoint(up.clientX, up.clientY)?.closest('.flow-node');
-      if(target&&target.dataset.role!==item.role){
-        const edge={
-          source_role: item.role,
-          target_role: target.dataset.role,
-          relationship
-        };
-        if(!state.edges.some(e=>e.source_role===edge.source_role&&e.target_role===edge.target_role&&e.relationship===edge.relationship)){
-          state.edges.push(edge);
-          saveEdges()
-        }
-        renderFlowchart()
-      }
-      state.drawingLink=null;
-      handle.classList.remove('active');
-      handle.onpointermove=null;
-      handle.onpointerup=null;
-      drawLines()
+function addRelationship(sourceRole,targetRole,relationship){
+  const edges=relationship==='supervisor'?[{
+    source_role:sourceRole,target_role:targetRole,relationship:'command'
+  },{
+    source_role:targetRole,target_role:sourceRole,relationship:'report'
+  }]:relationship==='bidirectional'?[{
+    source_role:sourceRole,target_role:targetRole,relationship:'command'
+  },{
+    source_role:targetRole,target_role:sourceRole,relationship:'command'
+  },{
+    source_role:sourceRole,target_role:targetRole,relationship:'report'
+  },{
+    source_role:targetRole,target_role:sourceRole,relationship:'report'
+  }]:[{
+    source_role:sourceRole,target_role:targetRole,relationship
+  }];
+  let changed=false;
+  edges.forEach(edge=>{
+    if(!state.edges.some(item=>item.source_role===edge.source_role&&item.target_role===edge.target_role&&item.relationship===edge.relationship)){
+      state.edges.push(edge); changed=true
     }
+  });
+  if(changed)saveEdges();
+  return changed
+}
+function startLinkDrawing(origin, item, relationship, event){
+  event.preventDefault();
+  event.stopPropagation();
+  origin.setPointerCapture(event.pointerId);
+  const chart=$('#flowchart'), rect=chart.getBoundingClientRect();
+  const originName=state.agents.find(agent=>agent.id===item.role)?.name||item.role, help=$('#flow-help');
+  if(help)help.textContent=relationship==='supervisor'
+    ? `Supervisor selected: ${originName}. Release on the employee.`
+    : relationship==='bidirectional'
+      ? `First selected: ${originName}. Release on either agent to connect both directions.`
+      : relationship==='command'
+        ? `Commanding agent selected: ${originName}. Release on the agent it commands.`
+        : `Reporting agent selected: ${originName}. Release on the agent it reports to.`;
+  state.drawingLink={
+    role:item.role,
+    relationship,
+    x:event.clientX-rect.left+chart.scrollLeft,
+    y:event.clientY-rect.top+chart.scrollTop,
+  };
+  origin.classList.add('active');
+  drawLines();
+  origin.onpointermove=move=>{
+    state.drawingLink.x=move.clientX-rect.left+chart.scrollLeft;
+    state.drawingLink.y=move.clientY-rect.top+chart.scrollTop;
+    drawLines()
+  };
+  origin.onpointerup=up=>{
+    const target=document.elementFromPoint(up.clientX,up.clientY)?.closest('.flow-node');
+    if(target&&target.dataset.role!==item.role){
+      addRelationship(item.role,target.dataset.role,relationship);
+      renderFlowchart()
+    }
+    state.drawingLink=null;
+    origin.classList.remove('active');
+    origin.onpointermove=null;
+    origin.onpointerup=null;
+    renderRelationshipToolbar();
+    drawLines()
   }
+}
+function enableLinkDrawing(handle, item, relationship){
+  handle.onpointerdown=e=>startLinkDrawing(handle,item,relationship,e)
+}
+function relationshipPairKey(sourceRole,targetRole){
+  return [sourceRole,targetRole].sort().join('::')
+}
+function isInterconnectedPair(sourceRole,targetRole){
+  const has=(source,target,relationship)=>state.edges.some(edge=>edge.source_role===source&&edge.target_role===target&&edge.relationship===relationship);
+  return has(sourceRole,targetRole,'command')&&has(targetRole,sourceRole,'command')&&has(sourceRole,targetRole,'report')&&has(targetRole,sourceRole,'report')
+}
+function isSupervisorEmployeePair(supervisorRole,employeeRole){
+  const has=(source,target,relationship)=>state.edges.some(edge=>edge.source_role===source&&edge.target_role===target&&edge.relationship===relationship);
+  return !isInterconnectedPair(supervisorRole,employeeRole)&&has(supervisorRole,employeeRole,'command')&&has(employeeRole,supervisorRole,'report')
+}
+function supervisorEmployeePairForEdge(edge){
+  if(edge.relationship==='command'&&isSupervisorEmployeePair(edge.source_role,edge.target_role))return{supervisor:edge.source_role,employee:edge.target_role};
+  if(edge.relationship==='report'&&isSupervisorEmployeePair(edge.target_role,edge.source_role))return{supervisor:edge.target_role,employee:edge.source_role};
+  return null
 }
 function nodeBox(role){
   const node=document.querySelector(`.flow-node[data-role="${role}"]`);
@@ -1057,18 +1459,59 @@ function appendArrow(svg, x1, y1, x2, y2, relationship, preview=false){
   path.setAttribute('d', horizontal?`M ${x1} ${y1} C ${x1+(x2>x1?curve:-curve)} ${y1}, ${x2-(x2>x1?curve:-curve)} ${y2}, ${x2} ${y2}`: `M ${x1} ${y1} C ${x1} ${y1+(y2>y1?curve:-curve)}, ${x2} ${y2-(y2>y1?curve:-curve)}, ${x2} ${y2}`);
   svg.append(path)
 }
+function appendOffsetArrow(svg, from, to, relationship, offset=0, preview=false){
+  const p=edgePoints(from,to), dx=p.x2-p.x1, dy=p.y2-p.y1, length=Math.max(1,Math.hypot(dx,dy));
+  const nx=-dy/length*offset, ny=dx/length*offset;
+  const x1=p.x1+nx, y1=p.y1+ny, x2=p.x2+nx, y2=p.y2+ny;
+  const curve=Math.min(90,Math.hypot(x2-x1,y2-y1)/3), horizontal=Math.abs(x2-x1)>Math.abs(y2-y1);
+  const path=document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('class', `connection-line ${relationship}${preview?' preview':''}`);
+  path.setAttribute('marker-end', `url(#${relationship}-arrow)`);
+  path.setAttribute('d', horizontal
+    ? `M ${x1} ${y1} C ${x1+(x2>x1?curve:-curve)} ${y1}, ${x2-(x2>x1?curve:-curve)} ${y2}, ${x2} ${y2}`
+    : `M ${x1} ${y1} C ${x1} ${y1+(y2>y1?curve:-curve)}, ${x2} ${y2-(y2>y1?curve:-curve)}, ${x2} ${y2}`);
+  svg.append(path)
+}
+function appendInterconnectedLine(svg, from, to, relationship, offset=0, preview=false){
+  const p=edgePoints(from,to), dx=p.x2-p.x1, dy=p.y2-p.y1, length=Math.max(1,Math.hypot(dx,dy));
+  const nx=-dy/length*offset, ny=dx/length*offset;
+  const cx=(p.x1+p.x2)/2+nx, cy=(p.y1+p.y2)/2+ny;
+  const path=document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('class', `connection-line interconnected ${relationship}${preview?' preview':''}`);
+  path.setAttribute('marker-start', `url(#${relationship}-arrow)`);
+  path.setAttribute('marker-end', `url(#${relationship}-arrow)`);
+  path.setAttribute('d', `M ${p.x1+nx} ${p.y1+ny} Q ${cx} ${cy} ${p.x2+nx} ${p.y2+ny}`);
+  svg.append(path)
+}
 function drawLines(){
   const svg=$('#flow-lines');
   if(!svg)return;
   const chart=$('#flowchart');
   svg.setAttribute('width', Math.max(chart.clientWidth, chart.scrollWidth));
   svg.setAttribute('height', Math.max(chart.clientHeight, chart.scrollHeight));
-  svg.innerHTML='<defs><marker id="report-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path class="connection-arrow report" d="M 1 1 L 11 6 L 1 11 z"/></marker><marker id="command-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path class="connection-arrow command" d="M 1 1 L 11 6 L 1 11 z"/></marker></defs>';
+  svg.innerHTML='<defs><marker id="report-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="connection-arrow report" d="M 1 1 L 11 6 L 1 11 z"/></marker><marker id="command-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="connection-arrow command" d="M 1 1 L 11 6 L 1 11 z"/></marker></defs>';
+  const drawnSupervisor=new Set(), drawnInterconnected=new Set();
   state.edges.forEach(edge=>{
     const from=nodeBox(edge.source_role), to=nodeBox(edge.target_role);
     if(from&&to){
-      const p=edgePoints(from, to);
-      appendArrow(svg, p.x1, p.y1, p.x2, p.y2, edge.relationship)
+      const supervisorPair=supervisorEmployeePairForEdge(edge);
+      if(supervisorPair){
+        const pairKey=relationshipPairKey(supervisorPair.supervisor,supervisorPair.employee);
+        if(drawnSupervisor.has(pairKey))return;
+        drawnSupervisor.add(pairKey);
+        const supervisorBox=nodeBox(supervisorPair.supervisor), employeeBox=nodeBox(supervisorPair.employee);
+        appendOffsetArrow(svg,supervisorBox,employeeBox,'command',-5);
+        appendOffsetArrow(svg,employeeBox,supervisorBox,'report',-5);
+      }else if(isInterconnectedPair(edge.source_role,edge.target_role)){
+        const pairKey=relationshipPairKey(edge.source_role,edge.target_role);
+        if(drawnInterconnected.has(pairKey))return;
+        drawnInterconnected.add(pairKey);
+        appendInterconnectedLine(svg,from,to,'command',-5);
+        appendInterconnectedLine(svg,from,to,'report',5);
+      }else{
+        const p=edgePoints(from, to);
+        appendArrow(svg, p.x1, p.y1, p.x2, p.y2, edge.relationship)
+      }
     }
   });
   if(state.drawingLink){
@@ -1079,9 +1522,17 @@ function drawLines(){
         y: state.drawingLink.y,
         w: 1,
         h: 1
-      },
-      p=edgePoints(from, pointer);
-      appendArrow(svg, p.x1, p.y1, state.drawingLink.x, state.drawingLink.y, state.drawingLink.relationship, true)
+      };
+      if(state.drawingLink.relationship==='supervisor'){
+        appendOffsetArrow(svg,from,pointer,'command',-5,true);
+        appendOffsetArrow(svg,pointer,from,'report',-5,true);
+      }else if(state.drawingLink.relationship==='bidirectional'){
+        appendInterconnectedLine(svg,from,pointer,'command',-5,true);
+        appendInterconnectedLine(svg,from,pointer,'report',5,true);
+      }else{
+        const p=edgePoints(from, pointer);
+        appendArrow(svg, p.x1, p.y1, state.drawingLink.x, state.drawingLink.y, state.drawingLink.relationship, true)
+      }
     }
   }
 }
@@ -1127,6 +1578,8 @@ function selectAgent(id){
     $('#agent-brief').textContent='Add a team member to this workspace to start a conversation.';
     $('#avatar').textContent='+';
     $('#runtime-badge').textContent='';
+    renderExternalAccessButton();
+    renderContextMeter();
     renderAgents();
     renderActiveSkillSummary();
     renderMessages();
@@ -1137,6 +1590,8 @@ function selectAgent(id){
   $('#agent-brief').textContent=a.brief;
   $('#avatar').textContent=a.name[0];
   $('#runtime-badge').textContent=runtimeLabel(a.runtime);
+  renderExternalAccessButton();
+  renderContextMeter();
   renderActiveSkillSummary();
   renderAgents();
   renderMessages();
@@ -1150,10 +1605,11 @@ function normalizeMessage(m, role=state.active){
   const messageKind=m.message_kind||'';
   const compiledParts=messageKind==='command'?compiledCommandParts(m.content):null;
   const sourceAgent=sourceRole?state.agents.find(agent=>agent.id===sourceRole):null;
+  const permissionRequest=m.permission_request||permissionRequestFromText(m.content);
   return{
     id: m.id,
     kind,
-    text: m.content,
+    text: permissionRequest?String(m.content).replace(/\s*<permission_request\s+scope="(?:workspace|external)">[\s\S]*?<\/permission_request>\s*/i,'').trim()||'I need your approval before continuing.':m.content,
     internal: m.speaker==='user'&&m.content===INTERNAL_CONTINUATION_PROMPT,
     provider: m.provider,
     model: m.model,
@@ -1164,12 +1620,22 @@ function normalizeMessage(m, role=state.active){
     message_kind: messageKind,
     compiled: Boolean(compiledParts?.length),
     compiled_parts: compiledParts||[],
+    permission_request: permissionRequest,
     delivery_status: m.delivery_status||'',
     by: sourceAgent?.name||(
       kind==='agent'?state.agents.find(a=>a.id===role)?.name:
       kind==='native'?'Codex': kind==='error'?'Provider error': 'Workspace'
     )
   }
+}
+function permissionRequestFromText(value){
+  const match=String(value||'').match(/<permission_request\s+scope="(workspace|external)">\s*([\s\S]*?)\s*<\/permission_request>/i);
+  if(!match)return null;
+  const body=match[2].trim(),
+  reason=body.match(/<reason>\s*([\s\S]*?)\s*<\/reason>/i),
+  commandBody=body.match(/<commands>\s*([\s\S]*?)\s*<\/commands>/i),
+  commands=(commandBody?.[1]||'').split(/\r?\n/).filter(line=>line.trim().startsWith('- ')).map(line=>line.trim().slice(2)).filter(Boolean);
+  return {scope:match[1].toLowerCase(),reason:reason?.[1].trim()||body,commands,status:'pending'}
 }
 function compiledCommandParts(value){
   const text=String(value??'').trim();
@@ -1196,17 +1662,32 @@ function compiledCommandParts(value){
 async function loadHistory(role){
   if(!state.project)return false;
   const projectId=state.project.id;
-  try{
-    const out=await api(`/api/agents/${role}/history?project_id=${projectId}`);
-    if(state.project?.id!==projectId)return false;
-    state.messages[role]=out.messages.map(m=>normalizeMessage(m, role));
-    if(state.active===role)renderMessages();
-    return true
-  }
-  catch(err){
-    if(state.active===role)localMessage(`Could not load history: ${err.message}`);
-    return false
-  }
+  const activeLoad=state.historyLoads[role];
+  if(activeLoad)return activeLoad;
+  const hadVisibleHistory=Array.isArray(state.messages[role])&&state.messages[role].length>0;
+  let request;
+  request=(async()=>{
+    try{
+      const out=await api(`/api/agents/${role}/history?project_id=${projectId}`);
+      if(state.project?.id!==projectId)return false;
+      state.messages[role]=out.messages.map(m=>normalizeMessage(m, role));
+      if(state.active===role)renderMessages();
+      refreshContextUsage(role);
+      return true
+    }
+    catch(err){
+      console.warn('Could not refresh chat history', err);
+      // A polling refresh can fail transiently while an already-rendered
+      // transcript remains valid. Do not turn that into a misleading chat bubble.
+      if(state.active===role&&!hadVisibleHistory)localMessage(`Could not load history: ${err.message}`);
+      return false
+    }
+    finally{
+      if(state.historyLoads[role]===request)delete state.historyLoads[role]
+    }
+  })();
+  state.historyLoads[role]=request;
+  return request
 }
 function formatTime(value){
   if(!value)return'Now';
@@ -1890,6 +2371,44 @@ function renderMessages(){
       });
       bubble.append(files)
     }
+    if(m.kind==='agent'&&m.permission_request){
+      const request=m.permission_request;
+      const requestCard=document.createElement('section');
+      requestCard.className=`permission-request ${request.status||'pending'}`;
+      const heading=document.createElement('strong');
+      heading.textContent=request.scope==='external'?'External access requested':'Workspace action requested';
+      const reason=document.createElement('p');
+      reason.textContent=request.reason;
+      requestCard.append(heading,reason);
+      const commands=document.createElement('div');
+      commands.className='permission-request-commands';
+      const commandLabel=document.createElement('small');
+      commandLabel.textContent=request.commands?.length?'Proposed commands':'No commands were supplied; this request cannot be approved.';
+      commands.append(commandLabel);
+      if(request.commands?.length){
+        const list=document.createElement('ol');
+        request.commands.forEach(command=>{
+          const item=document.createElement('li'), code=document.createElement('code');
+          code.textContent=command; item.append(code); list.append(item)
+        });
+        commands.append(list)
+      }
+      requestCard.append(commands);
+      if(request.status==='pending'){
+        const controls=document.createElement('div');
+        controls.className='permission-request-controls';
+        const approve=document.createElement('button'), deny=document.createElement('button');
+        approve.type=deny.type='button'; approve.textContent='Approve once'; approve.disabled=!request.commands?.length; deny.textContent='Deny'; deny.className='danger';
+        approve.onclick=()=>respondToPermissionRequest(m, true);
+        deny.onclick=()=>respondToPermissionRequest(m, false);
+        controls.append(approve,deny); requestCard.append(controls)
+      }else{
+        const status=document.createElement('small');
+        status.textContent=request.status==='approved'?'Approved for one continuation':'Denied';
+        requestCard.append(status)
+      }
+      bubble.append(requestCard)
+    }
     const meta=document.createElement('div');
     meta.className='message-meta';
     meta.textContent=`${m.kind==='user'?'You':m.by||activeAgent()?.name||'Team'} · ${formatTime(m.created_at)}${m.runtime?` · ${m.runtime}`:''}`;
@@ -1916,6 +2435,22 @@ function renderMessages(){
     box.append(wrap)
   });
   box.scrollTop=wasAtBottom?box.scrollHeight: previousTop
+}
+async function respondToPermissionRequest(message, approved){
+  const request=message.permission_request, role=state.active, projectId=state.project?.id;
+  if(!request||request.status!=='pending'||!projectId)return;
+  try{
+    const out=await api(`/api/agents/${role}/permission-response?project_id=${projectId}`, {
+      method:'POST',body:JSON.stringify({message_id:message.id,approved})
+    });
+    request.status=approved?'approved':'denied';
+    renderMessages();
+    state.busy.add(role);
+    setChatActivity(role, 'running', approved?`${activeAgent()?.name||role} is continuing with the approved access…`:`${activeAgent()?.name||role} is responding to the denied request…`);
+    renderComposer();
+    await waitForChatRun(out.run.id, role, projectId)
+  }
+  catch(err){alert(err.message)}
 }
 function setChatActivity(role, type, text){
   state.activities[role]={
@@ -2376,10 +2911,15 @@ async function openRuntime(){
   const a=activeAgent(),
   r=a.runtime;
   $('#runtime-title').textContent=`Configure ${a.name}`;
+  $('#restart-codex-session').style.display=r.provider==='codex'?'inline-block':'none';
   $('#provider-select').innerHTML=state.providers.map(p=>`<option value="${p.id}">${p.name}${p.available?'':' — not configured'}</option>`).join('');
   $('#provider-select').value=r.provider;
   $('#base-url-input').value=r.base_url;
   $('#key-env-input').value=r.api_key_env;
+  $('#context-window-input').value=Number(r.context_window_tokens)||128000;
+  $('#context-compaction-input').value=String(Number(r.context_compaction_threshold)||0);
+  $('#context-window-input').nextElementSibling.textContent='Fallback window when the provider does not report one; Codex uses its runtime-reported effective window when available.';
+  $('#context-compaction-input').nextElementSibling.textContent='Codex uses reported token counts before native /compact; other providers use reported usage when available and saved summaries otherwise.';
   updateRuntimeFields();
   $('#runtime-dialog').showModal();
   await loadModels(r.model, r.reasoning_effort)
@@ -2572,6 +3112,8 @@ $('#runtime-form').onsubmit=async e=>{
     base_url: $('#base-url-input').value,
     api_key_env: $('#key-env-input').value,
     reasoning_effort: $('#effort-input').value,
+    context_window_tokens: Number($('#context-window-input').value),
+    context_compaction_threshold: Number($('#context-compaction-input').value),
     project_id: state.project.id
   };
   await api(`/api/agents/${role}/runtime`, {
@@ -2663,6 +3205,202 @@ $('#new-context').onclick=()=>openContext();
 $('#new-agent').onclick=openAgentDialog;
 $('#add-agent-dashboard').onclick=openAgentDialog;
 $('#close-agent').onclick=()=>$('#agent-dialog').close();
+$('#workflow-button').onclick=()=>openWorkflowDialog().catch(err=>alert(err.message));
+$('#close-workflow').onclick=()=>$('#workflow-dialog').close();
+$('#permissions-button').onclick=()=>openPermissionsDialog().catch(err=>alert(err.message));
+$('#close-permissions').onclick=()=>$('#permissions-dialog').close();
+$('#memory-button').onclick=()=>openWorkflowMemories().catch(err=>alert(err.message));
+$('#close-memory').onclick=()=>$('#memory-dialog').close();
+$('#workflow-memory-select').onchange=event=>{
+  const memory=state.workflowMemories.find(item=>item.id===Number(event.currentTarget.value));
+  fillWorkflowMemory(memory||null)
+};
+$('#restart-codex-session').onclick=async()=>{
+  const agent=activeAgent();
+  if(!agent||agent.runtime.provider!=='codex')return;
+  if(!confirm(`Restart ${agent.name}'s Codex session? The saved Codex thread will be removed, but this app's conversation history stays visible.`))return;
+  try{
+    await api(`/api/agents/${agent.id}/session/restart?project_id=${state.project.id}`, {method:'POST'});
+    alert('Codex session restarted. The next message starts a fresh session with the current permissions.')
+  }
+  catch(err){
+    if(err.status===404){
+      alert('The running app server is an older version and does not have session restart yet. Stop and start the app once, then try again.');
+      return
+    }
+    alert(err.message)
+  }
+};
+$('#new-workflow-memory').onclick=()=>fillWorkflowMemory();
+$('#activate-workflow-memory').onclick=async()=>{
+  const memoryId=Number($('#workflow-memory-select').value)||0;
+  try{
+    const data=await api(`/api/projects/${state.project.id}/active-workflow-memory`, {method:'PUT',body:JSON.stringify({memory_id:memoryId})});
+    state.activeWorkflowMemoryId=Number(data.active_memory_id)||0;
+    state.project.active_workflow_memory_id=state.activeWorkflowMemoryId;
+    renderWorkflowMemories()
+  }
+  catch(err){alert(err.message)}
+};
+$('#workflow-memory-form').onsubmit=async event=>{
+  event.preventDefault();
+  const id=$('#workflow-memory-id').value,
+  payload={name:$('#workflow-memory-name').value,content:$('#workflow-memory-content').value};
+  try{
+    const saved=await api(id?`/api/projects/${state.project.id}/workflow-memories/${id}`:`/api/projects/${state.project.id}/workflow-memories`, {method:id?'PUT':'POST',body:JSON.stringify(payload)});
+    await loadWorkflowMemories(); fillWorkflowMemory(saved); renderWorkflowMemories()
+  }
+  catch(err){alert(err.message)}
+};
+$('#delete-workflow-memory').onclick=async()=>{
+  const id=$('#workflow-memory-id').value, memory=state.workflowMemories.find(item=>item.id===Number(id));
+  if(!id||!confirm(`Delete workflow memory “${memory?.name||''}”?`))return;
+  try{await api(`/api/projects/${state.project.id}/workflow-memories/${id}`,{method:'DELETE'});await loadWorkflowMemories();fillWorkflowMemory();renderWorkflowMemories()}
+  catch(err){alert(err.message)}
+};
+$('#auto-approve-agent-actions').onchange=async event=>{
+  const enabled=event.currentTarget.checked;
+  if(enabled&&!confirm('Allow every agent to run commands and edit files inside this project without permission prompts? This does not grant access outside the project folder.')){
+    event.currentTarget.checked=false;
+    return
+  }
+  try{
+    const project=await api(`/api/projects/${state.project.id}/action-policy`, {
+      method:'PUT',body:JSON.stringify({auto_approve_agent_actions:enabled,allow_full_system_access:Boolean(state.actionPermissions?.allow_full_system_access)})
+    });
+    state.project=project;
+    state.projects=state.projects.map(item=>item.id===project.id?project:item);
+    if(state.actionPermissions){
+      state.actionPermissions.auto_approve_agent_actions=enabled;
+      state.actionPermissions.allow_full_system_access=Boolean(project.allow_full_system_access)
+    }
+    renderPermissionsDialog(); renderAgents()
+  }
+  catch(err){event.currentTarget.checked=!enabled;alert(err.message)}
+};
+$('#allow-full-system-access').onchange=async event=>{
+  const enabled=event.currentTarget.checked;
+  if(enabled&&!confirm('Give every agent unrestricted access to this computer? They will be able to read, write, and run commands outside this project folder without confirmation.')){
+    event.currentTarget.checked=false;
+    return
+  }
+  try{
+    const project=await api(`/api/projects/${state.project.id}/action-policy`, {
+      method:'PUT',body:JSON.stringify({auto_approve_agent_actions:Boolean(state.actionPermissions?.auto_approve_agent_actions),allow_full_system_access:enabled})
+    });
+    state.project=project;
+    state.projects=state.projects.map(item=>item.id===project.id?project:item);
+    if(state.actionPermissions)state.actionPermissions.allow_full_system_access=enabled;
+    renderPermissionsDialog(); renderAgents()
+  }
+  catch(err){event.currentTarget.checked=!enabled;alert(err.message)}
+};
+$('#external-access-button').onclick=async()=>{
+  const agent=activeAgent();
+  if(!agent||agent.runtime?.provider!=='codex'||state.project?.allow_full_system_access)return;
+  const enabled=!Boolean(agent.permissions?.allow_full_system_access);
+  const action=enabled?'Give':'Remove';
+  const detail=enabled
+    ? `${agent.name} will be able to read, write, and run commands outside this project folder without confirmation.`
+    : `${agent.name} will return to its project-only access level.`;
+  if(!confirm(`${action} external system access for ${agent.name}?\n\n${detail}`))return;
+  try{
+    const saved=await api(`/api/projects/${state.project.id}/agents/${agent.id}/action-permissions`, {
+      method:'PUT',body:JSON.stringify({
+        allow_commands:Boolean(agent.permissions?.allow_commands),
+        allow_file_edits:Boolean(agent.permissions?.allow_file_edits),
+        allow_full_system_access:enabled
+      })
+    });
+    updateAgentPermissions(agent.id,saved);
+    renderExternalAccessButton();
+    renderPermissionsDialog();
+    alert(enabled?`${agent.name} now has external system access.`:`${agent.name}'s external system access was removed.`)
+  }
+  catch(err){alert(err.message)}
+};
+$('#theme-toggle').onclick=()=>applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+document.querySelectorAll('.relationship-toolbar [data-relationship-mode]').forEach(button=>button.onclick=()=>setRelationshipMode(button.dataset.relationshipMode));
+$('#workflow-template-select').onchange=renderWorkflowDialog;
+$('#relationship-enforcement').onchange=async event=>{
+  const enabled=event.currentTarget.checked;
+  try{
+    const project=await api(`/api/projects/${state.project.id}/relationship-policy`, {
+      method:'PUT', body:JSON.stringify({enforce_relationships:enabled})
+    });
+    state.project=project;
+    state.projects=state.projects.map(item=>item.id===project.id?project:item);
+    renderWorkflowDialog()
+  }
+  catch(err){
+    event.currentTarget.checked=!enabled;
+    alert(err.message)
+  }
+};
+$('#workflow-template-save-form').onsubmit=async event=>{
+  event.preventDefault();
+  const name=$('#workflow-template-name').value.trim();
+  if(!name)return;
+  try{
+    clearTimeout(layoutTimer); clearTimeout(edgeTimer);
+    await Promise.all([
+      api(`/api/projects/${state.project.id}/layout`, {method:'PUT',body:JSON.stringify({items:state.layout})}),
+      api(`/api/projects/${state.project.id}/edges`, {method:'PUT',body:JSON.stringify({edges:state.edges})}),
+    ]);
+    await api(`/api/projects/${state.project.id}/workflow-templates`, {method:'POST',body:JSON.stringify({name})});
+    $('#workflow-template-name').value='';
+    await loadWorkflowTemplates(); renderWorkflowDialog()
+  }
+  catch(err){alert(err.message)}
+};
+$('#workflow-template-apply').onclick=async()=>{
+  const id=$('#workflow-template-select').value;
+  if(!id)return alert('Choose a saved workflow first.');
+  const template=state.workflowTemplates.find(item=>item.id===Number(id));
+  if(!confirm(`Apply “${template?.name||'this workflow'}”? This replaces the current command/report relationships and repositions matching agents.`))return;
+  try{
+    const applied=await api(`/api/projects/${state.project.id}/workflow-templates/${id}/apply`, {method:'POST'});
+    state.layout=applied.layout; state.edges=applied.edges;
+    renderFlowchart(); renderWorkflowDialog();
+    if(applied.skipped_roles.length)alert(`Applied the workflow. No matching agent was found for: ${applied.skipped_roles.join(', ')}.`)
+  }
+  catch(err){alert(err.message)}
+};
+$('#workflow-template-delete').onclick=async()=>{
+  const id=$('#workflow-template-select').value, template=state.workflowTemplates.find(item=>item.id===Number(id));
+  if(!id||!confirm(`Delete saved workflow “${template?.name||''}”?`))return;
+  try{await api(`/api/projects/${state.project.id}/workflow-templates/${id}`, {method:'DELETE'}); await loadWorkflowTemplates(); renderWorkflowDialog()}
+  catch(err){alert(err.message)}
+};
+const relationshipKind=$('#relationship-kind');
+if(relationshipKind){
+  if(!relationshipKind.querySelector('option[value="supervisor"]'))relationshipKind.insertAdjacentHTML('beforeend','<option value="supervisor">Supervisor -> Employee</option><option value="bidirectional">Interconnected (both ways)</option>');
+  const relationshipAddHelp=document.createElement('small');
+  relationshipAddHelp.id='relationship-add-help';
+  relationshipAddHelp.className='workflow-detail';
+  relationshipKind.closest('form')?.after(relationshipAddHelp);
+  const updateRelationshipAddHelp=()=>relationshipAddHelp.textContent=relationshipKind.value==='supervisor'
+    ? 'Supervisor -> Employee: choose the supervisor first and the employee second.'
+    : relationshipKind.value==='bidirectional'
+      ? 'Interconnected: either agent may be selected first; both agents will command and report to each other.'
+      : relationshipKind.value==='command'
+        ? 'Commands: choose the commanding agent first.'
+        : 'Reports to: choose the reporting agent first.';
+  relationshipKind.onchange=updateRelationshipAddHelp;
+  updateRelationshipAddHelp()
+}
+$('#relationship-add-form').onsubmit=event=>{
+  event.preventDefault();
+  const sourceRole=$('#relationship-source').value, targetRole=$('#relationship-target').value, relationship=$('#relationship-kind').value;
+  if(sourceRole===targetRole)return alert('Choose two different agents.');
+  if(relationship==='supervisor'||relationship==='bidirectional'){
+    if(!addRelationship(sourceRole,targetRole,relationship))return alert('That relationship already exists.');
+    renderWorkflowDialog(); renderFlowchart(); return
+  }
+  const edge={source_role:sourceRole,target_role:targetRole,relationship};
+  if(state.edges.some(item=>item.source_role===edge.source_role&&item.target_role===edge.target_role&&item.relationship===edge.relationship))return alert('That relationship already exists.');
+  state.edges.push(edge); saveEdges(); renderWorkflowDialog(); renderFlowchart()
+};
 $('#close-dialog').onclick=()=>$('#context-dialog').close();
 $('#close-code-terminal').onclick=()=>$('#code-terminal-dialog').close();
 $('#tools-button').onclick=()=>openToolsDialog().catch(err=>alert(err.message));
@@ -3047,6 +3785,7 @@ async function init(){
     $('#status').style.background='#fde2dc'
   }
 }
+applyTheme(preferredTheme());
 init();
 setInterval(()=>{
   if(state.project&&state.active&&!state.busy.has(state.active)&&!$('#workspace').classList.contains('hidden'))loadHistory(state.active);

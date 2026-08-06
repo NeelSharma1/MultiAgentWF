@@ -137,6 +137,9 @@ def test_version_control_overview_and_branch_management(tmp_path):
         "role": "programmer", "name": "Programmer", "enabled": True, "branch": "programmer",
         "branch_exists": True, "merged_into_main": True,
     }]
+    assert overview["commits"]
+    assert any(item["agent_commit"] and item["subject"] == "agent(programmer): Create graph" for item in overview["commits"])
+    assert overview["commits_truncated"] is False
 
     assert workflow.checkout_branch(1, repository, "review")["branch"] == "review"
     with pytest.raises(GitWorkflowError, match="configured main branch"):

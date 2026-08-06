@@ -394,7 +394,7 @@ def format_tool_result(result: dict[str, Any]) -> str:
 
 
 async def resolve_tool_calls(text: str, store: ToolsetStore, project_root: Path,
-                             project_id: int, role: str) -> tuple[str, list[dict[str, Any]]]:
+                             project_id: int, role: str, allow_execution: bool = True) -> tuple[str, list[dict[str, Any]]]:
     matches = list(TOOL_CALL_RE.finditer(str(text or "")))
     if not matches:
         return text, []
@@ -405,6 +405,8 @@ async def resolve_tool_calls(text: str, store: ToolsetStore, project_root: Path,
         parts.append(text[cursor:match.start()])
         slug, name = match.group("toolset"), match.group("tool")
         try:
+            if not allow_execution:
+                raise PermissionError("This agent is not permitted to execute local commands")
             arguments = json.loads(match.group("arguments"))
             if not isinstance(arguments, list):
                 raise ValueError("arguments must be a JSON list")

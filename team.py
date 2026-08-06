@@ -445,9 +445,14 @@ class AgentTeam:
             skill_guidance = (
                 "\n\nAssigned ACP-compatible Agent Skills (discovery metadata only; load the SKILL.md body on demand):\n"
                 f"{skill_lines}\n"
-                "Use list_assigned_skills for the catalog, load_assigned_skill before following a skill, "
-                "read_skill_resource for references/assets, and run_assigned_skill with the skill_id and a JSON "
-                "inputs object when an executable helper is appropriate. Do not recreate a skill's script in your response."
+                "Use list_assigned_skills for the catalog, load_assigned_skill before following a skill, and "
+                "read_skill_resource for references/assets. "
+                + (
+                    "Run an executable helper only with run_assigned_skill and its skill_id plus a JSON inputs object. "
+                    if self._action_permissions(role, project_id)["effective_commands"] else
+                    "Do not call run_assigned_skill: executable skill helpers are not permitted for you in this workspace. "
+                )
+                + "Do not recreate a skill's script in your response."
             )
         else:
             return "\n\nNo reusable skills are assigned to you in this workspace."
@@ -474,7 +479,12 @@ class AgentTeam:
             "TOOLCALL - <toolset>/<tool name> - [arguments].\n\n"
             "Arguments must be one valid JSON list in positional order and the marker must end with a period. "
             "Do not wrap the marker in Markdown. The local workspace will execute the configured file and replace "
-            "the marker with the tool's formatted result in the chat. Never invent a toolset or tool name."
+            "the marker with the tool's formatted result in the chat. Never invent a toolset or tool name. "
+            + (
+                "You are authorized to execute these toolsets."
+                if self._action_permissions(role, project_id)["effective_commands"] else
+                "You are not authorized to execute these toolsets; inspect their documentation only."
+            )
         )
 
     def _git_guidance(self, role: str, project_id: int = 1) -> str:
@@ -493,15 +503,261 @@ class AgentTeam:
             "the completed series of file changes as one commit and handles the merge automatically."
         )
 
-    def _instructions(self, role: str, project_id: int = 1) -> str:
+    def _action_permissions(self, role: str, project_id: int = 1) -> dict[str, Any]:
+        return self.projects.agent_action_permissions(project_id, role)
+
+    def _has_full_workspace_access(self, role: str, project_id: int = 1) -> bool:
+        permissions = self._action_permissions(role, project_id)
+        project = self.projects.get(project_id)
+        return bool(project.get("auto_approve_agent_actions")) or (
+            bool(permissions["allow_commands"]) and bool(permissions["allow_file_edits"])
+        )
+
+    def _action_guidance(self, role: str, project_id: int = 1, temporary_access: str = "") -> str:
+        if temporary_access == "external":
+            return (
+                "\n\nThe user approved one external-access continuation. Perform only the specific action just "
+                "approved, then return to normal permissions. Do not inspect secrets or modify unrelated files."
+            )
+        if temporary_access == "workspace":
+            return (
+                "\n\nThe user approved one workspace-access continuation. Perform only the specific action just "
+                "approved inside this workspace, then return to normal permissions."
+            )
+        permissions = self._action_permissions(role, project_id)
+        if permissions["full_system_access"]:
+            return (
+                "\n\nThe user has explicitly granted unrestricted local system access for this agent. "
+                "You may read, write, and run commands outside the workspace when the task requires it. "
+                "Act directly without requesting permission, but do not inspect secrets or modify unrelated files."
+            )
+        if self._has_full_workspace_access(role, project_id):
+            return (
+                "\n\nThe user has authorized you to run commands and edit files inside this workspace. "
+                "Act directly when needed inside the workspace. For any command or file operation outside the workspace, "
+                "do not perform it yet. Reply with a permission_request block on its own lines using exactly this format: "
+                "<permission_request scope=\"external\"><reason>concise reason</reason><commands>\n- exact command 1\n"
+                "- exact command 2\n</commands></permission_request>. Include every command you intend to run and wait for the user's decision."
+            )
+        return (
+            "\n\nYou do not have persistent full workspace or computer access. Before every state-changing command "
+            "or file edit, including actions inside this workspace, do not perform it yet. Reply with a permission_request "
+            "block on its own lines: <permission_request scope=\"workspace\"> or <permission_request scope=\"external\">, "
+            "containing <reason>concise reason</reason><commands> followed by every exact planned command on lines beginning "
+            "with '- ', then </commands></permission_request>. Use workspace for project work and external for work outside it. "
+            "Wait for the user's decision. Read-only inspection is allowed."
+        )
+
+    def _shared_context_text(self, role: str, project_id: int = 1) -> str:
+        shared = self.context.list(role, project_id)
+        sections = [f"[{item['title']}]\n{item['content']}" for item in shared]
+        active_memory_id = int(self.projects.get(project_id).get("active_workflow_memory_id") or 0)
+        memory = self.projects.workflow_memory(project_id, active_memory_id)
+        if memory:
+            sections.append(f"[Active workflow memory: {memory['name']}]\n{memory['content']}")
+        return "\n\n".join(sections) or "No shared context."
+
+    def context_usage(self, role: str, project_id: int = 1) -> dict[str, Any]:
+        """Return provider-reported context usage, falling back to a visible-text estimate.
+
+        Codex reports both the effective model context window and current token usage in
+        its JSON event stream. Agents SDK providers report exact per-request usage. A
+        provider that omits either value cannot be made exact locally, so the fallback is
+        explicitly marked as an estimate instead of being presented as a token count.
+        """
+        config = self.configs.get(role, project_id)
+        window = max(1_000, int(config.get("context_window_tokens") or 128_000))
+        reported = self.configs.context_usage(role, project_id)
+        if reported and bool(reported.get("exact")) and int(reported.get("context_tokens") or 0) > 0:
+            reported_window = int(reported.get("context_window_tokens") or 0)
+            if reported_window > 0:
+                window = reported_window
+            used_tokens = int(reported.get("context_tokens") or 0)
+            remaining_tokens = max(0, window - used_tokens)
+            window_exact = bool(reported.get("context_window_exact"))
+            session = self.configs.codex_session(role, project_id) if config["provider"] == "codex" else None
+            summary = self.configs.context_summary(role, project_id) if config["provider"] != "codex" else None
+            compacted_message_id = (
+                int(session.get("compacted_message_id") or 0) if session else
+                int(summary.get("compacted_message_id") or 0) if summary else 0
+            )
+            return {
+                "estimated_tokens": used_tokens,
+                "used_tokens": used_tokens,
+                "context_window_tokens": window,
+                "remaining_tokens": remaining_tokens,
+                "remaining_percent": max(0, min(100, round(remaining_tokens * 100 / window))),
+                "compacted_message_id": compacted_message_id,
+                "compaction_threshold": int(config.get("context_compaction_threshold") or 0),
+                "is_estimate": not window_exact,
+                "is_exact": window_exact,
+                "context_window_exact": window_exact,
+                "usage_source": reported.get("source") or "provider",
+                "input_tokens": int(reported.get("input_tokens") or 0),
+                "output_tokens": int(reported.get("output_tokens") or 0),
+                "cached_input_tokens": int(reported.get("cached_input_tokens") or 0),
+                "reasoning_output_tokens": int(reported.get("reasoning_output_tokens") or 0),
+            }
+        session = self.configs.codex_session(role, project_id) if config["provider"] == "codex" else None
+        summary = self.configs.context_summary(role, project_id) if config["provider"] != "codex" else None
+        compacted_message_id = (
+            int(session.get("compacted_message_id") or 0) if session else
+            int(summary.get("compacted_message_id") or 0) if summary else 0
+        )
+        transcript = self.configs.context_messages(role, project_id, compacted_message_id)
+        characters = sum(len(str(message.get("content") or "")) for message in transcript)
+        characters += len(str(summary.get("summary") or "")) if summary else 0
+        characters += len(self._shared_context_text(role, project_id))
+        # Prompt scaffolding, role instructions, tool descriptions, and attachments are not
+        # represented in transcript rows. Reserve a small baseline for them.
+        baseline_tokens = min(1_200, max(200, window // 10))
+        estimated_tokens = max(baseline_tokens, (characters + 3) // 4 + baseline_tokens)
+        remaining_tokens = max(0, window - estimated_tokens)
+        return {
+            "estimated_tokens": estimated_tokens,
+            "used_tokens": estimated_tokens,
+            "context_window_tokens": window,
+            "remaining_tokens": remaining_tokens,
+            "remaining_percent": max(0, min(100, round(remaining_tokens * 100 / window))),
+            "compacted_message_id": compacted_message_id,
+            "compaction_threshold": int(config.get("context_compaction_threshold") or 0),
+            "is_estimate": True,
+            "is_exact": False,
+            "context_window_exact": False,
+            "usage_source": "visible_text_estimate",
+        }
+
+    async def _compact_context_if_needed(
+        self, role: str, config: dict[str, Any], project_id: int, session: dict[str, Any] | None = None,
+        executable: str = "", working_root: Path | None = None,
+        exclude_message_ids: set[int] | None = None, force: bool = False,
+    ) -> None:
+        """Compact visible history for every provider without blocking the actual turn on failure."""
+        threshold = int(config.get("context_compaction_threshold") or 0)
+        if not threshold and not force:
+            return
+        usage = self.context_usage(role, project_id)
+        if not force and usage["used_tokens"] * 100 < usage["context_window_tokens"] * threshold:
+            return
+        if config["provider"] == "codex":
+            if not session or not executable or working_root is None:
+                return
+            latest_messages = self.configs.context_messages(role, project_id)
+            latest_message_id = max((int(message["id"]) for message in latest_messages), default=0)
+            if latest_message_id <= int(session.get("compacted_message_id") or 0):
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._codex_tui_command, executable, "/compact", config, session["session_id"], working_root,
+                    ), timeout=45,
+                )
+            except Exception:
+                return
+            self.configs.mark_codex_context_compacted(role, project_id, latest_message_id)
+            self.configs.clear_context_usage(role, project_id)
+            return
+
+        existing_summary = self.configs.context_summary(role, project_id)
+        compacted_message_id = int(existing_summary.get("compacted_message_id") or 0) if existing_summary else 0
+        excluded = exclude_message_ids or set()
+        messages = [
+            item for item in self.configs.context_messages(role, project_id, compacted_message_id)
+            if int(item["id"]) not in excluded
+        ]
+        latest_message_id = max((int(message["id"]) for message in messages), default=0)
+        if latest_message_id <= compacted_message_id:
+            return
+        try:
+            summary = await asyncio.wait_for(
+                self._summarize_context(config, existing_summary.get("summary", "") if existing_summary else "", messages),
+                timeout=90,
+            )
+        except Exception:
+            return
+        if summary:
+            self.configs.save_context_summary(role, project_id, summary, latest_message_id)
+            self.configs.clear_context_usage(role, project_id)
+
+    async def _summarize_context(
+        self, config: dict[str, Any], previous_summary: str, messages: list[dict[str, Any]],
+    ) -> str:
+        """Use the selected API/compatible model to create durable, provider-neutral memory."""
+        window = max(1_000, int(config.get("context_window_tokens") or 128_000))
+        target_tokens = min(8_000, max(250, window // 8))
+        transcript = "\n\n".join(
+            f"Message {item['id']}:\n{item.get('content') or ''}" for item in messages
+        )
+        prompt = (
+            "Create a compact factual memory of this agent conversation for a later turn. Preserve completed work, "
+            "decisions, requirements, important file paths/commands, unresolved questions, and useful technical details. "
+            "Do not address the user, invent facts, or include a preamble. Keep it under approximately "
+            f"{target_tokens} tokens.\n\n"
+            + (f"Existing memory to retain and improve:\n{previous_summary}\n\n" if previous_summary else "")
+            + f"Conversation to compact:\n{transcript}"
+        )
+        summarizer = Agent(
+            name="Conversation context compactor",
+            instructions="Return only the durable conversation memory requested by the user message.",
+            model=self._model(config),
+        )
+        result = await Runner.run(
+            summarizer, prompt,
+            run_config=RunConfig(tracing_disabled=config["provider"] != "openai"),
+        )
+        return str(result.final_output).strip()
+
+    def _context_summary_text(self, role: str, project_id: int = 1) -> tuple[int, str]:
+        summary = self.configs.context_summary(role, project_id)
+        if not summary:
+            return 0, ""
+        return int(summary.get("compacted_message_id") or 0), str(summary.get("summary") or "")
+
+    def _agent_directed_compaction_guidance(self, role: str, project_id: int = 1) -> str:
+        """Give stateless API models a safe way to decide when to replace old turns with memory."""
+        config = self.configs.get(role, project_id)
+        if config["provider"] == "codex" or int(config.get("context_compaction_threshold") or 0):
+            return ""
+        usage = self.context_usage(role, project_id)
+        return (
+            "\n\n<context_management>Context compaction is agent-directed for this conversation. "
+            f"The app estimates {usage['remaining_percent']}% of the configured context window remains. "
+            "When preserving a concise memory would help a later turn, include the standalone marker "
+            "<context_compaction_request/> anywhere in your final response. The marker is removed before the user "
+            "sees it, and the app will save a summary for future turns. Keep your normal answer as well.</context_management>"
+        )
+
+    def _instructions(self, role: str, project_id: int = 1, temporary_access: str = "") -> str:
         definition = self.definitions.get(role, project_id)
-        roster = ", ".join(
-            f"{item['role']} ({item['name']})" for item in self.definitions.list(project_id)
-        ) or "no other agents"
-        graph = "; ".join(
-            f"{edge['source_role']} {'commands' if edge['relationship'] == 'command' else 'reports to'} {edge['target_role']}"
-            for edge in self.projects.edges(project_id)
-        ) or "no explicit graph relationships"
+        project = self.projects.get(project_id)
+        edges = self.projects.edges(project_id)
+        enforce_relationships = bool(project.get("enforce_relationships"))
+        if enforce_relationships:
+            direct_edges = [edge for edge in edges if role in {edge["source_role"], edge["target_role"]}]
+            direct_roles = {
+                edge["target_role"] if edge["source_role"] == role else edge["source_role"]
+                for edge in direct_edges
+            }
+            roster = ", ".join(sorted(direct_roles)) or "none"
+            graph = "; ".join(
+                f"You {'command' if edge['relationship'] == 'command' else 'report to'} {edge['target_role']}"
+                if edge["source_role"] == role else
+                f"{edge['source_role']} {'commands' if edge['relationship'] == 'command' else 'reports to'} you"
+                for edge in direct_edges
+            ) or "no direct relationships"
+            coordination_policy = (
+                "Relationship enforcement is enabled: communicate only with the directly connected role IDs below, "
+                "and only use the direction/type shown. "
+            )
+        else:
+            roster = ", ".join(
+                f"{item['role']} ({item['name']})" for item in self.definitions.list(project_id)
+            ) or "no other agents"
+            graph = "; ".join(
+                f"{edge['source_role']} {'commands' if edge['relationship'] == 'command' else 'reports to'} {edge['target_role']}"
+                for edge in edges
+            ) or "no explicit graph relationships"
+            coordination_policy = ""
         return (
             "You are one member of the user's agent team. Use list_shared_context at the start of substantive work "
             "to incorporate relevant team knowledge. Publish durable findings or decisions with publish_shared_context. "
@@ -511,11 +767,12 @@ class AgentTeam:
             "status, or decisions. Messages are durable, automatically start an idle recipient run, and are "
             "synthesized into its next prompt. Always use send_agent_message for delegation so the recipient has "
             "its own chat transcript and run history. "
-            f"Available recipient role IDs in this workspace: {roster}. "
-            f"Current graph relationships: {graph}. "
+            f"{coordination_policy}Available recipient role IDs: {roster}. "
+            f"{'Your direct relationships' if enforce_relationships else 'Current graph relationships'}: {graph}. "
             f"This conversation belongs to workspace {project_id}. Always pass project_id={project_id} to shared context tools. "
             "Never claim another agent completed work unless the conversation or shared context shows it. "
             f"Be direct, practical, and identify assumptions. Your role is {definition['name']}: {definition['instructions']}"
+            f"{self._action_guidance(role, project_id, temporary_access)}"
             f"{self._skill_guidance(role, project_id)}"
             f"{self._tool_guidance(role, project_id)}"
             f"{self._git_guidance(role, project_id)}"
@@ -562,6 +819,7 @@ class AgentTeam:
                              reply_to_id: int | None = None,
                              exclude_message_ids: set[int] | None = None) -> str:
         history = self.configs.history(role, project_id=project_id)
+        compacted_message_id, summary = self._context_summary_text(role, project_id)
         excluded = exclude_message_ids or set()
         reply = self.configs.message(reply_to_id, role, project_id) if reply_to_id else None
         if reply_to_id and not reply:
@@ -569,6 +827,8 @@ class AgentTeam:
         reply_text = f"\n\n<replying_to>\n{reply['content']}\n</replying_to>" if reply else ""
         transcript_items = []
         for item in history:
+            if int(item["id"]) <= compacted_message_id:
+                continue
             if item["speaker"] == "agent" and int(item["id"]) in excluded:
                 continue
             speaker = item["speaker"]
@@ -591,10 +851,15 @@ class AgentTeam:
                 label = speaker.title()
                 content = str(item.get("content") or "")
             transcript_items.append(f"{label}: {content}")
+        summary_text = f"<conversation_summary>\n{summary}\n</conversation_summary>\n\n" if summary else ""
+        compaction_guidance = self._agent_directed_compaction_guidance(role, project_id)
         if not transcript_items:
-            return f"{message}{reply_text}"
+            return f"{summary_text}{message}{reply_text}{compaction_guidance}"
         transcript = "\n".join(transcript_items)
-        return f"<conversation_history>\n{transcript}\n</conversation_history>\n\nUser: {message}{reply_text}"
+        return (
+            f"{summary_text}<conversation_history>\n{transcript}\n</conversation_history>\n\n"
+            f"User: {message}{reply_text}{compaction_guidance}"
+        )
 
     @staticmethod
     def _command_prompt_content(content: str) -> str:
@@ -632,9 +897,18 @@ class AgentTeam:
     def send_agent_message(self, sender_role: str, recipient_role: str, content: str,
                            relationship: str, project_id: int = 1) -> dict[str, Any]:
         """Validate and persist an inter-agent message for this project."""
-        self.projects.get(project_id)
+        project = self.projects.get(project_id)
         self.definitions.get(sender_role, project_id)
         self.definitions.get(recipient_role, project_id)
+        if project.get("enforce_relationships") and not any(
+            edge["source_role"] == sender_role
+            and edge["target_role"] == recipient_role
+            and edge["relationship"] == relationship
+            for edge in self.projects.edges(project_id)
+        ):
+            raise ValueError(
+                f"Relationship enforcement blocks {relationship} messages from {sender_role} to {recipient_role}"
+            )
         message = self.configs.send_agent_message(
             sender_role, recipient_role, content, relationship, project_id,
         )
@@ -669,6 +943,107 @@ class AgentTeam:
                 if isinstance(text, str):
                     parts.append(text)
         return "".join(parts)
+
+    @staticmethod
+    def _usage_value(value: Any, *names: str, default: int = 0) -> int:
+        for name in names:
+            item = value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+            if item is not None:
+                try:
+                    return max(0, int(item))
+                except (TypeError, ValueError):
+                    continue
+        return default
+
+    @classmethod
+    def _provider_usage_record(
+        cls, usage: Any, context_window_tokens: int, source: str,
+    ) -> dict[str, int | bool | str] | None:
+        """Normalize Agents SDK, Responses, and Chat Completions usage shapes."""
+        if usage is None:
+            return None
+        entries = getattr(usage, "request_usage_entries", None)
+        selected = entries[-1] if entries else usage
+        input_tokens = cls._usage_value(selected, "input_tokens", "prompt_tokens")
+        output_tokens = cls._usage_value(selected, "output_tokens", "completion_tokens")
+        total_tokens = cls._usage_value(selected, "total_tokens") or input_tokens + output_tokens
+        input_details = (
+            selected.get("input_tokens_details", {}) if isinstance(selected, dict)
+            else getattr(selected, "input_tokens_details", None)
+        )
+        prompt_details = (
+            selected.get("prompt_tokens_details", {}) if isinstance(selected, dict)
+            else getattr(selected, "prompt_tokens_details", None)
+        )
+        output_details = (
+            selected.get("output_tokens_details", {}) if isinstance(selected, dict)
+            else getattr(selected, "output_tokens_details", None)
+        )
+        completion_details = (
+            selected.get("completion_tokens_details", {}) if isinstance(selected, dict)
+            else getattr(selected, "completion_tokens_details", None)
+        )
+        cached_input_tokens = cls._usage_value(
+            input_details, "cached_tokens", default=cls._usage_value(prompt_details, "cached_tokens"),
+        )
+        reasoning_output_tokens = cls._usage_value(
+            output_details, "reasoning_tokens", default=cls._usage_value(completion_details, "reasoning_tokens"),
+        )
+        if not input_tokens and not output_tokens and not total_tokens:
+            return None
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
+            "context_tokens": total_tokens,
+            "context_window_tokens": max(0, int(context_window_tokens or 0)),
+            "source": source,
+            "exact": True,
+            "context_window_exact": False,
+        }
+
+    @classmethod
+    def _codex_usage_record(
+        cls, events: list[dict[str, Any]], config: dict[str, Any],
+    ) -> dict[str, int | bool | str] | None:
+        """Read Codex's JSON usage events, including the effective context window."""
+        token_info = None
+        turn_usage = None
+        for event in events:
+            event_type = event.get("type")
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if event_type == "token_count":
+                token_info = event.get("info") or {}
+            elif event_type == "event_msg" and payload.get("type") == "token_count":
+                token_info = payload.get("info") or {}
+            elif event_type == "turn.completed" and isinstance(event.get("usage"), dict):
+                turn_usage = event["usage"]
+        if token_info:
+            last_usage = token_info.get("last_token_usage") or token_info.get("total_token_usage") or {}
+            context_window = cls._usage_value(token_info, "model_context_window")
+            total_tokens = cls._usage_value(last_usage, "total_tokens")
+            if total_tokens:
+                return {
+                    "input_tokens": cls._usage_value(last_usage, "input_tokens"),
+                    "output_tokens": cls._usage_value(last_usage, "output_tokens"),
+                    "total_tokens": total_tokens,
+                    "cached_input_tokens": cls._usage_value(last_usage, "cached_input_tokens"),
+                    "reasoning_output_tokens": cls._usage_value(last_usage, "reasoning_output_tokens"),
+                    "context_tokens": total_tokens,
+                    "context_window_tokens": context_window or int(config.get("context_window_tokens") or 0),
+                    "source": "codex_token_count",
+                    "exact": True,
+                    "context_window_exact": bool(context_window),
+                }
+        if turn_usage:
+            record = cls._provider_usage_record(
+                turn_usage, int(config.get("context_window_tokens") or 0), "codex_turn_completed",
+            )
+            if record:
+                return record
+        return None
 
     def _attachment_text(self, attachments: list[dict[str, Any]]) -> str:
         parts = []
@@ -716,7 +1091,15 @@ class AgentTeam:
             ),
             run_config=RunConfig(tracing_disabled=config["provider"] != "openai"),
         )
-        return {"response": str(result.final_output), "answered_by": result.last_agent.name}
+        usage = self._provider_usage_record(
+            result.raw_responses[-1].usage if result.raw_responses else None,
+            int(config.get("context_window_tokens") or 0),
+            "agents_sdk_response",
+        )
+        response = {"response": str(result.final_output), "answered_by": result.last_agent.name}
+        if usage:
+            response["context_usage"] = usage
+        return response
 
     async def _google_chat(self, role: str, message: str, config: dict[str, str], project_id: int = 1,
                            reply_to_id: int | None = None,
@@ -727,17 +1110,22 @@ class AgentTeam:
         key = os.getenv(env_name)
         if not key:
             raise ProviderError(f"{env_name} is not configured")
-        shared = self.context.list(role, project_id)
-        context_text = "\n\n".join(f"[{item['title']}]\n{item['content']}" for item in shared) or "No shared context."
+        context_text = self._shared_context_text(role, project_id)
         messages: list[dict[str, Any]] = [{
             "role": "system",
             "content": (
                 f"{self._instructions(role, project_id)}\n\nCurrent shared team context:\n{context_text}\n\n"
-                f"{GOOGLE_TEXT_ONLY_INSTRUCTION}"
+                f"{GOOGLE_TEXT_ONLY_INSTRUCTION}{self._agent_directed_compaction_guidance(role, project_id)}"
             ),
         }]
+        compacted_message_id, summary = self._context_summary_text(role, project_id)
+        if summary:
+            messages.append({"role": "user", "content": f"<conversation_summary>\n{summary}\n</conversation_summary>"})
+            messages.append({"role": "assistant", "content": "I will use this prior conversation summary as context."})
         excluded = exclude_message_ids or set()
         for item in self.configs.history(role, project_id=project_id):
+            if int(item["id"]) <= compacted_message_id:
+                continue
             if item["speaker"] == "agent" and int(item["id"]) in excluded:
                 continue
             if item["speaker"] in {"user", "assistant"}:
@@ -787,6 +1175,7 @@ class AgentTeam:
             api_key=key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
         ) as client:
             use_tools = True
+            last_usage = None
             for _ in range(5):
                 try:
                     completion = await create_completion(client, use_tools)
@@ -816,6 +1205,7 @@ class AgentTeam:
                         detail, provider="google", status_code=status, code=code,
                         request_id=request_id, body=body,
                     ) from exc
+                last_usage = getattr(completion, "usage", None)
                 if not completion.choices:
                     raise ProviderError(
                         "Gemini returned no choices",
@@ -877,7 +1267,13 @@ class AgentTeam:
                     messages.extend(tool_entries)
                     continue
                 if response.strip():
-                    return {"response": response.strip(), "answered_by": self.definitions.get(role, project_id)["name"]}
+                    result = {"response": response.strip(), "answered_by": self.definitions.get(role, project_id)["name"]}
+                    usage = self._provider_usage_record(
+                        last_usage, int(config.get("context_window_tokens") or 0), "google_chat_completion",
+                    )
+                    if usage:
+                        result["context_usage"] = usage
+                    return result
                 tool_names = [str(call_value(call_value(call, "function", {}), "name", "unknown")) for call in calls]
                 if calls:
                     code = "tool_call_without_tools" if not use_tools else "tool_call_loop_exhausted"
@@ -896,13 +1292,17 @@ class AgentTeam:
 
     async def _codex_chat(self, role: str, message: str, config: dict[str, str], project_id: int = 1,
                           reply_to_id: int | None = None,
-                          attachments: list[dict[str, Any]] | None = None) -> dict[str, str]:
+                          attachments: list[dict[str, Any]] | None = None,
+                          temporary_access: str = "") -> dict[str, str]:
         lock = self._codex_chat_locks.setdefault((project_id, role), asyncio.Lock())
         async with lock:
-            return await self._codex_chat_locked(role, message, config, project_id, reply_to_id, attachments or [])
+            return await self._codex_chat_locked(
+                role, message, config, project_id, reply_to_id, attachments or [], temporary_access,
+            )
 
     async def _codex_chat_locked(self, role: str, message: str, config: dict[str, str], project_id: int,
-                                 reply_to_id: int | None, attachments: list[dict[str, Any]]) -> dict[str, str]:
+                                 reply_to_id: int | None, attachments: list[dict[str, Any]],
+                                 temporary_access: str = "") -> dict[str, str]:
         command = self._codex_command()
         if not command:
             raise ProviderError("Codex CLI was not found. Set CODEX_COMMAND or install and sign in to Codex CLI.")
@@ -915,9 +1315,11 @@ class AgentTeam:
                 code="codex_not_authenticated",
             )
         working_root = self._project_root(project_id)
-        shared = self.context.list(role, project_id)
-        context_text = "\n\n".join(f"[{item['title']}]\n{item['content']}" for item in shared) or "No shared context."
+        context_text = self._shared_context_text(role, project_id)
         existing = self.configs.codex_session(role, project_id)
+        if existing and not temporary_access:
+            await self._compact_context_if_needed(role, config, project_id, existing, command, working_root)
+            existing = self.configs.codex_session(role, project_id)
         shared_prompt = f"<current_shared_context>\n{context_text}\n</current_shared_context>"
         reply = self.configs.message(reply_to_id, role, project_id) if reply_to_id else None
         if reply_to_id and not reply:
@@ -928,26 +1330,35 @@ class AgentTeam:
         if existing:
             prompt = (
                 f"The shared team context, reusable skill assignments, and local toolsets may have changed since the prior turn.\n"
-                f"{shared_prompt}\n{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
+                f"{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
                 f"User: {message}{reply_prompt}{attachment_prompt}"
             )
         else:
             prompt = (
-                f"{self._instructions(role, project_id)}\n\n"
+                f"{self._instructions(role, project_id, temporary_access)}\n\n"
                 "You are a persistent conversational team member. Do not inspect secret files such as .env or .env.local. "
                 "Keep continuity with future turns in this Codex session.\n\n"
                 f"{shared_prompt}\n\nUser: {message}{reply_prompt}{attachment_prompt}"
             )
         with tempfile.TemporaryDirectory(prefix="agent-team-") as temp_dir:
             output_path = Path(temp_dir) / "last-message.txt"
+            permissions = self._action_permissions(role, project_id)
+            full_workspace_access = self._has_full_workspace_access(role, project_id)
+            sandbox = "danger-full-access" if temporary_access == "external" or permissions["full_system_access"] else "workspace-write" if (
+                temporary_access == "workspace" or full_workspace_access
+            ) else "read-only"
+            # The bundled Windows Codex executable runs `exec` non-interactively
+            # but does not accept the newer `--ask-for-approval` CLI option.
+            # The sandbox mode remains the enforceable permission boundary.
+            execution_flags = ["--sandbox", sandbox]
             if existing:
                 # `-C/--cd` belongs to the top-level `exec` command in current
                 # Codex CLI releases. Putting it after `resume` makes the CLI
                 # reject the invocation with only the unhelpful "try --help"
                 # footer, which used to look like an account/usage failure.
-                args = [command, "exec", "-C", str(working_root), "resume", "--skip-git-repo-check"]
+                args = [command, "exec", *execution_flags, "-C", str(working_root), "resume", "--skip-git-repo-check"]
             else:
-                args = [command, "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-C", str(working_root)]
+                args = [command, "exec", *execution_flags, "--skip-git-repo-check", "-C", str(working_root)]
             if config["model"]:
                 args.extend(["--model", config["model"]])
             if config.get("reasoning_effort"):
@@ -985,23 +1396,42 @@ class AgentTeam:
                     body={"command": args, "diagnostic": diagnostic},
                 )
             session_id = existing["session_id"] if existing else ""
+            events: list[dict[str, Any]] = []
             for line in stdout.decode(errors="replace").splitlines():
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(event, dict):
+                    events.append(event)
                 if event.get("type") == "thread.started":
                     session_id = event.get("thread_id", "")
-                    break
             if not session_id:
                 raise ProviderError("Codex started without returning a persistent session ID")
             self.configs.save_codex_session(
                 role, project_id, session_id, config.get("model", ""), config.get("reasoning_effort", "")
             )
+            provider_usage = self._codex_usage_record(events, config)
+            if provider_usage:
+                self.configs.save_context_usage(
+                    role, project_id, "codex", config.get("model", ""),
+                    input_tokens=int(provider_usage["input_tokens"]),
+                    output_tokens=int(provider_usage["output_tokens"]),
+                    total_tokens=int(provider_usage["total_tokens"]),
+                    cached_input_tokens=int(provider_usage["cached_input_tokens"]),
+                    reasoning_output_tokens=int(provider_usage["reasoning_output_tokens"]),
+                    context_tokens=int(provider_usage["context_tokens"]),
+                    context_window_tokens=int(provider_usage["context_window_tokens"]),
+                    source=str(provider_usage["source"]), exact=bool(provider_usage["exact"]),
+                    context_window_exact=bool(provider_usage.get("context_window_exact")),
+                )
             response = output_path.read_text(encoding="utf-8", errors="replace").strip()
         if not response:
             raise ProviderError("Codex completed without a final response")
-        return {"response": response, "answered_by": self.definitions.get(role, project_id)["name"]}
+        result = {"response": response, "answered_by": self.definitions.get(role, project_id)["name"]}
+        if provider_usage:
+            result["context_usage"] = provider_usage
+        return result
 
     async def list_models(self, provider: str, base_url: str = "", api_key_env: str = "") -> list[dict]:
         if provider == "codex":
@@ -1422,7 +1852,8 @@ class AgentTeam:
                    project_id: int = 1, reply_to_id: int | None = None,
                    attachment_ids: list[str] | None = None,
                    record_user_message: bool = True,
-                   user_message_id: int | None = None) -> dict[str, Any]:
+                   user_message_id: int | None = None,
+                   temporary_access: str = "") -> dict[str, Any]:
         config = self.configs.get(role, project_id).copy()
         attachments = self.configs.pending_attachments(attachment_ids or [], role, project_id)
         existing_user_message = None
@@ -1453,18 +1884,22 @@ class AgentTeam:
             provider_message = f"{inbound_prompt}\n\n{message}" if inbound_prompt else message
             if config["provider"] == "codex":
                 result = await self._codex_chat(
-                    role, provider_message, config, project_id, reply_to_id, attachments,
-                )
-            elif config["provider"] == "google":
-                result = await self._google_chat(
-                    role, provider_message, config, project_id, reply_to_id, attachments,
-                    excluded_history_ids,
+                    role, provider_message, config, project_id, reply_to_id, attachments, temporary_access,
                 )
             else:
-                result = await self._agents_chat(
-                    role, provider_message, config, project_id, reply_to_id, attachments,
-                    excluded_history_ids,
+                await self._compact_context_if_needed(
+                    role, config, project_id, exclude_message_ids=excluded_history_ids,
                 )
+                if config["provider"] == "google":
+                    result = await self._google_chat(
+                        role, provider_message, config, project_id, reply_to_id, attachments,
+                        excluded_history_ids,
+                    )
+                else:
+                    result = await self._agents_chat(
+                        role, provider_message, config, project_id, reply_to_id, attachments,
+                        excluded_history_ids,
+                    )
         except Exception as exc:
             self.configs.release_agent_messages(
                 [int(item["id"]) for item in inbound_messages], delivery_run_id,
@@ -1520,8 +1955,19 @@ class AgentTeam:
                 raise
             resolved_response, tool_calls = await resolve_tool_calls(
                 result["response"], self.toolsets, self._project_root(project_id), project_id, role,
+                allow_execution=temporary_access in {"workspace", "external"} or
+                self._action_permissions(role, project_id)["full_system_access"] or
+                self._has_full_workspace_access(role, project_id),
             )
             result["response"] = resolved_response
+            agent_requested_compaction = False
+            agent_requested_compaction = bool(re.search(
+                r"<context_compaction_request\s*/>", result["response"], flags=re.IGNORECASE,
+            ))
+            if agent_requested_compaction:
+                result["response"] = re.sub(
+                    r"\s*<context_compaction_request\s*/>\s*", "\n", result["response"], flags=re.IGNORECASE,
+                ).strip()
             if tool_calls:
                 result["tool_calls"] = tool_calls
             print(result, flush=True)
@@ -1535,6 +1981,57 @@ class AgentTeam:
             assistant_message = self.configs.add_message(
                 role, "assistant", result["response"], config["provider"], config["model"], project_id
             )
+            provider_usage = result.get("context_usage")
+            if isinstance(provider_usage, dict):
+                self.configs.save_context_usage(
+                    role, project_id, config["provider"], config.get("model", ""),
+                    input_tokens=int(provider_usage.get("input_tokens") or 0),
+                    output_tokens=int(provider_usage.get("output_tokens") or 0),
+                    total_tokens=int(provider_usage.get("total_tokens") or 0),
+                    cached_input_tokens=int(provider_usage.get("cached_input_tokens") or 0),
+                    reasoning_output_tokens=int(provider_usage.get("reasoning_output_tokens") or 0),
+                    context_tokens=int(provider_usage.get("context_tokens") or 0),
+                    context_window_tokens=int(provider_usage.get("context_window_tokens") or 0),
+                    observed_message_id=int(assistant_message["id"]),
+                    source=str(provider_usage.get("source") or "provider"),
+                    exact=bool(provider_usage.get("exact")),
+                    context_window_exact=bool(provider_usage.get("context_window_exact")),
+                )
+                threshold = int(config.get("context_compaction_threshold") or 0)
+                usage_reached = bool(
+                    int(provider_usage.get("context_tokens") or 0) * 100
+                    >= int(provider_usage.get("context_window_tokens") or 0) * threshold
+                    if threshold and int(provider_usage.get("context_window_tokens") or 0) else False
+                )
+                if config["provider"] != "codex" and (agent_requested_compaction or usage_reached):
+                    await self._compact_context_if_needed(
+                        role, config, project_id, exclude_message_ids=excluded_history_ids,
+                        force=agent_requested_compaction,
+                    )
+            elif config["provider"] != "codex" and agent_requested_compaction:
+                # Some compatible endpoints omit usage entirely; the agent's
+                # explicit request still has to create a durable summary.
+                await self._compact_context_if_needed(
+                    role, config, project_id, exclude_message_ids=excluded_history_ids, force=True,
+                )
+            permission_match = re.search(
+                r'<permission_request\s+scope="(workspace|external)">\s*(.*?)\s*</permission_request>',
+                result["response"], flags=re.IGNORECASE | re.DOTALL,
+            )
+            if permission_match:
+                request_body = permission_match.group(2).strip()
+                reason_match = re.search(r"<reason>\s*(.*?)\s*</reason>", request_body, flags=re.IGNORECASE | re.DOTALL)
+                commands_match = re.search(
+                    r"<commands>\s*(.*?)\s*</commands>", request_body, flags=re.IGNORECASE | re.DOTALL,
+                )
+                commands = [
+                    line[2:].strip() for line in (commands_match.group(1).splitlines() if commands_match else [])
+                    if line.strip().startswith("- ") and line[2:].strip()
+                ]
+                assistant_message["permission_request"] = self.projects.record_permission_request(
+                    project_id, role, int(assistant_message["id"]), permission_match.group(1).lower(),
+                    reason_match.group(1).strip() if reason_match else request_body, commands,
+                )
             if user_message is not None:
                 user_message["attachments"] = [
                     {key: item[key] for key in ("id", "name", "mime_type", "size")} for item in attachments

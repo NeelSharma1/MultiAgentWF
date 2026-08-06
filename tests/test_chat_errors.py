@@ -189,10 +189,136 @@ def test_codex_resume_places_working_directory_before_resume_and_keeps_diagnosti
     ))
 
     args = captured["args"]
-    assert args[args.index("exec") + 1:args.index("exec") + 4] == [
-        "-C", str(tmp_path), "resume",
-    ]
+    assert args.index("-C") < args.index("resume")
+    assert args[args.index("-C") + 1] == str(tmp_path)
+    assert args[args.index("--sandbox") + 1] == "read-only"
+    assert "--ask-for-approval" not in args
     assert result["response"] == "Codex resumed response"
+
+
+def test_codex_temporary_external_approval_uses_unrestricted_sandbox(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "codex", "gpt-test", "", "")
+    monkeypatch.setattr(team, "_codex_command", lambda: "/usr/bin/codex")
+
+    async def logged_in():
+        return {"connected": True, "detail": "Logged in using ChatGPT", "login_output": ""}
+
+    monkeypatch.setattr(team, "codex_login_status", logged_in)
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _prompt):
+            Path(captured["output_path"]).write_text("Codex unrestricted response")
+            return b'{"type":"thread.started","thread_id":"session-unrestricted"}\n', b""
+
+    async def fake_create(*args, **_kwargs):
+        captured["args"] = list(args)
+        captured["output_path"] = args[args.index("--output-last-message") + 1]
+        return FakeProcess()
+
+    monkeypatch.setattr("team.asyncio.create_subprocess_exec", fake_create)
+    result = asyncio.run(team._codex_chat_locked(
+        "researcher", "Inspect the sibling workspace", team.configs.get("researcher"), 1, None, [], "external",
+    ))
+
+    args = captured["args"]
+    assert args[args.index("--sandbox") + 1] == "danger-full-access"
+    assert result["response"] == "Codex unrestricted response"
+
+
+def test_context_usage_and_automatic_compaction_watermark(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    config = team.configs.save(
+        "researcher", "codex", "gpt-test", "", "", context_window_tokens=1_000,
+        context_compaction_threshold=50,
+    )
+    team.configs.add_message("researcher", "user", "x" * 4_000, "codex", "gpt-test")
+    team.configs.save_codex_session("researcher", 1, "session-context", "gpt-test", "")
+    session = team.configs.codex_session("researcher", 1)
+    assert session is not None
+    assert team.context_usage("researcher", 1)["remaining_percent"] == 0
+    calls = []
+    monkeypatch.setattr(team, "_codex_tui_command", lambda *args: calls.append(args) or "Compacted")
+
+    asyncio.run(team._compact_context_if_needed(
+        "researcher", config, 1, session, "/usr/bin/codex", tmp_path,
+    ))
+
+    assert calls[0][1] == "/compact"
+    assert team.configs.codex_session("researcher", 1)["compacted_message_id"] > 0
+
+
+def test_codex_json_usage_includes_effective_context_window(tmp_path):
+    team = AgentTeam(tmp_path)
+    record = team._codex_usage_record([
+        {"type": "thread.started", "thread_id": "thread-usage"},
+        {"type": "token_count", "info": {
+            "model_context_window": 258400,
+            "last_token_usage": {
+                "input_tokens": 1200, "cached_input_tokens": 500,
+                "output_tokens": 300, "reasoning_output_tokens": 100,
+                "total_tokens": 1500,
+            },
+        }},
+        {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 300, "total_tokens": 1500}},
+    ], {"context_window_tokens": 128000})
+
+    assert record["context_tokens"] == 1500
+    assert record["context_window_tokens"] == 258400
+    assert record["source"] == "codex_token_count"
+    assert record["exact"] is True
+
+
+def test_api_and_compatible_providers_compact_to_saved_summary(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    config = team.configs.save(
+        "researcher", "compatible", "local-model", "http://localhost:1234/v1", "",
+        context_window_tokens=1_000, context_compaction_threshold=50,
+    )
+    team.configs.add_message("researcher", "user", "x" * 4_000, "compatible", "local-model")
+    calls = []
+
+    async def summarize(compaction_config, previous_summary, messages):
+        calls.append((compaction_config, previous_summary, messages))
+        return "The user asked for a long-running task; preserve its key requirements."
+
+    monkeypatch.setattr(team, "_summarize_context", summarize)
+    asyncio.run(team._compact_context_if_needed("researcher", config, 1))
+
+    summary = team.configs.context_summary("researcher", 1)
+    assert calls
+    assert summary is not None
+    assert summary["compacted_message_id"] > 0
+    prompt = team._conversation_prompt("researcher", "Continue")
+    assert "conversation_summary" in prompt
+    assert "key requirements" in prompt
+    assert "x" * 100 not in prompt
+
+
+def test_api_provider_can_request_agent_directed_compaction(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save(
+        "researcher", "compatible", "local-model", "http://localhost:1234/v1", "",
+        context_window_tokens=1_000, context_compaction_threshold=0,
+    )
+    team.configs.add_message("researcher", "user", "x" * 4_000, "compatible", "local-model")
+
+    async def fake_chat(*_args, **_kwargs):
+        return {"response": "Completed the task.\n<context_compaction_request/>", "answered_by": "Researcher"}
+
+    async def summarize(*_args, **_kwargs):
+        return "Compact memory of the completed task."
+
+    monkeypatch.setattr(team, "_agents_chat", fake_chat)
+    monkeypatch.setattr(team, "_summarize_context", summarize)
+    result = asyncio.run(team.chat("researcher", "Continue", project_id=1))
+
+    assert result["ok"] is True
+    assert "context_compaction_request" not in result["response"]
+    assert team.configs.context_summary("researcher", 1)["summary"].startswith("Compact memory")
 
 
 def test_inter_agent_message_is_synthesized_into_the_next_prompt(tmp_path):

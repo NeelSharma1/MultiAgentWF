@@ -234,7 +234,7 @@ class GitWorkflowStore:
         result = self.status(project_id, project_root)
         repository = self._repository(project_root)
         if repository is None:
-            return {**result, "branches": [], "worktrees": [], "agents": []}
+            return {**result, "branches": [], "worktrees": [], "agents": [], "commits": [], "commits_truncated": False}
         configuration = self.configuration(project_id) or {}
         main_branch = self._main_branch(configuration) if configuration else ""
         current = result["current_branch"]
@@ -276,7 +276,29 @@ class GitWorkflowStore:
                 "role": role, "name": str(agent.get("name") or role), "enabled": self.agent_enabled(project_id, role),
                 "branch": branch, "branch_exists": exists, "merged_into_main": merged,
             })
-        return {**result, "branches": branches, "worktrees": worktrees, "agents": agent_items}
+        agent_hashes = {
+            value for record in self.agent_commits(project_id)
+            for value in (record.get("commit_hash"), record.get("merge_hash")) if value
+        }
+        raw_commits = self._run(
+            repository, "log", "--all", "--topo-order", "--date=short",
+            "--pretty=format:%H%x1f%P%x1f%D%x1f%h%x1f%an%x1f%ad%x1f%s%x1e",
+        ).stdout
+        commits: list[dict[str, Any]] = []
+        for record in raw_commits.split("\x1e"):
+            values = record.strip().split("\x1f")
+            if len(values) != 7 or not values[0]:
+                continue
+            commit_hash, parents, decorations, short_hash, author, date, subject = values
+            commits.append({
+                "hash": commit_hash, "short_hash": short_hash, "parents": parents.split() if parents else [],
+                "decorations": decorations.strip(), "author": author, "date": date, "subject": subject,
+                "agent_commit": commit_hash in agent_hashes,
+            })
+        return {
+            **result, "branches": branches, "worktrees": worktrees, "agents": agent_items,
+            "commits": commits, "commits_truncated": False,
+        }
 
     def create_branch(self, project_id: int, project_root: Path, name: str, source: str = "") -> dict[str, str]:
         repository = self._repository(project_root)

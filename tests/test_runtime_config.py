@@ -7,9 +7,14 @@ from runtime_config import RuntimeConfigStore
 def test_runtime_defaults_save_and_history(tmp_path):
     store = RuntimeConfigStore(tmp_path / "runtime.db")
     assert store.get("programmer")["provider"] == "codex"
-    saved = store.save("researcher", "compatible", "qwen3", "http://model-box:11434/v1", "LOCAL_API_KEY", "high")
+    saved = store.save(
+        "researcher", "compatible", "qwen3", "http://model-box:11434/v1", "LOCAL_API_KEY", "high",
+        context_window_tokens=200_000, context_compaction_threshold=80,
+    )
     assert saved["model"] == "qwen3"
     assert saved["reasoning_effort"] == "high"
+    assert saved["context_window_tokens"] == 200_000
+    assert saved["context_compaction_threshold"] == 80
     store.add_message("researcher", "user", "hello", "compatible", "qwen3")
     assert store.history("researcher")[0]["content"] == "hello"
     store.add_message("researcher", "user", "other project", "compatible", "qwen3", project_id=2)
@@ -25,9 +30,26 @@ def test_codex_sessions_are_scoped_and_cleared_with_chat(tmp_path):
     store.save_codex_session("programmer", 2, "thread-two")
     assert store.codex_session("programmer", 1)["session_id"] == "thread-one"
     assert store.codex_session("programmer", 2)["session_id"] == "thread-two"
+    store.mark_codex_context_compacted("programmer", 2, 17)
+    assert store.codex_session("programmer", 2)["compacted_message_id"] == 17
     store.clear_history("programmer", 1)
     assert store.codex_session("programmer", 1) is None
     assert store.codex_session("programmer", 2)["session_id"] == "thread-two"
+
+
+def test_provider_context_usage_is_scoped_and_cleared_with_chat(tmp_path):
+    store = RuntimeConfigStore(tmp_path / "context-usage.db")
+    store.save_context_usage(
+        "programmer", 1, "codex", "gpt-test", input_tokens=120, output_tokens=30,
+        total_tokens=150, context_tokens=150, context_window_tokens=1000,
+        observed_message_id=9, source="codex_token_count", exact=True,
+    )
+    usage = store.context_usage("programmer", 1)
+    assert usage["context_tokens"] == 150
+    assert usage["exact"] == 1
+    assert store.context_usage("programmer", 2) is None
+    store.clear_history("programmer", 1)
+    assert store.context_usage("programmer", 1) is None
 
 
 def test_compatible_requires_base_url(tmp_path):

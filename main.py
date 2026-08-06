@@ -18,7 +18,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Any
+from typing import Any, Literal
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env.local")
@@ -102,6 +102,8 @@ class ChatInput(BaseModel):
     # not become a synthetic user bubble in the recipient's transcript.
     record_user_message: bool = True
     user_message_id: int | None = None
+    # One-turn sandbox authorization set solely by the in-chat approval UI.
+    temporary_access: Literal["", "workspace", "external"] = ""
 
 class NativeCommandInput(BaseModel):
     command: str = Field(min_length=1, max_length=1000)
@@ -133,6 +135,8 @@ class RuntimeInput(BaseModel):
     base_url: str = ""
     api_key_env: str = ""
     reasoning_effort: str = ""
+    context_window_tokens: int = Field(default=128_000, ge=1_000, le=10_000_000)
+    context_compaction_threshold: int = Field(default=0, ge=0, le=95)
     project_id: int = 1
 
 class AgentInput(BaseModel):
@@ -194,6 +198,40 @@ class EdgeItem(BaseModel):
 
 class EdgeInput(BaseModel):
     edges: list[EdgeItem]
+
+
+class RelationshipPolicyInput(BaseModel):
+    enforce_relationships: bool
+
+
+class AgentActionPolicyInput(BaseModel):
+    auto_approve_agent_actions: bool
+    allow_full_system_access: bool | None = None
+
+
+class AgentActionPermissionsInput(BaseModel):
+    allow_commands: bool
+    allow_file_edits: bool
+    allow_full_system_access: bool | None = None
+
+
+class PermissionResponseInput(BaseModel):
+    message_id: int = Field(gt=0)
+    approved: bool
+
+
+class WorkflowMemoryInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=100_000)
+
+
+class ActiveWorkflowMemoryInput(BaseModel):
+    memory_id: int = Field(ge=0)
+
+
+class WorkflowTemplateInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
 
 class TemplateInput(BaseModel):
     name: str = Field(default="", max_length=120)
@@ -415,7 +453,10 @@ async def agents(project_id: int = 1):
         raise HTTPException(404, str(exc)) from exc
     definitions = team.definitions.list(project_id)
     configs = {item["role"]: item for item in team.configs.list([item["role"] for item in definitions], project_id)}
-    return [{"id": item["role"], "name": item["name"], "brief": item["brief"], "instructions": item["instructions"], "built_in": bool(item["built_in"]), "runtime": configs[item["role"]], "git_enabled": team.git.agent_enabled(project_id, item["role"])} for item in definitions]
+    permissions = {item["role"]: item for item in projects.action_permissions(
+        project_id, [definition["role"] for definition in definitions],
+    )["agents"]}
+    return [{"id": item["role"], "name": item["name"], "brief": item["brief"], "instructions": item["instructions"], "built_in": bool(item["built_in"]), "runtime": configs[item["role"]], "git_enabled": team.git.agent_enabled(project_id, item["role"]), "permissions": permissions[item["role"]]} for item in definitions]
 
 @app.get("/api/projects")
 async def list_projects():
@@ -463,6 +504,112 @@ async def update_project_edges(project_id: int, payload: EdgeInput):
     try: return projects.save_edges(project_id, [item.model_dump() for item in payload.edges], roles)
     except KeyError as exc: raise HTTPException(404, str(exc)) from exc
     except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/relationship-policy")
+async def update_relationship_policy(project_id: int, payload: RelationshipPolicyInput):
+    try:
+        return projects.set_relationship_enforcement(project_id, payload.enforce_relationships)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/action-permissions")
+async def get_action_permissions(project_id: int):
+    try:
+        return projects.action_permissions(project_id, [item["role"] for item in team.definitions.list(project_id)])
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/action-policy")
+async def update_action_policy(project_id: int, payload: AgentActionPolicyInput):
+    try:
+        return projects.set_action_policy(
+            project_id, payload.auto_approve_agent_actions, payload.allow_full_system_access,
+        )
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/agents/{role}/action-permissions")
+async def update_agent_action_permissions(project_id: int, role: str, payload: AgentActionPermissionsInput):
+    try:
+        team.definitions.get(role, project_id)
+        return projects.set_agent_action_permissions(
+            project_id, role, payload.allow_commands, payload.allow_file_edits, payload.allow_full_system_access,
+        )
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/workflow-memories")
+async def get_workflow_memories(project_id: int):
+    try:
+        return projects.workflow_memories(project_id)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/workflow-memories", status_code=201)
+async def create_workflow_memory(project_id: int, payload: WorkflowMemoryInput):
+    try:
+        return projects.save_workflow_memory(project_id, payload.name, payload.content)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/workflow-memories/{memory_id}")
+async def update_workflow_memory(project_id: int, memory_id: int, payload: WorkflowMemoryInput):
+    try:
+        return projects.save_workflow_memory(project_id, payload.name, payload.content, memory_id)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/active-workflow-memory")
+async def set_active_workflow_memory(project_id: int, payload: ActiveWorkflowMemoryInput):
+    try:
+        return projects.set_active_workflow_memory(project_id, payload.memory_id)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/workflow-memories/{memory_id}", status_code=204)
+async def delete_workflow_memory(project_id: int, memory_id: int):
+    try:
+        projects.delete_workflow_memory(project_id, memory_id)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/workflow-templates")
+async def list_workflow_templates(project_id: int):
+    try:
+        projects.get(project_id)
+        return projects.workflow_templates()
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/workflow-templates", status_code=201)
+async def save_workflow_template(project_id: int, payload: WorkflowTemplateInput):
+    roles = [item["role"] for item in team.definitions.list(project_id)]
+    try:
+        return projects.save_workflow_template(
+            project_id, payload.name, projects.layout(project_id, roles), projects.edges(project_id), roles,
+        )
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/workflow-templates/{template_id}/apply")
+async def apply_workflow_template(project_id: int, template_id: int):
+    roles = [item["role"] for item in team.definitions.list(project_id)]
+    try:
+        return projects.apply_workflow_template(project_id, template_id, roles)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/workflow-templates/{template_id}", status_code=204)
+async def delete_workflow_template(project_id: int, template_id: int):
+    try:
+        projects.get(project_id)
+        projects.delete_workflow_template(template_id)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
 
 
 def _git_project_root(project_id: int) -> Path:
@@ -1117,6 +1264,7 @@ async def update_runtime(role: str, payload: RuntimeInput):
         return team.configs.save(
             role, payload.provider, payload.model, payload.base_url, payload.api_key_env,
             payload.reasoning_effort, payload.project_id,
+            payload.context_window_tokens, payload.context_compaction_threshold,
         )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -1133,6 +1281,16 @@ async def clear_history(role: str, project_id: int = 1):
     team.configs.clear_history(role, project_id)
 
 
+@app.post("/api/agents/{role}/session/restart", status_code=204)
+async def restart_agent_session(role: str, project_id: int = 1):
+    try:
+        team.definitions.get(role, project_id)
+        if team.configs.active_chat_run(role, project_id):
+            raise HTTPException(409, "Wait for the active agent run to finish before restarting its session")
+        team.configs.clear_codex_session(role, project_id)
+    except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+
 @app.get("/api/agents/{role}/history")
 async def get_history(role: str, project_id: int = 1):
     try:
@@ -1140,7 +1298,20 @@ async def get_history(role: str, project_id: int = 1):
         projects.get(project_id)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
-    return {"messages": team.configs.history(role, limit=200, project_id=project_id)}
+    messages = team.configs.history(role, limit=200, project_id=project_id)
+    for message in messages:
+        message["permission_request"] = projects.permission_request(project_id, role, int(message["id"]))
+    return {"messages": messages}
+
+
+@app.get("/api/agents/{role}/context-usage")
+async def get_context_usage(role: str, project_id: int = 1):
+    try:
+        team.definitions.get(role, project_id)
+        projects.get(project_id)
+        return team.context_usage(role, project_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.get("/api/agents/{role}/inbox")
@@ -1376,7 +1547,7 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
             return await team.chat(
                 role, payload.message.strip(), payload.model, payload.reasoning_effort, payload.project_id,
                 payload.reply_to_id, payload.attachment_ids, payload.record_user_message,
-                payload.user_message_id,
+                payload.user_message_id, payload.temporary_access,
             )
 
         if team.git.agent_enabled(payload.project_id, role):
@@ -1445,6 +1616,38 @@ async def chat(role: str, payload: ChatInput):
         raise
     except Exception as exc:
         raise HTTPException(502, f"Agent run failed: {exc}") from exc
+
+
+@app.post("/api/agents/{role}/permission-response", status_code=202)
+async def permission_response(role: str, payload: PermissionResponseInput, project_id: int = 1):
+    """Resume a Codex turn after the user accepts or denies its structured request."""
+    try:
+        team.definitions.get(role, project_id)
+        config = team.configs.get(role, project_id)
+        if config["provider"] != "codex":
+            raise ValueError("In-chat local permission approval is available only for Codex agents")
+        request = projects.resolve_permission_request(project_id, role, payload.message_id, payload.approved)
+        access = request["scope"] if payload.approved else ""
+        decision = "approved" if payload.approved else "denied"
+        commands = "\n".join(f"- {command}" for command in request["commands"])
+        message = (
+            f"The user {decision} your {request['scope']} permission request: {request['reason']}\n"
+            f"Proposed commands:\n{commands or '- none supplied'}\n\n"
+            + (
+                "Continue now. Run only the proposed commands listed above, stay within the approved scope, "
+                "and request approval again before any additional privileged action or command."
+                if payload.approved else
+                "Do not perform the requested privileged action. Explain an alternative or ask a narrower request if useful."
+            )
+        )
+        run = _schedule_chat_run(role, ChatInput(
+            message=message, project_id=project_id, record_user_message=False, temporary_access=access,
+        ))
+        return {"run": run}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/chat-runs/{run_id}")
