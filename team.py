@@ -9,7 +9,6 @@ import json
 import re
 import uuid
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +40,15 @@ ROLE_BRIEFS = {
     "formatter": "Transform material into a clear requested structure while preserving meaning and consistency.",
     "documenter": "Create maintainable documentation, examples, decisions, and handoff notes for future readers.",
 }
+
+MCP_TOOL_TIMEOUT_SECONDS = 660
+# ``auto`` lets Codex apply its annotation heuristics.  In a non-interactive
+# ``codex exec`` run, an unclassified host-mediated tool can then be rejected
+# as a cancelled approval before the MCP server receives the request.  The
+# workspace MCP server performs its own role, relationship, and action-
+# permission checks, so asking Codex to approve this local tool server avoids
+# that dead end without widening the shell/filesystem sandbox.
+MCP_TOOL_APPROVAL_MODE = "approve"
 
 # Provider-native slash commands are intentionally kept separate from the
 # workspace's `/app …` commands.  Codex is the only configured runtime with a
@@ -181,14 +189,28 @@ def _prefer_windows_native_codex(command: str) -> str:
     if command_path.suffix.lower() not in {".cmd", ".bat", ".ps1"}:
         return command
     node_modules = command_path.parent.parent
-    candidates = sorted(
-        node_modules.glob("@openai/codex-win32-*/vendor/*/bin/codex.exe"),
-        reverse=True,
+    candidate = _latest_existing_file(
+        node_modules.glob("@openai/codex-win32-*/vendor/*/bin/codex.exe")
     )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate.resolve())
+    if candidate:
+        return str(candidate.resolve())
     return command
+
+
+def _latest_existing_file(paths) -> Path | None:
+    """Return the newest installed executable from a possibly lazy path list."""
+    candidates = [Path(path) for path in paths if Path(path).is_file()]
+    if not candidates:
+        return None
+
+    def key(path: Path) -> tuple[int, int, str]:
+        try:
+            stat = path.stat()
+            return stat.st_mtime_ns, stat.st_size, str(path).lower()
+        except OSError:
+            return 0, 0, str(path).lower()
+
+    return max(candidates, key=key)
 
 
 def resolve_codex_command() -> str | None:
@@ -216,9 +238,9 @@ def resolve_codex_command() -> str | None:
             "*/acp-agents/.runtimes/node/*/npm-cache/_npx/*/node_modules/.bin/codex.cmd",
         )
         for pattern in patterns:
-            for candidate in sorted(jetbrains_windows_root.glob(pattern), reverse=True):
-                if candidate.is_file():
-                    return _prefer_windows_native_codex(str(candidate.resolve()))
+            candidate = _latest_existing_file(jetbrains_windows_root.glob(pattern))
+            if candidate:
+                return _prefer_windows_native_codex(str(candidate.resolve()))
 
     # JetBrains launches Python with a smaller PATH than an interactive shell.
     # Include conventional install locations before checking its bundled runtime.
@@ -240,9 +262,9 @@ def resolve_codex_command() -> str | None:
         "*/aia/agents/.runtimes/node/*/npm-cache/_npx/*/node_modules/.bin/codex",
     )
     for pattern in patterns:
-        for candidate in sorted(jetbrains_root.glob(pattern), reverse=True):
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate.resolve())
+        candidate = _latest_existing_file(jetbrains_root.glob(pattern))
+        if candidate and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
 
     # Last resort: ask the user's login shell, whose startup files may add Codex.
     shell = os.getenv("SHELL", "/bin/zsh")
@@ -287,6 +309,52 @@ def codex_process_env() -> dict[str, str]:
         env.setdefault("HOMEDRIVE", Path(user_home).drive)
         env.setdefault("HOMEPATH", str(Path(user_home).relative_to(Path(user_home).anchor)))
     env.setdefault("CODEX_HOME", str(Path(user_home) / ".codex"))
+    return env
+
+
+def project_python_executable(working_root: Path) -> Path:
+    """Return the project's virtual-environment Python executable.
+
+    Agent processes must use the project's interpreter rather than the Python
+    installation that happened to launch the web server.  Keep the lookup
+    platform-neutral while preferring the conventional ``venv`` directory.
+    """
+    root = Path(working_root).expanduser().resolve()
+    executable_name = "python.exe" if os.name == "nt" else "python"
+    bin_name = "Scripts" if os.name == "nt" else "bin"
+    expected: list[str] = []
+    for environment_name in ("venv", ".venv", "env"):
+        environment_root = root / environment_name
+        candidate = environment_root / bin_name / executable_name
+        expected.append(str(candidate))
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "No project virtual environment was found. Create a venv in the project "
+        f"before running agent Python commands. Checked: {', '.join(expected)}"
+    )
+
+
+def codex_project_env(working_root: Path | None = None) -> dict[str, str]:
+    """Run Codex child commands with the project's Python environment.
+
+    A server launched from an IDE does not necessarily inherit that IDE's
+    selected interpreter on ``PATH``.  Supplying ``VIRTUAL_ENV`` and placing
+    the project's Scripts/bin directory first makes ``python``, ``pytest``,
+    and other installed project tools resolve consistently on every OS.
+    """
+    env = codex_process_env()
+    if working_root is None:
+        return env
+
+    interpreter = project_python_executable(Path(working_root).expanduser())
+    bin_directory = interpreter.parent
+    environment_root = bin_directory.parent
+    env["VIRTUAL_ENV"] = str(environment_root)
+    env["PYTHON"] = str(interpreter)
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("PYTHONPATH", None)
+    env["PATH"] = os.pathsep.join([str(bin_directory), env.get("PATH", "")])
     return env
 
 
@@ -336,15 +404,20 @@ class AgentTeam:
             return self.root.resolve()
 
     async def start(self) -> None:
-        python_command = os.getenv("PYTHON", "").strip() or sys.executable
+        python_command = str(project_python_executable(self.root))
+        mcp_env = {"WORKSPACE_DB": str(self.db_path)}
+        app_url = os.getenv("WORKSPACE_APP_URL", "").strip().rstrip("/")
+        if app_url:
+            mcp_env["WORKSPACE_APP_URL"] = app_url
         self.mcp = MCPServerStdio(
             name="shared-context",
             params={
                 "command": python_command,
                 "args": [str(self.root / "mcp_server.py")],
-                "env": {"WORKSPACE_DB": str(self.db_path)},
+                "env": mcp_env,
             },
             cache_tools_list=True,
+            client_session_timeout_seconds=MCP_TOOL_TIMEOUT_SECONDS,
         )
         await self.mcp.connect()
 
@@ -506,6 +579,39 @@ class AgentTeam:
     def _action_permissions(self, role: str, project_id: int = 1) -> dict[str, Any]:
         return self.projects.agent_action_permissions(project_id, role)
 
+    def _codex_team_mcp_config_args(self, working_root: Path | None = None) -> list[str]:
+        """Configure the app-managed MCP tools for direct Codex sessions."""
+        server_name = "multiagent_workflow"
+        app_url = os.getenv("WORKSPACE_APP_URL", "").strip().rstrip("/")
+        if app_url:
+            # Direct Codex runs execute inside a provider-managed sandbox.  A
+            # stdio MCP configuration would make Codex start mcp_server.py
+            # there, which fails on Windows when the project venv launcher
+            # points at a base Python outside the sandbox.  The app is already
+            # running on the host, so connect to its localhost Streamable HTTP
+            # endpoint instead.  The app host remains responsible for using
+            # the project venv and enforcing the workspace permissions.
+            return [
+                "-c", f"mcp_servers.{server_name}.url={json.dumps(f'{app_url}/mcp/')}",
+                "-c", f"mcp_servers.{server_name}.default_tools_approval_mode={json.dumps(MCP_TOOL_APPROVAL_MODE)}",
+                "-c", f"mcp_servers.{server_name}.tools.run_project_tests.approval_mode={json.dumps(MCP_TOOL_APPROVAL_MODE)}",
+                "-c", f"mcp_servers.{server_name}.startup_timeout_sec=30",
+                "-c", f"mcp_servers.{server_name}.tool_timeout_sec={MCP_TOOL_TIMEOUT_SECONDS}",
+            ]
+
+        server_path = str((self.root / "mcp_server.py").resolve())
+        workspace_db = str(self.db_path.resolve())
+        python_command = str(project_python_executable(working_root or self.root))
+        return [
+            "-c", f"mcp_servers.{server_name}.command={json.dumps(python_command)}",
+            "-c", f"mcp_servers.{server_name}.args={json.dumps([server_path])}",
+            "-c", f"mcp_servers.{server_name}.env.WORKSPACE_DB={json.dumps(workspace_db)}",
+            "-c", f"mcp_servers.{server_name}.default_tools_approval_mode={json.dumps(MCP_TOOL_APPROVAL_MODE)}",
+            "-c", f"mcp_servers.{server_name}.tools.run_project_tests.approval_mode={json.dumps(MCP_TOOL_APPROVAL_MODE)}",
+            "-c", f"mcp_servers.{server_name}.startup_timeout_sec=30",
+            "-c", f"mcp_servers.{server_name}.tool_timeout_sec={MCP_TOOL_TIMEOUT_SECONDS}",
+        ]
+
     def _has_full_workspace_access(self, role: str, project_id: int = 1) -> bool:
         permissions = self._action_permissions(role, project_id)
         project = self.projects.get(project_id)
@@ -514,15 +620,41 @@ class AgentTeam:
         )
 
     def _action_guidance(self, role: str, project_id: int = 1, temporary_access: str = "") -> str:
+        if os.name == "nt":
+            python_command = r".\venv\Scripts\python.exe"
+            pytest_command = r".\venv\Scripts\pytest.exe"
+            platform_test_guidance = (
+                f"On Windows, prefer {python_command} -m pytest (or {pytest_command})."
+            )
+        else:
+            python_command = "./venv/bin/python"
+            pytest_command = "./venv/bin/pytest"
+            platform_test_guidance = (
+                f"On macOS/Linux, prefer {python_command} -m pytest (or {pytest_command})."
+            )
+        test_guidance = (
+            "\n\n<Test_execution>When running project tests, use only the project's local virtual environment. "
+            f"{platform_test_guidance} A .venv or env directory is also valid. Do not use the system Python "
+            "executable, the Windows `py` launcher, or a globally installed pytest. If the project environment "
+            "is unavailable, or its launcher reports that the base Python is inaccessible, use the "
+            "app-managed run_project_tests MCP tool first with "
+            f"role='{role}' and project_id={project_id}; it also runs pytest through the project's virtual "
+            "environment from the local application outside the provider sandbox. Use a direct shell command only "
+            "when that tool is unavailable or the task specifically requires it. If a direct venv launcher reports "
+            "an inaccessible base interpreter, do not retry it; use the MCP runner and report its exact command and "
+            "exit status. Never claim tests ran if the interpreter could not start.</Test_execution>"
+        )
         if temporary_access == "external":
             return (
                 "\n\nThe user approved one external-access continuation. Perform only the specific action just "
                 "approved, then return to normal permissions. Do not inspect secrets or modify unrelated files."
+                + test_guidance
             )
         if temporary_access == "workspace":
             return (
                 "\n\nThe user approved one workspace-access continuation. Perform only the specific action just "
                 "approved inside this workspace, then return to normal permissions."
+                + test_guidance
             )
         permissions = self._action_permissions(role, project_id)
         if permissions["full_system_access"]:
@@ -530,6 +662,7 @@ class AgentTeam:
                 "\n\nThe user has explicitly granted unrestricted local system access for this agent. "
                 "You may read, write, and run commands outside the workspace when the task requires it. "
                 "Act directly without requesting permission, but do not inspect secrets or modify unrelated files."
+                + test_guidance
             )
         if self._has_full_workspace_access(role, project_id):
             return (
@@ -538,6 +671,19 @@ class AgentTeam:
                 "do not perform it yet. Reply with a permission_request block on its own lines using exactly this format: "
                 "<permission_request scope=\"external\"><reason>concise reason</reason><commands>\n- exact command 1\n"
                 "- exact command 2\n</commands></permission_request>. Include every command you intend to run and wait for the user's decision."
+                + test_guidance
+            )
+        if permissions["effective_commands"]:
+            return (
+                "\n\nThe user has authorized this agent to execute commands inside the workspace, including project "
+                "test runners. Command execution may create command-generated artifacts such as test caches or "
+                "temporary files. Do not use direct file-edit operations or intentionally edit project files unless "
+                "file-edit permission is also granted. For any command or file operation outside the workspace, "
+                "do not perform it yet. Reply with a permission_request block on its own lines using exactly this "
+                "format: <permission_request scope=\"external\"><reason>concise reason</reason><commands>\n"
+                "- exact command 1\n- exact command 2\n</commands></permission_request>. Include every "
+                "command you intend to run and wait for the user's decision."
+                + test_guidance
             )
         return (
             "\n\nYou do not have persistent full workspace or computer access. Before every state-changing command "
@@ -546,6 +692,7 @@ class AgentTeam:
             "containing <reason>concise reason</reason><commands> followed by every exact planned command on lines beginning "
             "with '- ', then </commands></permission_request>. Use workspace for project work and external for work outside it. "
             "Wait for the user's decision. Read-only inspection is allowed."
+            + test_guidance
         )
 
     def _shared_context_text(self, role: str, project_id: int = 1) -> str:
@@ -727,6 +874,62 @@ class AgentTeam:
             "sees it, and the app will save a summary for future turns. Keep your normal answer as well.</context_management>"
         )
 
+    def _workspace_team_guidance(self, role: str, project_id: int = 1) -> str:
+        """Describe the app-managed team separately from provider-native subagents."""
+        project = self.projects.get(project_id)
+        edges = self.projects.edges(project_id)
+        enforce_relationships = bool(project.get("enforce_relationships"))
+        definitions = self.definitions.list(project_id)
+        if enforce_relationships:
+            direct_edges = [edge for edge in edges if role in {edge["source_role"], edge["target_role"]}]
+            visible_roles = {
+                edge["target_role"] if edge["source_role"] == role else edge["source_role"]
+                for edge in direct_edges
+            }
+            visible_definitions = [item for item in definitions if item["role"] in visible_roles]
+            visible_edges = direct_edges
+            visibility = "Relationship enforcement is enabled, so only directly connected workspace agents are available for delegation."
+        else:
+            visible_definitions = [item for item in definitions if item["role"] != role]
+            visible_edges = edges
+            visibility = "Relationship enforcement is disabled, so all configured workspace agents may be considered for delegation."
+        roster_lines = []
+        for item in visible_definitions:
+            brief = " ".join(str(item.get("brief") or "").split())
+            roster_lines.append(f"- role_id={item['role']} | name={item['name']} | specialty={brief}")
+        roster = "\n".join(roster_lines) or "- no other workspace agents are currently available"
+        graph = "; ".join(
+            f"{edge['source_role']} {'commands' if edge['relationship'] == 'command' else 'reports to'} {edge['target_role']}"
+            for edge in visible_edges
+        ) or "no configured relationships are visible"
+        current = self.definitions.get(role, project_id)
+        return (
+            "\n\n<workspace_team_delegation>\n"
+            "This application has two distinct delegation systems. The workspace agents below are the user's "
+            "configured, durable team members; Codex-native subagents are temporary helpers inside this Codex "
+            "session. A native Codex subagent is not one of the workspace agents and cannot replace one.\n"
+            "PRIMARY DELEGATION RULE: use the configured workspace-agent system first and by default. The configured "
+            "workspace-agent system is the primary coordination path. When another "
+            "listed workspace specialist is relevant, delegate to that agent with send_agent_message and wait for or "
+            "synthesize its durable command/report result. Do not replace a workspace agent with a Codex-native "
+            "subagent.\n"
+            "Use a Codex-native subagent only as an optional secondary helper when your prescribed role genuinely "
+            "needs a bounded, parallel local investigation or a native capability unavailable through the workspace "
+            "team. Do not create native subagents by default, and do not use them to bypass the configured team, its "
+            "relationships, or its durable transcript.\n"
+            "For workspace delegation, send an actionable command or report with "
+            f"send_agent_message(sender_role='{role}', recipient_role='<role_id>', relationship='command' or 'report', content='...') "
+            f"and inspect results with list_agent_messages(role='{role}', project_id={project_id}). Workspace messages "
+            "are durable and start the recipient's own agent run; never claim that a workspace agent completed work "
+            "until its message or report confirms it.\n"
+            f"Current workspace agent: {role} ({current['name']}).\n"
+            f"{visibility}\n"
+            "Workspace agents available to this prompt:\n"
+            f"{roster}\n"
+            f"Visible workspace relationships: {graph}\n"
+            "</workspace_team_delegation>"
+        )
+
     def _instructions(self, role: str, project_id: int = 1, temporary_access: str = "") -> str:
         definition = self.definitions.get(role, project_id)
         project = self.projects.get(project_id)
@@ -770,6 +973,10 @@ class AgentTeam:
             f"{coordination_policy}Available recipient role IDs: {roster}. "
             f"{'Your direct relationships' if enforce_relationships else 'Current graph relationships'}: {graph}. "
             f"This conversation belongs to workspace {project_id}. Always pass project_id={project_id} to shared context tools. "
+            "Provider-native subagents are separate temporary helpers, not replacements for the user's configured workspace agents. "
+            "The configured workspace-agent system is the primary coordination path: delegate there first whenever a listed "
+            "specialist is relevant. Use a provider-native subagent only as a secondary, bounded helper when the current "
+            "role specifically needs it; never use native subagents instead of the configured workspace agents. "
             "Never claim another agent completed work unless the conversation or shared context shows it. "
             f"Be direct, practical, and identify assumptions. Your role is {definition['name']}: {definition['instructions']}"
             f"{self._action_guidance(role, project_id, temporary_access)}"
@@ -1321,6 +1528,7 @@ class AgentTeam:
             await self._compact_context_if_needed(role, config, project_id, existing, command, working_root)
             existing = self.configs.codex_session(role, project_id)
         shared_prompt = f"<current_shared_context>\n{context_text}\n</current_shared_context>"
+        workspace_team_prompt = self._workspace_team_guidance(role, project_id)
         reply = self.configs.message(reply_to_id, role, project_id) if reply_to_id else None
         if reply_to_id and not reply:
             raise ValueError("The message being replied to does not exist in this chat")
@@ -1330,12 +1538,13 @@ class AgentTeam:
         if existing:
             prompt = (
                 f"The shared team context, reusable skill assignments, and local toolsets may have changed since the prior turn.\n"
-                f"{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
+                f"{workspace_team_prompt}{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
                 f"User: {message}{reply_prompt}{attachment_prompt}"
             )
         else:
             prompt = (
                 f"{self._instructions(role, project_id, temporary_access)}\n\n"
+                f"{workspace_team_prompt}\n\n"
                 "You are a persistent conversational team member. Do not inspect secret files such as .env or .env.local. "
                 "Keep continuity with future turns in this Codex session.\n\n"
                 f"{shared_prompt}\n\nUser: {message}{reply_prompt}{attachment_prompt}"
@@ -1345,12 +1554,12 @@ class AgentTeam:
             permissions = self._action_permissions(role, project_id)
             full_workspace_access = self._has_full_workspace_access(role, project_id)
             sandbox = "danger-full-access" if temporary_access == "external" or permissions["full_system_access"] else "workspace-write" if (
-                temporary_access == "workspace" or full_workspace_access
+                temporary_access == "workspace" or full_workspace_access or permissions["effective_commands"]
             ) else "read-only"
             # The bundled Windows Codex executable runs `exec` non-interactively
             # but does not accept the newer `--ask-for-approval` CLI option.
             # The sandbox mode remains the enforceable permission boundary.
-            execution_flags = ["--sandbox", sandbox]
+            execution_flags = ["--sandbox", sandbox, *self._codex_team_mcp_config_args(working_root)]
             if existing:
                 # `-C/--cd` belongs to the top-level `exec` command in current
                 # Codex CLI releases. Putting it after `resume` makes the CLI
@@ -1376,7 +1585,7 @@ class AgentTeam:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=codex_process_env(),
+                env=codex_project_env(working_root),
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(prompt.encode()), timeout=600)
             if process.returncode:
@@ -1766,14 +1975,14 @@ class AgentTeam:
 
     def _codex_tui_command(self, executable: str, command_text: str, config: dict[str, str],
                            session_id: str = "", working_root: Path | None = None) -> str:
-        terminal = create_terminal(rows=40, columns=120)
-        env = codex_process_env()
-        env.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40"})
         working_root = working_root or self.root
+        terminal = create_terminal(rows=40, columns=120)
+        env = codex_project_env(working_root)
+        env.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40"})
         if session_id:
-            args = [executable, "resume", "--include-non-interactive", "--no-alt-screen", "-C", str(working_root)]
+            args = [executable, *self._codex_team_mcp_config_args(working_root), "resume", "--include-non-interactive", "--no-alt-screen", "-C", str(working_root)]
         else:
-            args = [executable, "--no-alt-screen", "-C", str(working_root)]
+            args = [executable, *self._codex_team_mcp_config_args(working_root), "--no-alt-screen", "-C", str(working_root)]
         if config.get("model"):
             args.extend(["--model", config["model"]])
         if config.get("reasoning_effort"):
@@ -1953,10 +2162,11 @@ class AgentTeam:
                     [int(item["id"]) for item in inbound_messages], delivery_run_id,
                 )
                 raise
+            action_permissions = self._action_permissions(role, project_id)
             resolved_response, tool_calls = await resolve_tool_calls(
                 result["response"], self.toolsets, self._project_root(project_id), project_id, role,
                 allow_execution=temporary_access in {"workspace", "external"} or
-                self._action_permissions(role, project_id)["full_system_access"] or
+                action_permissions["effective_commands"] or
                 self._has_full_workspace_access(role, project_id),
             )
             result["response"] = resolved_response

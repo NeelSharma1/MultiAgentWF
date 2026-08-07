@@ -22,6 +22,7 @@
 </head>
 <body>
   <header><div class="brand" id="home-button"><span class="brand-mark">M</span><div><span class="eyebrow">MCP workspace</span><h1>MultiAgent</h1></div></div><div class="header-actions"><button id="tools-button" class="settings-button">Tools</button><button id="skills-button" class="settings-button">Skills</button><button id="version-control-button" class="settings-button">Version control</button><button id="permissions-button" class="settings-button">Permissions</button><button id="memory-button" class="settings-button">Memories</button><button id="theme-toggle" class="settings-button" type="button" aria-pressed="false">Dark mode</button><button id="connections-button" class="settings-button">Accounts</button><span id="status" class="status">Connecting…</span></div></header>
+  <nav class="settings-tabs" aria-label="Workspace sections"><a class="active" href="#dashboard">Overview</a><a href="#workspace">Activity</a><a href="#context-list">Shared context</a><span class="settings-tabs-spacer"></span><span class="settings-caption">Project settings</span></nav>
   <section id="dashboard" class="dashboard">
     <aside class="project-rail"><div class="rail-title"><span class="eyebrow">Workspaces</span><button id="new-project" title="New project">＋</button></div><nav id="projects"></nav></aside>
     <div class="project-main">
@@ -38,15 +39,16 @@
   </div>
   <main id="workspace" class="workspace hidden">
     <aside>
-      <h2>Team members</h2>
+      <div class="sidebar-heading"><h2>Team members</h2><button id="new-chat" class="sidebar-icon" type="button" title="Start a new chat">＋</button></div>
+      <label class="agent-search-label"><span class="sr-only">Search team members</span><input id="agent-search" type="search" placeholder="Search agents…" autocomplete="off"></label>
       <nav id="agents"></nav>
       <button id="new-agent" class="secondary">＋ Add team member</button>
       <button id="new-context" class="secondary">＋ Add shared context</button>
     </aside>
     <section class="chat-panel">
-      <div class="agent-heading"><div id="avatar" class="avatar">O</div><div class="agent-copy"><div class="name-row"><h2 id="agent-name">Orchestrator</h2><span id="runtime-badge" class="runtime-badge"></span></div><p id="agent-brief"></p><small id="agent-skills" class="agent-skills"></small></div><button id="external-access-button" class="settings-button" type="button" title="Allow this agent to work outside the project folder">External access</button><button id="git-changes-button" class="settings-button">Git</button><button id="runtime-settings" class="settings-button">⚙ Runtime</button></div>
-      <div id="messages" class="messages"><div class="empty"><strong>Start a conversation</strong><span>Each team member remembers their own thread, receives team commands and reports, and can read shared MCP context.</span></div></div>
-      <div id="chat-activity" class="chat-activity hidden" role="status" aria-live="polite"></div>
+      <div class="agent-heading"><div id="avatar" class="avatar">O</div><div class="agent-copy"><div class="name-row"><h2 id="agent-name">Orchestrator</h2><span id="runtime-badge" class="runtime-badge"></span></div><p id="agent-brief"></p><small id="agent-skills" class="agent-skills"></small><div class="scope-line"><span id="scope-badge" class="scope-badge">Project scope</span><span id="active-model-label">Agent default</span></div></div><button id="external-access-button" class="settings-button" type="button" title="Allow this agent to work outside the project folder">External access</button><button id="git-changes-button" class="settings-button">Git</button><button id="runtime-settings" class="settings-button">⚙ Runtime</button></div>
+      <div class="history-toolbar"><label><span class="sr-only">Search this conversation</span><input id="history-search" type="search" placeholder="Search conversation…" autocomplete="off"></label><span id="history-count"></span></div><div id="messages" class="messages"><div class="empty"><strong>Start a conversation</strong><span>Each team member remembers their own thread, receives team commands and reports, and can read shared MCP context.</span></div></div>
+      <div id="chat-activity" class="chat-activity hidden" role="status" aria-live="polite"><span class="chat-activity-label"></span><i class="chat-activity-progress" aria-hidden="true"></i></div>
       <div class="chat-overrides"><label>Chat model<select id="chat-model"><option value="">Agent default</option></select></label><label>Effort<select id="chat-effort"><option value="">Agent default</option></select></label><div id="context-meter" class="context-meter" title="Estimated active context usage"><div><span>Context remaining</span><strong id="context-remaining">—</strong></div><div class="context-track"><i id="context-progress"></i></div><small id="context-detail">Estimating…</small></div></div>
       <div id="reply-preview" class="reply-preview hidden"><div><span>Replying to</span><strong id="reply-author"></strong><p id="reply-text"></p></div><button id="cancel-reply" type="button" title="Cancel reply">×</button></div>
       <div id="attachment-tray" class="attachment-tray hidden"></div>
@@ -54,7 +56,7 @@
     </section>
     <aside class="context-panel">
       <div class="context-title"><div><span class="eyebrow">Team memory</span><h2>Shared context</h2></div><span id="context-count">0</span></div>
-      <div id="context-list"></div>
+      <div id="context-scope-summary" class="context-scope-summary"></div><div id="context-list"></div>
     </aside>
   </main>
   <dialog id="project-dialog">
@@ -137,6 +139,6 @@
       <section class="connection-card"><div><h3>OpenAI-compatible endpoint</h3><p>Optional key for Ollama, LM Studio, vLLM, or a remote compatible server.</p><input id="compatible-credential" type="password" autocomplete="off" placeholder="Paste local/remote server key"></div><div><span id="compatible-connection" class="connection-state"></span><button data-connect="compatible">Save key</button><button data-disconnect="compatible" class="danger">Remove</button></div></section>
     </div>
   </dialog>
-  <script src="/static/app.js?v=20260805-54"></script>
+  <script src="/static/app.js?v=20260807-55"></script>
 </body>
 </html>

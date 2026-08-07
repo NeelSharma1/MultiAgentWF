@@ -8,13 +8,12 @@ import os
 import signal
 import shutil
 import socket
-import sys
 import uuid
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -45,7 +44,8 @@ def bind_available_port(host: str = "127.0.0.1", start_port: int = 8000) -> tupl
     raise OSError(f"No available TCP port found from {start_port} through 65535")
 
 from shared_context import ContextStore, ROLES  # noqa: E402
-from team import AgentTeam, ROLE_BRIEFS  # noqa: E402
+from team import AgentTeam, ROLE_BRIEFS, project_python_executable  # noqa: E402
+from mcp_server import mcp as workspace_mcp  # noqa: E402
 from credentials import LocalCredentialStore  # noqa: E402
 from project_store import ProjectStore  # noqa: E402
 from github_status import GitReportError, collect_git_report, format_git_report  # noqa: E402
@@ -60,6 +60,7 @@ projects = ProjectStore(ROOT / "data" / "workspace.db")
 chat_tasks: set[asyncio.Task] = set()
 git_run_locks: dict[int, asyncio.Lock] = {}
 agent_dispatch_task: asyncio.Task | None = None
+workspace_mcp_http_app = workspace_mcp.streamable_http_app()
 AUTOMATIC_AGENT_PROMPT = (
     "Process the queued team messages now. Follow each command, use reports as context, "
     "and send a concise report to the requesting agent when the work is complete."
@@ -70,25 +71,42 @@ AUTOMATIC_AGENT_PROMPT = (
 async def lifespan(_: FastAPI):
     global agent_dispatch_task
     await team.start()
-    agent_dispatch_task = asyncio.create_task(
-        dispatch_pending_agent_messages(), name="agent-message-dispatcher"
-    )
-    try:
-        yield
-    finally:
-        if agent_dispatch_task:
-            agent_dispatch_task.cancel()
-            await asyncio.gather(agent_dispatch_task, return_exceptions=True)
-            agent_dispatch_task = None
-        for task in chat_tasks:
-            task.cancel()
-        if chat_tasks:
-            await asyncio.gather(*chat_tasks, return_exceptions=True)
-        await team.stop()
+    async with workspace_mcp.session_manager.run():
+        agent_dispatch_task = asyncio.create_task(
+            dispatch_pending_agent_messages(), name="agent-message-dispatcher"
+        )
+        try:
+            yield
+        finally:
+            if agent_dispatch_task:
+                agent_dispatch_task.cancel()
+                await asyncio.gather(agent_dispatch_task, return_exceptions=True)
+                agent_dispatch_task = None
+            for task in chat_tasks:
+                task.cancel()
+            if chat_tasks:
+                await asyncio.gather(*chat_tasks, return_exceptions=True)
+            await team.stop()
 
 
 app = FastAPI(title="Agent Team Workspace", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+app.mount("/mcp", workspace_mcp_http_app, name="workspace-mcp")
+
+
+def remember_local_mcp_url(request: Request) -> None:
+    """Make the HTTP MCP URL available when launched by an ASGI server.
+
+    ``python main.py`` sets this before Uvicorn starts.  When the app is
+    instead launched as ``uvicorn main:app``, the server port is not available
+    during module import, so learn it from the first local browser request.
+    """
+    if os.getenv("WORKSPACE_APP_URL", "").strip():
+        return
+    hostname = request.base_url.hostname
+    if hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return
+    os.environ["WORKSPACE_APP_URL"] = str(request.base_url).rstrip("/")
 
 
 class ChatInput(BaseModel):
@@ -244,6 +262,12 @@ class CodeExecutionInput(BaseModel):
     project_id: int = 1
 
 
+class ProjectTestsInput(BaseModel):
+    role: str = Field(min_length=2, max_length=80)
+    project_id: int = 1
+    pytest_args: list[str] = Field(default_factory=list, max_length=100)
+
+
 class SkillInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(default="", max_length=80)
@@ -338,9 +362,11 @@ def normalize_code_language(value: str) -> str:
     return CODE_LANGUAGE_ALIASES.get(raw, raw or "")
 
 
-def code_execution_command(language: str, code: str) -> list[str]:
+def code_execution_command(language: str, code: str, working_root: Path | None = None) -> list[str]:
     if language == "python":
-        return [sys.executable, "-c", code]
+        if working_root is None:
+            raise ValueError("Python code must be run from a project with a virtual environment")
+        return [str(project_python_executable(working_root)), "-c", code]
     if language == "javascript":
         executable = shutil.which("node")
         if not executable:
@@ -386,9 +412,18 @@ def kill_code_process(process: asyncio.subprocess.Process) -> None:
 
 
 async def run_code_in_project(code: str, language: str, cwd: Path) -> dict[str, object]:
-    command = code_execution_command(language, code)
+    command = code_execution_command(language, code, cwd)
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
+    if language == "python":
+        interpreter = Path(command[0]).resolve()
+        environment["VIRTUAL_ENV"] = str(interpreter.parent.parent)
+        environment["PYTHON"] = str(interpreter)
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment.pop("PYTHONPATH", None)
+        environment["PATH"] = os.pathsep.join(
+            [str(interpreter.parent), environment.get("PATH", "")]
+        )
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd),
@@ -426,6 +461,61 @@ async def run_code_in_project(code: str, language: str, cwd: Path) -> dict[str, 
         "cwd": str(cwd),
         "exit_code": process.returncode,
         "timed_out": timed_out,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def project_python_environment(interpreter: Path) -> dict[str, str]:
+    """Build an isolated environment for a project-venv Python process."""
+    interpreter = interpreter.resolve()
+    environment = os.environ.copy()
+    environment["VIRTUAL_ENV"] = str(interpreter.parent.parent)
+    environment["PYTHON"] = str(interpreter)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment.pop("PYTHONPATH", None)
+    environment["PATH"] = os.pathsep.join(
+        [str(interpreter.parent), environment.get("PATH", "")]
+    )
+    return environment
+
+
+async def run_project_tests_in_host(root: Path, pytest_args: list[str]) -> dict[str, object]:
+    """Run pytest from the app process, outside the provider sandbox."""
+    interpreter = project_python_executable(root)
+    arguments = [str(value) for value in (pytest_args or ["-q"])]
+    if any("\x00" in value for value in arguments):
+        raise ValueError("pytest arguments cannot contain NUL characters")
+    command = [str(interpreter), "-m", "pytest", *arguments]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(root),
+        env=project_python_environment(interpreter),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    stdout_task = asyncio.create_task(read_limited(process.stdout, 20_000))
+    stderr_task = asyncio.create_task(read_limited(process.stderr, 20_000))
+    timed_out = False
+    try:
+        await asyncio.wait_for(process.wait(), timeout=600)
+    except asyncio.TimeoutError:
+        timed_out = True
+        kill_code_process(process)
+        await process.wait()
+    stdout, _ = await stdout_task
+    stderr, _ = await stderr_task
+    if timed_out:
+        stderr = f"{stderr}\nProcess timed out after 600 seconds.".strip()
+    return {
+        "ok": process.returncode == 0 and not timed_out,
+        "command": command,
+        "cwd": str(root),
+        "python": str(interpreter),
+        "exit_code": process.returncode,
         "stdout": stdout,
         "stderr": stderr,
     }
@@ -895,6 +985,31 @@ async def execute_code(payload: CodeExecutionInput):
         raise HTTPException(422, str(exc)) from exc
     except OSError as exc:
         raise HTTPException(502, f"Could not start the code runner: {exc}") from exc
+
+
+@app.post("/api/internal/project-tests")
+async def run_project_tests_internal(payload: ProjectTestsInput, request: Request):
+    """Run project tests for the local MCP bridge outside Codex's sandbox."""
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(403, "This runner is available only to the local application")
+    try:
+        projects.get(payload.project_id)
+        team.definitions.get(payload.role, payload.project_id)
+        permissions = projects.agent_action_permissions(payload.project_id, payload.role)
+        if not permissions["effective_commands"]:
+            return {
+                "ok": False,
+                "error": "This agent is not authorized to run project tests; request command permission first.",
+            }
+        root = team._project_root(payload.project_id)
+        return await run_project_tests_in_host(root, payload.pytest_args)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except FileNotFoundError as exc:
+        return {"ok": False, "error": str(exc)}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _toolset_project(project_id: int) -> Path:
@@ -1536,6 +1651,19 @@ async def dispatch_pending_agent_messages() -> None:
         await asyncio.sleep(0.5)
 
 
+def _persist_run_error(role: str, project_id: int, message: str) -> None:
+    """Keep failures outside team.chat visible in the agent transcript."""
+    try:
+        config = team.configs.get(role, project_id)
+        team.configs.add_message(
+            role, "error", message, config.get("provider", "workspace"), config.get("model", ""), project_id,
+        )
+    except Exception as exc:
+        # The original run error is still stored below; this guard prevents a
+        # secondary database/agent-deletion failure from masking it.
+        print(f"[chat-run] could not persist error for {role}: {exc}", flush=True)
+
+
 async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
     try:
         print(
@@ -1585,13 +1713,17 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
             flush=True,
         )
     except asyncio.CancelledError:
+        message = "The server stopped before this agent run finished. Send the prompt again."
+        _persist_run_error(role, payload.project_id, message)
         team.configs.update_chat_run(
-            run_id, "error", error="The server stopped before this agent run finished. Send the prompt again."
+            run_id, "error", error=message
         )
         print(f"[chat-run] cancelled role={role} project={payload.project_id} run={run_id}", flush=True)
         raise
     except Exception as exc:
-        team.configs.update_chat_run(run_id, "error", error=f"Agent run failed: {exc}")
+        message = f"Agent run failed: {exc}"
+        _persist_run_error(role, payload.project_id, message)
+        team.configs.update_chat_run(run_id, "error", error=message)
         print(
             f"[chat-run] error role={role} project={payload.project_id} run={run_id}: {exc}",
             flush=True,
@@ -1599,8 +1731,9 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
 
 
 @app.post("/api/chat/{role}", status_code=202)
-async def chat(role: str, payload: ChatInput):
+async def chat(role: str, payload: ChatInput, request: Request):
     try:
+        remember_local_mcp_url(request)
         team.definitions.get(role, payload.project_id)
         projects.get(payload.project_id)
         # Human/API-submitted prompts always remain visible. Only the internal
@@ -1748,6 +1881,7 @@ if __name__ == "__main__":
     host = "127.0.0.1"
     start_port = int(os.getenv("PORT_START", "8000"))
     listener, port = bind_available_port(host, start_port)
+    os.environ["WORKSPACE_APP_URL"] = f"http://{host}:{port}"
     print(f"Agent Team Workspace listening at http://{host}:{port}", flush=True)
     config = uvicorn.Config(app, host=host, port=port, reload=False)
     server = uvicorn.Server(config)

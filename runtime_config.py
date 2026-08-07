@@ -70,8 +70,17 @@ DEFAULTS = {
 
 
 class RuntimeConfigStore:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, recover_interrupted_runs: bool = True) -> None:
+        """Open the runtime store.
+
+        Only the main application process should perform process-restart
+        recovery.  Provider helpers such as the MCP server share this
+        database while an agent run is active; treating one of those helper
+        processes as the application owner would incorrectly mark the live
+        run as interrupted.
+        """
         self.db_path = str(db_path)
+        self.recover_interrupted_runs = recover_interrupted_runs
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute(
@@ -258,23 +267,24 @@ class RuntimeConfigStore:
             chat_run_columns = {row[1] for row in db.execute("PRAGMA table_info(chat_runs)")}
             if "input_json" not in chat_run_columns:
                 db.execute("ALTER TABLE chat_runs ADD COLUMN input_json TEXT NOT NULL DEFAULT ''")
-            # A process restart cannot resume an in-memory provider task. Make that
-            # state explicit instead of leaving the UI polling forever. Queued
-            # requests are durable user work and remain available for the
-            # dispatcher after a restart.
-            timestamp = datetime.now(timezone.utc).isoformat()
-            db.execute(
-                """UPDATE chat_runs SET status='error', error=?, updated_at=?
-                WHERE status='running'""",
-                ("The server restarted before this agent run finished. Send the prompt again.", timestamp),
-            )
-            # A process restart can interrupt the provider after messages were
-            # claimed but before they were marked delivered. Requeue those
-            # messages so the next prompt cannot silently miss them.
-            db.execute(
-                """UPDATE conversation_messages SET delivery_status='pending', delivery_run_id=''
-                WHERE delivery_status='in_prompt'"""
-            )
+            if self.recover_interrupted_runs:
+                # A process restart cannot resume an in-memory provider task.
+                # Make that state explicit instead of leaving the UI polling
+                # forever. Queued requests are durable user work and remain
+                # available to the dispatcher after a restart.
+                timestamp = datetime.now(timezone.utc).isoformat()
+                db.execute(
+                    """UPDATE chat_runs SET status='error', error=?, updated_at=?
+                    WHERE status='running'""",
+                    ("The server restarted before this agent run finished. Send the prompt again.", timestamp),
+                )
+                # A process restart can interrupt the provider after messages
+                # were claimed but before they were marked delivered. Requeue
+                # those messages so the next prompt cannot silently miss them.
+                db.execute(
+                    """UPDATE conversation_messages SET delivery_status='pending', delivery_run_id=''
+                    WHERE delivery_status='in_prompt'"""
+                )
             self._migrate_existing_projects(db)
 
     @contextmanager

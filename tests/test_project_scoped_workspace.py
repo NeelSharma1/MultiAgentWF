@@ -52,6 +52,24 @@ def test_relationship_enforcement_limits_prompt_roster_and_messages(tmp_path):
         team.send_agent_message("lead", "observer", "Do the work", "command", project_id)
 
 
+def test_workspace_team_guidance_distinguishes_configured_agents_from_native_subagents(tmp_path):
+    team = AgentTeam(tmp_path)
+    project_id = team.projects.create("Delegation workspace")['id']
+    for role in ("lead", "worker"):
+        team.definitions.save(role.title(), f"{role} brief", f"{role} instructions", role, project_id)
+
+    guidance = team._workspace_team_guidance("lead", project_id)
+
+    assert "two distinct delegation systems" in guidance
+    assert "Codex-native subagents" in guidance
+    assert "PRIMARY DELEGATION RULE" in guidance
+    assert "Do not create native subagents by default" in guidance
+    assert "role_id=worker" in guidance
+    assert "specialty=worker brief" in guidance
+    assert "send_agent_message(sender_role='lead'" in guidance
+    assert "list_agent_messages(role='lead'" in guidance
+
+
 def test_agent_action_permissions_are_scoped_and_global_mode_overrides_them(tmp_path):
     team = AgentTeam(tmp_path)
     project_id = team.projects.create("Action permissions")['id']
@@ -64,7 +82,11 @@ def test_agent_action_permissions_are_scoped_and_global_mode_overrides_them(tmp_
     granted = team._action_permissions("editor", project_id)
     assert granted["effective_commands"] is True
     assert granted["effective_file_edits"] is False
-    assert 'permission_request scope="workspace"' in team._instructions("editor", project_id)
+    command_guidance = team._instructions("editor", project_id)
+    assert "authorized this agent to execute commands" in command_guidance
+    assert 'permission_request scope="external"' in command_guidance
+    assert 'permission_request scope="workspace"' not in command_guidance
+    assert "project's local virtual environment" in command_guidance
 
     team.projects.set_auto_approve_agent_actions(project_id, True)
     automatic = team._action_permissions("editor", project_id)

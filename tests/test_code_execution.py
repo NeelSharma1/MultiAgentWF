@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+import sys
 
 import pytest
 from fastapi import HTTPException
@@ -17,6 +18,10 @@ class FakeProjects:
 
 def test_code_execution_returns_stdout_and_runtime_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "projects", FakeProjects(tmp_path))
+    # The test process is launched from the project's venv. Production looks
+    # this path up from the selected project root instead of using a fallback
+    # system interpreter.
+    monkeypatch.setattr(main, "project_python_executable", lambda _root: Path(sys.executable))
 
     success = asyncio.run(main.execute_code(main.CodeExecutionInput(
         code="print('hello from terminal')", language="python", project_id=42

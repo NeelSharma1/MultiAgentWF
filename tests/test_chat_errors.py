@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -164,11 +165,17 @@ def test_codex_resume_places_working_directory_before_resume_and_keeps_diagnosti
     team.configs.save_codex_session("researcher", 1, "session-123", "gpt-test", "")
     monkeypatch.setattr(team, "_codex_command", lambda: "/usr/bin/codex")
     monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    interpreter = tmp_path / "venv" / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python"
+    )
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
 
     async def logged_in():
         return {"connected": True, "detail": "Logged in using ChatGPT", "login_output": ""}
 
     monkeypatch.setattr(team, "codex_login_status", logged_in)
+    monkeypatch.setattr("team.project_python_executable", lambda _root: interpreter)
     captured = {}
 
     class FakeProcess:
@@ -194,6 +201,121 @@ def test_codex_resume_places_working_directory_before_resume_and_keeps_diagnosti
     assert args[args.index("--sandbox") + 1] == "read-only"
     assert "--ask-for-approval" not in args
     assert result["response"] == "Codex resumed response"
+
+
+def test_codex_resume_prompt_explains_workspace_agents_and_native_subagents(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "codex", "gpt-test", "", "")
+    team.configs.save_codex_session("researcher", 1, "session-123", "gpt-test", "")
+    monkeypatch.setattr(team, "_codex_command", lambda: "/usr/bin/codex")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    interpreter = tmp_path / "venv" / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python"
+    )
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+
+    async def logged_in():
+        return {"connected": True, "detail": "Logged in using ChatGPT", "login_output": ""}
+
+    monkeypatch.setattr(team, "codex_login_status", logged_in)
+    monkeypatch.setattr("team.project_python_executable", lambda _root: interpreter)
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            captured["prompt"] = prompt.decode()
+            Path(captured["output_path"]).write_text("Codex resumed response")
+            return b'{"type":"thread.started","thread_id":"session-123"}\n', b""
+
+    async def fake_create(*args, **_kwargs):
+        captured["output_path"] = args[list(args).index("--output-last-message") + 1]
+        return FakeProcess()
+
+    monkeypatch.setattr("team.asyncio.create_subprocess_exec", fake_create)
+    asyncio.run(team._codex_chat_locked(
+        "researcher", "Continue", team.configs.get("researcher"), 1, None, [],
+    ))
+
+    prompt = captured["prompt"]
+    assert "<workspace_team_delegation>" in prompt
+    assert "Codex-native subagents" in prompt
+    assert "PRIMARY DELEGATION RULE" in prompt
+    assert "Do not create native subagents by default" in prompt
+    assert "configured workspace-agent system is the primary coordination path" in prompt
+    assert "role_id=programmer" in prompt
+    assert "send_agent_message(sender_role='researcher'" in prompt
+    assert "run_project_tests" in prompt
+
+
+def test_codex_command_permission_can_run_tests_with_project_python(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "codex", "gpt-test", "", "")
+    team.projects.set_agent_action_permissions(1, "researcher", True, False)
+    monkeypatch.setattr(team, "_codex_command", lambda: "/usr/bin/codex")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+
+    environment_root = tmp_path / "venv"
+    bin_directory = environment_root / ("Scripts" if os.name == "nt" else "bin")
+    bin_directory.mkdir(parents=True)
+    (bin_directory / ("python.exe" if os.name == "nt" else "python")).write_text("", encoding="utf-8")
+
+    async def logged_in():
+        return {"connected": True, "detail": "Logged in using ChatGPT", "login_output": ""}
+
+    monkeypatch.setattr(team, "codex_login_status", logged_in)
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            captured["prompt"] = prompt.decode()
+            Path(captured["output_path"]).write_text("Tests completed", encoding="utf-8")
+            return b'{"type":"thread.started","thread_id":"session-tests"}\n', b""
+
+    async def fake_create(*args, **kwargs):
+        captured["args"] = list(args)
+        captured["env"] = kwargs["env"]
+        captured["output_path"] = args[args.index("--output-last-message") + 1]
+        return FakeProcess()
+
+    monkeypatch.setattr("team.asyncio.create_subprocess_exec", fake_create)
+    result = asyncio.run(team._codex_chat_locked(
+        "researcher", "Run the test suite", team.configs.get("researcher"), 1, None, [],
+    ))
+
+    args = captured["args"]
+    assert args[args.index("--sandbox") + 1] == "workspace-write"
+    config_values = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "-c"]
+    assert any(value.startswith("mcp_servers.multiagent_workflow.command=") for value in config_values)
+    assert any(value.startswith("mcp_servers.multiagent_workflow.args=") for value in config_values)
+    assert 'mcp_servers.multiagent_workflow.default_tools_approval_mode="approve"' in config_values
+    assert 'mcp_servers.multiagent_workflow.tools.run_project_tests.approval_mode="approve"' in config_values
+    assert "mcp_servers.multiagent_workflow.tool_timeout_sec=660" in config_values
+    assert captured["env"]["VIRTUAL_ENV"] == str(environment_root)
+    assert captured["env"]["PATH"].split(os.pathsep)[0] == str(bin_directory)
+    assert "authorized this agent to execute commands" in captured["prompt"]
+    assert "project's local virtual environment" in captured["prompt"]
+    assert "-m pytest" in captured["prompt"]
+    assert result["response"] == "Tests completed"
+
+
+def test_codex_direct_mcp_uses_the_running_app_endpoint(tmp_path, monkeypatch):
+    agent_team = AgentTeam(tmp_path)
+    monkeypatch.setenv("WORKSPACE_APP_URL", "http://127.0.0.1:8123/")
+
+    args = agent_team._codex_team_mcp_config_args()
+    config_values = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "-c"]
+
+    assert "mcp_servers.multiagent_workflow.url=\"http://127.0.0.1:8123/mcp/\"" in config_values
+    assert 'mcp_servers.multiagent_workflow.default_tools_approval_mode="approve"' in config_values
+    assert 'mcp_servers.multiagent_workflow.tools.run_project_tests.approval_mode="approve"' in config_values
+    assert "mcp_servers.multiagent_workflow.tool_timeout_sec=660" in config_values
+    assert not any(value.startswith("mcp_servers.multiagent_workflow.command=") for value in config_values)
+    assert not any(value.startswith("mcp_servers.multiagent_workflow.args=") for value in config_values)
 
 
 def test_codex_temporary_external_approval_uses_unrestricted_sandbox(tmp_path, monkeypatch):

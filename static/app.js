@@ -91,6 +91,7 @@ const state={
   chatModels: [],
   providerCommands: [],
   commandHistory: loadCommandHistory(),
+  historySearch: '',
   commandIndex: 0,
   drawingLink: null,
   relationshipMode: 'move',
@@ -102,9 +103,61 @@ const state={
   contextUsageLoads: {},
   chatOverrides: loadChatOverrides(),
   runtimeModelRequest: 0,
-  chatControlsRequest: 0
+  chatControlsRequest: 0,
+  agentSearch: ''
 };
 const $=s=>document.querySelector(s);
+let messagesScrollFrame=0,
+messagesScrollTimer=0,
+observedMessagesBox=null,
+messagesMutationObserver=null,
+messagesResizeObserver=null;
+function scrollMessagesToLatest(){
+  const box=$('#messages');
+  if(!box)return;
+  const apply=()=>{
+    if(!box.isConnected)return;
+    // Use the largest valid offset rather than relying on the browser to
+    // clamp scrollHeight. This remains reliable when the pane is flex-sized
+    // or was hidden while the selected agent's history was rendered.
+    box.scrollTop=Math.max(0, box.scrollHeight-box.clientHeight)
+  };
+  if(messagesScrollFrame)cancelAnimationFrame(messagesScrollFrame);
+  clearTimeout(messagesScrollTimer);
+  apply();
+  messagesScrollFrame=requestAnimationFrame(()=>{
+    apply();
+    messagesScrollFrame=requestAnimationFrame(apply)
+  });
+  // Give late layout changes (for example a long formatted response) one
+  // final opportunity to update the scroll height.
+  messagesScrollTimer=setTimeout(apply, 150)
+}
+function observeMessagesForAutoScroll(){
+  const box=$('#messages');
+  if(!box)return;
+  if(observedMessagesBox!==box){
+    messagesMutationObserver?.disconnect();
+    messagesResizeObserver?.disconnect();
+    observedMessagesBox=box;
+    if(typeof MutationObserver!=='undefined'){
+      messagesMutationObserver=new MutationObserver(()=>{
+        observeMessagesForAutoScroll();
+        scrollMessagesToLatest()
+      });
+      messagesMutationObserver.observe(box, {childList:true, subtree:true, characterData:true})
+    }
+  }
+  // A formatter, font, or image can change a message's height without
+  // changing the DOM. Observe the message wrappers so those late layout
+  // changes also keep the active transcript pinned to its newest message.
+  if(typeof ResizeObserver!=='undefined'){
+    messagesResizeObserver??=new ResizeObserver(()=>scrollMessagesToLatest());
+    messagesResizeObserver.disconnect();
+    messagesResizeObserver.observe(box);
+    Array.from(box.children).forEach(child=>messagesResizeObserver.observe(child))
+  }
+}
 const commands=[
 {
   name: '/gh',
@@ -239,13 +292,28 @@ function runtimeLabel(r){
 function showDashboard(){
   $('#workspace').classList.add('hidden');
   $('#dashboard').classList.remove('hidden');
+  document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#dashboard'));
   renderFlowchart()
 }
 function showWorkspace(role=state.active){
   $('#dashboard').classList.add('hidden');
   $('#workspace').classList.remove('hidden');
-  selectAgent(role)
+  document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#workspace'));
+  selectAgent(role);
+  // The workspace may have been hidden while the transcript was first
+  // rendered. Scroll again after making it visible so its dimensions exist.
+  requestAnimationFrame(scrollMessagesToLatest)
 }
+document.querySelectorAll('.settings-tabs a').forEach(tab=>tab.addEventListener('click', event=>{
+  event.preventDefault();
+  const target=tab.getAttribute('href');
+  if(target==='#dashboard')showDashboard();
+  else if(target==='#workspace'||target==='#context-list'){
+    showWorkspace();
+    if(target==='#context-list')setTimeout(()=>$('#context-list')?.scrollIntoView({behavior:'smooth',block:'start'}),0)
+  }
+  document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item===tab));
+}));
 function renderProjects(){
   const nav=$('#projects');
   nav.innerHTML='';
@@ -1071,6 +1139,12 @@ function renderExternalAccessButton(){
     : individualAccess
       ? `Remove ${agent.name}'s access outside the project folder.`
       : `Allow only ${agent.name} to work outside the project folder.`;
+  const scope=$('#scope-badge');
+  if(scope){
+    const external=globalAccess||individualAccess;
+    scope.textContent=external?'External access':'Project scope';
+    scope.classList.toggle('external',external)
+  }
 }
 function renderContextMeter(){
   const meter=$('#context-meter'), agent=activeAgent(), usage=state.contextUsage[state.active];
@@ -1559,7 +1633,10 @@ function saveEdges(){
 function renderAgents(){
   const nav=$('#agents');
   nav.innerHTML='';
-  state.agents.forEach(a=>{
+  const query=state.agentSearch.trim().toLowerCase();
+  const visible=state.agents.filter(a=>!query||`${a.name} ${a.brief} ${a.id}`.toLowerCase().includes(query));
+  if(!visible.length){nav.innerHTML='<p class="agent-search-empty">No matching agents.</p>'}
+  visible.forEach(a=>{
     const b=document.createElement('button');
     b.className=`agent-button ${a.id===state.active?'active':''}`;
     b.innerHTML=`<span class="mini-avatar">${a.name[0]}</span><div><strong>${a.name}</strong><small></small></div>`;
@@ -1590,6 +1667,7 @@ function selectAgent(id){
   $('#agent-brief').textContent=a.brief;
   $('#avatar').textContent=a.name[0];
   $('#runtime-badge').textContent=runtimeLabel(a.runtime);
+  $('#active-model-label').textContent=a.runtime?.model||'Agent default';
   renderExternalAccessButton();
   renderContextMeter();
   renderActiveSkillSummary();
@@ -1597,7 +1675,10 @@ function selectAgent(id){
   renderMessages();
   renderComposer();
   loadChatControls();
-  if(state.project)loadHistory(id).then(()=>recoverActiveRun(id))
+  if(state.project)loadHistory(id).then(()=>{
+    if(state.active===id)scrollMessagesToLatest();
+    return recoverActiveRun(id)
+  })
 }
 function normalizeMessage(m, role=state.active){
   const kind=m.speaker==='user'?'user': m.speaker==='error'?'error': m.speaker==='native'?'native': m.speaker==='app'?'app': 'agent';
@@ -1670,8 +1751,21 @@ async function loadHistory(role){
     try{
       const out=await api(`/api/agents/${role}/history?project_id=${projectId}`);
       if(state.project?.id!==projectId)return false;
-      state.messages[role]=out.messages.map(m=>normalizeMessage(m, role));
-      if(state.active===role)renderMessages();
+      const messages=out.messages.map(m=>normalizeMessage(m, role));
+      // A history request can have started before a provider run finished.
+      // Keep any run-level error rendered locally until a later history
+      // response contains its persisted transcript row; otherwise polling can
+      // erase the diagnostic immediately after it appears.
+      const localErrors=(state.messages[role]||[]).filter(message=>message.localOnly&&message.kind==='error');
+      const persistedErrors=new Set(messages.filter(message=>message.kind==='error').map(message=>message.text));
+      localErrors.forEach(message=>{
+        if(!persistedErrors.has(message.text))messages.push(message)
+      });
+      state.messages[role]=messages;
+      if(state.active===role){
+        renderMessages();
+        scrollMessagesToLatest()
+      }
       refreshContextUsage(role);
       return true
     }
@@ -2305,10 +2399,13 @@ function wireCodeActions(container){
 }
 function renderMessages(){
   const box=$('#messages'),
-  items=(state.messages[state.active]||[]).filter(m=>!m.internal),
-  previousTop=box.scrollTop,
-  wasAtBottom=!box.scrollHeight||box.scrollHeight-box.scrollTop-box.clientHeight<64;
-  box.innerHTML=items.length?'': '<div class="empty"><strong>Start a conversation</strong><span>Type / to browse commands. This role keeps its own transcript.</span></div>';
+  allItems=(state.messages[state.active]||[]).filter(m=>!m.internal),
+  query=state.historySearch.trim().toLowerCase(),
+  items=query?allItems.filter(m=>`${m.text||''} ${m.by||''}`.toLowerCase().includes(query)):allItems;
+  observeMessagesForAutoScroll();
+  box.innerHTML=items.length?'': `<div class="empty"><strong>${query?'No matching messages':'Start a conversation'}</strong><span>${query?'Try a different search term.':'Type / to browse commands. This role keeps its own transcript.'}</span></div>`;
+  const count=$('#history-count');
+  if(count)count.textContent=query?`${items.length} of ${allItems.length} messages`:allItems.length?`${allItems.length} messages`:'';
   items.forEach(m=>{
     const wrap=document.createElement('article');
     const compiled=Boolean(m.compiled&&m.compiled_parts?.length);
@@ -2434,7 +2531,11 @@ function renderMessages(){
     wrap.append(bubble, actions);
     box.append(wrap)
   });
-  box.scrollTop=wasAtBottom?box.scrollHeight: previousTop
+  // Every agent has its own transcript.  When the active transcript is
+  // rendered or refreshed, start at its newest message instead of inheriting
+  // the scroll position from the previous agent or an empty initial render.
+  observeMessagesForAutoScroll();
+  scrollMessagesToLatest()
 }
 async function respondToPermissionRequest(message, approved){
   const request=message.permission_request, role=state.active, projectId=state.project?.id;
@@ -2471,9 +2572,15 @@ function waitForChatRun(runId, role, projectId){
       if(['completed', 'error'].includes(run.status)){
         console.info(`[chat-run] ${role} run ${currentRunId} ${run.status}`);
         await loadHistory(role);
-        if(run.status==='error'&&run.error&&!run.result?.assistant_message)(state.messages[role]??=[]).push({
-          kind: 'error', text: run.error, by: 'Workspace', created_at: run.updated_at, attachments: []
-        });
+        if(run.status==='error'){
+          const text=String(run.error||run.result?.response||'');
+          const messages=state.messages[role]??=[];
+          if(text&&!messages.some(message=>message.kind==='error'&&message.text===text))messages.push({
+            id: `run-error-${currentRunId}`,
+            localOnly: true,
+            kind: 'error', text, by: 'Workspace', created_at: run.updated_at, attachments: []
+          })
+        }
         let next=null;
         try{
           const active=await api(`/api/agents/${role}/active-run?project_id=${projectId}`);
@@ -2586,7 +2693,10 @@ function renderComposer(){
   });
   tray.classList.toggle('hidden', !pending.length);
   activity.className=`chat-activity ${activityState?.type||''}${activityState?'':' hidden'}`;
-  activity.textContent=activityState?.text||'';
+  const activityLabel=activity.querySelector('.chat-activity-label');
+  if(activityLabel)activityLabel.textContent=activityState?.text||'';
+  else activity.textContent=activityState?.text||'';
+  activity.dataset.state=activityState?.type||'';
   // An active run blocks provider execution, not composing. Messages sent
   // while busy are persisted as queued runs and submitted when this agent is
   // free, so the send control must remain usable.
@@ -2596,6 +2706,9 @@ function renderComposer(){
   $('#attach-button').disabled=!agent||$('#attach-button').dataset.enabled!=='true';
   $('#send-button').disabled=!agent||!$('#message').value.trim();
   $('#send-button').innerHTML=busy?'Queue <span>↗</span>': 'Send <span>↗</span>'
+  const model=$('#chat-model')?.selectedOptions?.[0]?.textContent||agent?.runtime?.model||'Agent default';
+  const modelLabel=$('#active-model-label');
+  if(modelLabel)modelLabel.textContent=model;
 }
 function openAgentContextMenu(event, agent){
   event.preventDefault();
@@ -2637,12 +2750,18 @@ async function loadTemplates(){
 function renderContext(){
   const box=$('#context-list');
   $('#context-count').textContent=state.context.length;
+  const summary=$('#context-scope-summary');
+  if(summary){
+    const scoped=state.context.filter(item=>Array.isArray(item.roles)&&item.roles.includes(state.active));
+    summary.textContent=state.active?`${scoped.length} item${scoped.length===1?'':'s'} scoped to this agent · ${state.context.length-scoped.length} shared`:'';
+  }
   box.innerHTML=state.context.length?'': '<p style="color:var(--muted);font-size:12px">No shared context yet.</p>';
   state.context.forEach(x=>{
     const d=document.createElement('article');
     d.className='context-card';
-    const roles=x.roles.length?x.roles: ['All agents'];
-    d.innerHTML=`<h3></h3><p></p><div class="tags">${roles.map(r=>`<span class="tag">${r}</span>`).join('')}</div>`;
+    const roles=x.roles?.length?x.roles: ['All agents'];
+    const scope=roles.includes(state.active)?'Available to this agent':(x.roles?.length?'Other agents':'Shared with all agents');
+    d.innerHTML=`<h3></h3><p></p><div class="context-scope-label">${scope}</div><div class="tags">${roles.map(r=>`<span class="tag">${r}</span>`).join('')}</div>`;
     d.querySelector('h3').textContent=x.title;
     d.querySelector('p').textContent=x.content;
     d.onclick=()=>openContext(x);
@@ -3203,6 +3322,12 @@ function selectedToolsetRoles(){
 }
 $('#new-context').onclick=()=>openContext();
 $('#new-agent').onclick=openAgentDialog;
+$('#new-chat').onclick=async()=>{
+  if(!activeAgent()||!state.messages[state.active]?.length)return $('#message').focus();
+  if(confirm(`Start a new chat with ${activeAgent().name}? This clears the saved transcript.`))await clearHistory()
+};
+$('#agent-search').oninput=e=>{state.agentSearch=e.currentTarget.value;renderAgents()};
+$('#history-search').oninput=e=>{state.historySearch=e.currentTarget.value;renderMessages()};
 $('#add-agent-dashboard').onclick=openAgentDialog;
 $('#close-agent').onclick=()=>$('#agent-dialog').close();
 $('#workflow-button').onclick=()=>openWorkflowDialog().catch(err=>alert(err.message));
@@ -3320,6 +3445,12 @@ $('#external-access-button').onclick=async()=>{
   catch(err){alert(err.message)}
 };
 $('#theme-toggle').onclick=()=>applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+document.addEventListener('keydown', event=>{
+  if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){
+    event.preventDefault();
+    $('#agent-search')?.focus()
+  }
+});
 document.querySelectorAll('.relationship-toolbar [data-relationship-mode]').forEach(button=>button.onclick=()=>setRelationshipMode(button.dataset.relationshipMode));
 $('#workflow-template-select').onchange=renderWorkflowDialog;
 $('#relationship-enforcement').onchange=async event=>{
@@ -3353,7 +3484,7 @@ $('#workflow-template-save-form').onsubmit=async event=>{
   }
   catch(err){alert(err.message)}
 };
-$('#workflow-template-apply').onclick=async()=>{
+document.querySelector('.workflow-template-apply button[type="button"]')?.addEventListener('click', async()=>{
   const id=$('#workflow-template-select').value;
   if(!id)return alert('Choose a saved workflow first.');
   const template=state.workflowTemplates.find(item=>item.id===Number(id));
@@ -3365,7 +3496,7 @@ $('#workflow-template-apply').onclick=async()=>{
     if(applied.skipped_roles.length)alert(`Applied the workflow. No matching agent was found for: ${applied.skipped_roles.join(', ')}.`)
   }
   catch(err){alert(err.message)}
-};
+});
 $('#workflow-template-delete').onclick=async()=>{
   const id=$('#workflow-template-select').value, template=state.workflowTemplates.find(item=>item.id===Number(id));
   if(!id||!confirm(`Delete saved workflow “${template?.name||''}”?`))return;
@@ -3782,10 +3913,35 @@ async function init(){
   }
   catch(err){
     $('#status').textContent=err.message;
-    $('#status').style.background='#fde2dc'
+    $('#status').classList.add('error');
+  }
+}
+function setupChatEnhancements(){
+  const heading=document.querySelector('.agent-heading'), form=$('#chat-form');
+  if($('#history-search')){
+    const input=$('#history-search');
+    input.oninput=()=>{state.historySearch=input.value;renderMessages()};
+    if(!$('#clear-history-search')){
+      const clear=document.createElement('button'); clear.type='button'; clear.id='clear-history-search'; clear.className='composer-action'; clear.textContent='Clear'; clear.title='Clear search';
+      clear.onclick=()=>{input.value='';state.historySearch='';renderMessages();input.focus()}; input.parentElement.append(clear)
+    }
+  }else if(heading){
+    const tools=document.createElement('div'); tools.className='chat-tools';
+    tools.innerHTML='<label class="history-search"><span>Search chat</span><input id="history-search" type="search" placeholder="Search this transcript" autocomplete="off"><button id="clear-history-search" type="button" title="Clear search" aria-label="Clear search">×</button></label><span id="history-count" class="history-count"></span>';
+    heading.insertBefore(tools, heading.querySelector('#external-access-button'));
+    const input=tools.querySelector('input');
+    input.oninput=()=>{state.historySearch=input.value;renderMessages()};
+    tools.querySelector('button').onclick=()=>{input.value='';state.historySearch='';renderMessages();input.focus()};
+  }
+  if(form&&!$('#clear-composer')){
+    const send=$('#send-button'), actions=document.createElement('div'); actions.className='composer-actions';
+    const clear=document.createElement('button'); clear.type='button'; clear.id='clear-composer'; clear.className='composer-action'; clear.textContent='Clear'; clear.title='Clear draft';
+    clear.onclick=()=>{$('#message').value='';state.replyTo[state.active]=null;renderCommands();renderComposer();$('#message').focus()};
+    form.insertBefore(actions,send); actions.append(clear,send);
   }
 }
 applyTheme(preferredTheme());
+setupChatEnhancements();
 init();
 setInterval(()=>{
   if(state.project&&state.active&&!state.busy.has(state.active)&&!$('#workspace').classList.contains('hidden'))loadHistory(state.active);
