@@ -186,3 +186,6 @@ main.workspace{height:calc(100vh - 120px);background:var(--settings-bg);grid-tem
 :root[data-theme="dark"] #context-count{background:#fff;color:#17211c;border-color:#dce2de}
 .chat-transcript{position:relative;display:flex;flex:1;min-height:0;flex-direction:column}.chat-transcript .messages{flex:1;min-height:0}.jump-to-latest{position:absolute;right:24px;bottom:18px;z-index:5;padding:8px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--ink);box-shadow:0 8px 20px rgba(23,33,28,.18);font-size:11px}.jump-to-latest:hover{background:var(--surface-subtle);color:var(--ink)}:root[data-theme="dark"] .jump-to-latest{background:var(--settings-raised);color:var(--ink);box-shadow:0 8px 20px rgba(0,0,0,.32)}
 @media(max-width:650px){.jump-to-latest{right:16px;bottom:14px}}
+#git-setup-form #git-setup-submit:disabled{background:#aab4ad;color:#f7faf8;cursor:wait;opacity:1}
+#git-setup-status.git-setup-error{margin-top:10px;padding:8px 10px;border:1px solid #efc8c1;border-radius:8px;background:#fff0ed;color:#8a3025;white-space:pre-wrap}
+:root[data-theme="dark"] #git-setup-status.git-setup-error{border-color:#75413b;background:#452725;color:#ffc2b8}

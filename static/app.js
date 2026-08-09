@@ -693,9 +693,11 @@ async function loadGitStatus(){
 function openGitSetup(status, pendingAgent){
   state.pendingGitAgent=pendingAgent||null;
   const noRepository=!status?.is_repository;
-  $('#git-setup-status').textContent=noRepository
+  const statusBox=$('#git-setup-status');
+  statusBox.textContent=noRepository
     ? 'This project folder is not a Git repository. Choose its main branch and explicitly confirm initialization.'
     : `Repository: ${status.repository}\nCurrent branch: ${status.current_branch||'(detached HEAD)'}. Git-enabled agents work on role-named branches and merge into the selected main branch.`;
+  statusBox.classList.remove('git-setup-error');
   $('#git-branch-input').value=status?.main_branch||status?.branch||((status?.current_branch&&status.current_branch!=='(detached HEAD)')?status.current_branch:'main');
   $('#git-remote-name-input').value='gh';
   $('#git-remote-url-input').value='';
@@ -3690,8 +3692,15 @@ $('#close-git-setup').onclick=()=>{
 };
 $('#git-setup-form').onsubmit=async e=>{
   e.preventDefault();
+  const submit=$('#git-setup-submit'), statusBox=$('#git-setup-status');
+  if(submit.disabled)return;
   const pending=state.pendingGitAgent;
   const pendingEnable=state.pendingGitEnableAgent;
+  submit.disabled=true;
+  submit.classList.add('loading');
+  submit.textContent='Saving…';
+  submit.setAttribute('aria-busy','true');
+  statusBox.classList.remove('git-setup-error');
   try{
     state.gitStatus=await api(`/api/projects/${state.project.id}/git`, {
       method:'PUT',
@@ -3702,14 +3711,23 @@ $('#git-setup-form').onsubmit=async e=>{
         remote_url:$('#git-remote-url-input').value
       })
     });
-    $('#git-setup-dialog').close();
-    state.pendingGitAgent=null;
-    state.pendingGitEnableAgent=null;
     if(pending)await createAgent(pending);
     else if(pendingEnable)await saveExistingAgentGitEnabled(pendingEnable, true);
     if($('#version-control-dialog').open)await loadVersionControl()
+    $('#git-setup-dialog').close();
+    state.pendingGitAgent=null;
+    state.pendingGitEnableAgent=null
   }
-  catch(err){alert(err.message)}
+  catch(err){
+    statusBox.textContent=`Could not configure Git: ${err.message}`;
+    statusBox.classList.add('git-setup-error')
+  }
+  finally{
+    submit.disabled=false;
+    submit.classList.remove('loading');
+    submit.textContent='Use Git workflow';
+    submit.removeAttribute('aria-busy')
+  }
 };
 $('#version-branch-form').onsubmit=async e=>{
   e.preventDefault();
