@@ -48,7 +48,10 @@ function applyTheme(theme){
   localStorage.setItem(THEME_KEY,dark?'dark':'light');
   const button=$('#theme-toggle');
   if(button){
-    button.textContent=dark?'Light mode':'Dark mode';
+    const description=button.querySelector('small');
+    if(description)description.textContent=dark?'Switch to light mode.':'Switch to dark mode.';
+    else button.textContent=dark?'Light mode':'Dark mode';
+    button.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode');
     button.setAttribute('aria-pressed',String(dark))
   }
 }
@@ -3461,7 +3464,38 @@ $('#add-agent-dashboard').onclick=openAgentDialog;
 $('#close-agent').onclick=()=>$('#agent-dialog').close();
 $('#workflow-button').onclick=()=>openWorkflowDialog().catch(err=>alert(err.message));
 $('#close-workflow').onclick=()=>$('#workflow-dialog').close();
-$('#permissions-button').onclick=()=>openPermissionsDialog().catch(err=>alert(err.message));
+function filterSettingsMenu(value=''){
+  const query=String(value).trim().toLowerCase(), sections=[...document.querySelectorAll('#settings-menu-panel [data-settings-section]')];
+  let visible=0;
+  sections.forEach(section=>{
+    const matches=!query||section.dataset.settingsSearch.includes(query);
+    section.classList.toggle('hidden',!matches);
+    if(matches)visible++
+  });
+  $('#settings-menu-empty')?.classList.toggle('hidden',visible>0)
+}
+function setSettingsMenuOpen(open){
+  const panel=$('#settings-menu-panel'), trigger=$('#settings-button');
+  if(!panel||!trigger)return;
+  panel.classList.toggle('hidden',!open);
+  trigger.setAttribute('aria-expanded',String(open));
+  if(open){
+    filterSettingsMenu($('#settings-search')?.value||'');
+    requestAnimationFrame(()=>$('#settings-search')?.focus())
+  }else{
+    const search=$('#settings-search');
+    if(search){search.value='';filterSettingsMenu('')}
+  }
+}
+$('#settings-button').onclick=()=>{
+  const panel=$('#settings-menu-panel');
+  setSettingsMenuOpen(panel?.classList.contains('hidden'))
+};
+$('#settings-search').oninput=event=>filterSettingsMenu(event.currentTarget.value);
+$('#permissions-button').onclick=()=>{
+  setSettingsMenuOpen(false);
+  openPermissionsDialog().catch(err=>alert(err.message))
+};
 $('#close-permissions').onclick=()=>$('#permissions-dialog').close();
 $('#memory-button').onclick=()=>openWorkflowMemories().catch(err=>alert(err.message));
 $('#close-memory').onclick=()=>$('#memory-dialog').close();
@@ -3573,8 +3607,20 @@ $('#external-access-button').onclick=async()=>{
   }
   catch(err){alert(err.message)}
 };
-$('#theme-toggle').onclick=()=>applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+$('#theme-toggle').onclick=()=>{
+  applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+  setSettingsMenuOpen(false)
+};
+document.addEventListener('pointerdown',event=>{
+  const menu=$('#settings-menu');
+  if(menu&&!menu.contains(event.target))setSettingsMenuOpen(false)
+});
 document.addEventListener('keydown', event=>{
+  if(event.key==='Escape'&&!$('#settings-menu-panel')?.classList.contains('hidden')){
+    setSettingsMenuOpen(false);
+    $('#settings-button')?.focus();
+    return
+  }
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){
     event.preventDefault();
     $('#agent-search')?.focus()
@@ -3977,6 +4023,7 @@ async function refreshProviders(){
   renderFlowchart()
 }
 $('#connections-button').onclick=async()=>{
+  setSettingsMenuOpen(false);
   $('#connections-dialog').showModal();
   await loadConnections()
 };

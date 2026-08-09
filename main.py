@@ -1753,12 +1753,9 @@ async def chat(role: str, payload: ChatInput, request: Request):
 
 @app.post("/api/agents/{role}/permission-response", status_code=202)
 async def permission_response(role: str, payload: PermissionResponseInput, project_id: int = 1):
-    """Resume a Codex turn after the user accepts or denies its structured request."""
+    """Resume an agent turn after the user accepts or denies its structured request."""
     try:
         team.definitions.get(role, project_id)
-        config = team.configs.get(role, project_id)
-        if config["provider"] != "codex":
-            raise ValueError("In-chat local permission approval is available only for Codex agents")
         request = projects.resolve_permission_request(project_id, role, payload.message_id, payload.approved)
         access = request["scope"] if payload.approved else ""
         decision = "approved" if payload.approved else "denied"
