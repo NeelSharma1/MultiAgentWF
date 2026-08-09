@@ -111,27 +111,74 @@ let messagesScrollFrame=0,
 messagesScrollTimer=0,
 observedMessagesBox=null,
 messagesMutationObserver=null,
-messagesResizeObserver=null;
-function scrollMessagesToLatest(){
+messagesResizeObserver=null,
+messagesPinnedToLatest=true,
+messagesRendering=false;
+const MESSAGES_BOTTOM_THRESHOLD=8;
+function messagesIsNearLatest(box=$('#messages')){
+  if(!box)return true;
+  return box.scrollHeight-box.clientHeight-box.scrollTop<=MESSAGES_BOTTOM_THRESHOLD
+}
+function cancelScheduledMessagesScroll(){
+  if(messagesScrollFrame){
+    cancelAnimationFrame(messagesScrollFrame);
+    messagesScrollFrame=0
+  }
+  if(messagesScrollTimer){
+    clearTimeout(messagesScrollTimer);
+    messagesScrollTimer=0
+  }
+}
+function stopFollowingMessages(box=$('#messages')){
+  if(messagesRendering)return;
+  messagesPinnedToLatest=false;
+  cancelScheduledMessagesScroll();
+  updateLatestMessagesButton()
+}
+function updateLatestMessagesButton(){
+  const box=$('#messages'), button=$('#jump-to-latest');
+  if(!box||!button)return;
+  const show=!messagesPinnedToLatest&&box.scrollHeight>box.clientHeight+4;
+  button.classList.toggle('hidden',!show);
+  button.setAttribute('aria-hidden',String(!show))
+}
+function scrollMessagesToLatest(force=false){
   const box=$('#messages');
   if(!box)return;
+  if(!force&&!messagesPinnedToLatest){
+    cancelScheduledMessagesScroll();
+    updateLatestMessagesButton();
+    return
+  }
   const apply=()=>{
     if(!box.isConnected)return;
+    if(!force&&!messagesPinnedToLatest){
+      updateLatestMessagesButton();
+      return
+    }
     // Use the largest valid offset rather than relying on the browser to
     // clamp scrollHeight. This remains reliable when the pane is flex-sized
     // or was hidden while the selected agent's history was rendered.
-    box.scrollTop=Math.max(0, box.scrollHeight-box.clientHeight)
+    messagesPinnedToLatest=true;
+    box.scrollTop=Math.max(0, box.scrollHeight-box.clientHeight);
+    updateLatestMessagesButton()
   };
-  if(messagesScrollFrame)cancelAnimationFrame(messagesScrollFrame);
-  clearTimeout(messagesScrollTimer);
+  cancelScheduledMessagesScroll();
   apply();
   messagesScrollFrame=requestAnimationFrame(()=>{
+    messagesScrollFrame=0;
     apply();
-    messagesScrollFrame=requestAnimationFrame(apply)
+    messagesScrollFrame=requestAnimationFrame(()=>{
+      messagesScrollFrame=0;
+      apply()
+    })
   });
   // Give late layout changes (for example a long formatted response) one
   // final opportunity to update the scroll height.
-  messagesScrollTimer=setTimeout(apply, 150)
+  messagesScrollTimer=setTimeout(()=>{
+    messagesScrollTimer=0;
+    apply()
+  }, 150)
 }
 function observeMessagesForAutoScroll(){
   const box=$('#messages');
@@ -147,6 +194,21 @@ function observeMessagesForAutoScroll(){
       });
       messagesMutationObserver.observe(box, {childList:true, subtree:true, characterData:true})
     }
+    box.addEventListener('scroll',()=>{
+      // Re-rendering a transcript can temporarily clamp scrollTop while
+      // innerHTML is replaced. That is not user intent and must not turn a
+      // reader who is above the latest message back into a live-follow chat.
+      if(messagesRendering)return;
+      if(messagesIsNearLatest(box)){
+        messagesPinnedToLatest=true;
+        updateLatestMessagesButton()
+      }else stopFollowingMessages(box)
+    }, {passive:true});
+    box.addEventListener('wheel',event=>{
+      // Lock on the user's upward intent before the browser emits its scroll
+      // event, so a polling/render pass cannot win the race and pull down.
+      if(event.deltaY<0)stopFollowingMessages(box)
+    }, {passive:true});
   }
   // A formatter, font, or image can change a message's height without
   // changing the DOM. Observe the message wrappers so those late layout
@@ -157,6 +219,7 @@ function observeMessagesForAutoScroll(){
     messagesResizeObserver.observe(box);
     Array.from(box.children).forEach(child=>messagesResizeObserver.observe(child))
   }
+  updateLatestMessagesButton()
 }
 const commands=[
 {
@@ -1297,8 +1360,45 @@ function setRelationshipMode(mode){
   state.relationshipMode=mode;
   renderRelationshipToolbar()
 }
+function clearLinkDrawing(redraw=true){
+  const active=state.drawingLink;
+  if(active?.origin){
+    active.origin.classList.remove('active');
+    active.origin.onpointermove=null;
+    active.origin.onpointerup=null;
+    active.origin.onpointercancel=null;
+    active.origin.onlostpointercapture=null
+  }
+  if(active?.sourceNode)active.sourceNode.classList.remove('link-source');
+  if(active?.onWindowBlur)window.removeEventListener('blur',active.onWindowBlur);
+  document.querySelectorAll('.flow-node.link-source').forEach(node=>node.classList.remove('link-source'));
+  document.querySelectorAll('.link-handle.active').forEach(handle=>handle.classList.remove('active'));
+  const wasDrawing=Boolean(active);
+  state.drawingLink=null;
+  if(redraw&&wasDrawing){
+    renderRelationshipToolbar();
+    drawLines()
+  }
+}
+function normalizeGraphState(){
+  const roles=new Set(state.agents.map(agent=>agent.id));
+  state.layout=state.layout.filter(item=>item&&roles.has(item.role));
+  const seenEdges=new Set();
+  const nextEdges=state.edges.filter(edge=>{
+    if(!edge||edge.source_role===edge.target_role||!roles.has(edge.source_role)||!roles.has(edge.target_role)||!['command','report'].includes(edge.relationship))return false;
+    const key=`${edge.source_role}::${edge.target_role}::${edge.relationship}`;
+    if(seenEdges.has(key))return false;
+    seenEdges.add(key);
+    return true
+  });
+  const edgesChanged=nextEdges.length!==state.edges.length;
+  state.edges=nextEdges;
+  if(edgesChanged)saveEdges()
+}
 function renderFlowchart(){
   if(!state.project)return;
+  clearLinkDrawing(false);
+  normalizeGraphState();
   renderRelationshipToolbar();
   const host=$('#flow-nodes');
   host.innerHTML='';
@@ -1406,12 +1506,17 @@ function enableDrag(node, item){
       node.style.top=`${item.y}px`;
       drawLines()
     };
-    node.onpointerup=()=>{
+    const finish=()=>{
       node.classList.remove('dragging');
       node.onpointermove=null;
       node.onpointerup=null;
+      node.onpointercancel=null;
+      node.onlostpointercapture=null;
       saveLayout()
-    }
+    };
+    node.onpointerup=finish;
+    node.onpointercancel=finish;
+    node.onlostpointercapture=finish
   }
 }
 function addRelationship(sourceRole,targetRole,relationship){
@@ -1442,8 +1547,10 @@ function addRelationship(sourceRole,targetRole,relationship){
 function startLinkDrawing(origin, item, relationship, event){
   event.preventDefault();
   event.stopPropagation();
+  clearLinkDrawing(false);
   origin.setPointerCapture(event.pointerId);
   const chart=$('#flowchart'), rect=chart.getBoundingClientRect();
+  const sourceNode=origin.closest('.flow-node');
   const originName=state.agents.find(agent=>agent.id===item.role)?.name||item.role, help=$('#flow-help');
   if(help)help.textContent=relationship==='supervisor'
     ? `Supervisor selected: ${originName}. Release on the employee.`
@@ -1457,27 +1564,37 @@ function startLinkDrawing(origin, item, relationship, event){
     relationship,
     x:event.clientX-rect.left+chart.scrollLeft,
     y:event.clientY-rect.top+chart.scrollTop,
+    origin,
+    sourceNode,
   };
   origin.classList.add('active');
+  sourceNode?.classList.add('link-source');
   drawLines();
+  function finish(up, createLink){
+    if(!state.drawingLink)return;
+    const target=up?document.elementFromPoint(up.clientX,up.clientY)?.closest('.flow-node'):null;
+    const shouldLink=Boolean(createLink&&target&&target.dataset.role!==item.role);
+    clearLinkDrawing(false);
+    if(shouldLink){
+      addRelationship(item.role,target.dataset.role,relationship);
+      renderFlowchart();
+      return
+    }
+    renderRelationshipToolbar();
+    drawLines()
+  }
+  const onWindowBlur=()=>finish(null,false);
+  state.drawingLink.onWindowBlur=onWindowBlur;
+  window.addEventListener('blur',onWindowBlur);
   origin.onpointermove=move=>{
+    if(!state.drawingLink)return;
     state.drawingLink.x=move.clientX-rect.left+chart.scrollLeft;
     state.drawingLink.y=move.clientY-rect.top+chart.scrollTop;
     drawLines()
   };
-  origin.onpointerup=up=>{
-    const target=document.elementFromPoint(up.clientX,up.clientY)?.closest('.flow-node');
-    if(target&&target.dataset.role!==item.role){
-      addRelationship(item.role,target.dataset.role,relationship);
-      renderFlowchart()
-    }
-    state.drawingLink=null;
-    origin.classList.remove('active');
-    origin.onpointermove=null;
-    origin.onpointerup=null;
-    renderRelationshipToolbar();
-    drawLines()
-  }
+  origin.onpointerup=up=>finish(up,true);
+  origin.onpointercancel=()=>finish(null,false);
+  origin.onlostpointercapture=()=>finish(null,false)
 }
 function enableLinkDrawing(handle, item, relationship){
   handle.onpointerdown=e=>startLinkDrawing(handle,item,relationship,e)
@@ -1648,6 +1765,8 @@ function renderAgents(){
 }
 function selectAgent(id){
   state.active=id;
+  messagesPinnedToLatest=true;
+  updateLatestMessagesButton();
   state.providerCommands=[];
   const a=activeAgent();
   if(!a){
@@ -2402,6 +2521,9 @@ function renderMessages(){
   allItems=(state.messages[state.active]||[]).filter(m=>!m.internal),
   query=state.historySearch.trim().toLowerCase(),
   items=query?allItems.filter(m=>`${m.text||''} ${m.by||''}`.toLowerCase().includes(query)):allItems;
+  const preserveScrollPosition=!messagesPinnedToLatest,
+  previousScrollTop=box.scrollTop;
+  messagesRendering=true;
   observeMessagesForAutoScroll();
   box.innerHTML=items.length?'': `<div class="empty"><strong>${query?'No matching messages':'Start a conversation'}</strong><span>${query?'Try a different search term.':'Type / to browse commands. This role keeps its own transcript.'}</span></div>`;
   const count=$('#history-count');
@@ -2531,9 +2653,13 @@ function renderMessages(){
     wrap.append(bubble, actions);
     box.append(wrap)
   });
-  // Every agent has its own transcript.  When the active transcript is
-  // rendered or refreshed, start at its newest message instead of inheriting
-  // the scroll position from the previous agent or an empty initial render.
+  if(preserveScrollPosition){
+    box.scrollTop=Math.min(previousScrollTop,Math.max(0,box.scrollHeight-box.clientHeight));
+    messagesPinnedToLatest=false
+  }else messagesPinnedToLatest=true;
+  messagesRendering=false;
+  // Every agent has its own transcript. Keep pinned chats at the newest
+  // message, but preserve the user's position when they are reading above it.
   observeMessagesForAutoScroll();
   scrollMessagesToLatest()
 }
@@ -3328,6 +3454,7 @@ $('#new-chat').onclick=async()=>{
 };
 $('#agent-search').oninput=e=>{state.agentSearch=e.currentTarget.value;renderAgents()};
 $('#history-search').oninput=e=>{state.historySearch=e.currentTarget.value;renderMessages()};
+$('#jump-to-latest').onclick=()=>scrollMessagesToLatest(true);
 $('#add-agent-dashboard').onclick=openAgentDialog;
 $('#close-agent').onclick=()=>$('#agent-dialog').close();
 $('#workflow-button').onclick=()=>openWorkflowDialog().catch(err=>alert(err.message));

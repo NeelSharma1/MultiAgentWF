@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Agent Team Workspace</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260805-35">
+  <link rel="stylesheet" href="/static/styles.css?v=20260809-38">
   <style>.header-actions{display:flex;gap:10px;align-items:center}.model-row{display:flex;gap:8px}.model-row select{flex:1;min-width:0}.compact{width:auto;margin:0}.chat-overrides{display:flex;gap:10px;padding:8px 28px 0;border-top:1px solid var(--line)}.chat-overrides label{margin:0;min-width:190px}.chat-overrides select{padding:7px;font-size:11px}.divider{border-top:1px solid var(--line);margin:22px 0 0;text-align:center}.divider span{position:relative;top:-11px;background:white;padding:0 9px;color:var(--muted);font-size:11px}#agent-form{padding:24px}.connections-wrap{padding:24px}.connections-intro{color:var(--muted);margin:8px 0 18px}.connection-card{display:grid;grid-template-columns:1fr auto;gap:16px;border-top:1px solid var(--line);padding:16px 0}.connection-card h3{margin:0}.connection-card p{color:var(--muted);font-size:12px}.connection-card>div:last-child{display:flex;align-items:center;gap:7px}.connection-card input{margin-top:9px;width:100%}.connection-state{font-size:10px;text-transform:uppercase}.connection-state.connected{color:var(--green)}#codex-login-output{white-space:pre-wrap;font-size:11px;max-width:390px;background:#f3f5f2;padding:8px;border-radius:6px;display:none}</style>
   <style>
     #codex-login-output a{color:var(--green);font-weight:700;text-decoration:underline}
@@ -18,6 +18,14 @@
     #codex-login-output .ansi-bright-cyan{color:#147d88}
     #codex-login-output .ansi-bright-magenta{color:#7a4f9d}
     #codex-login-output .ansi-bright-white{color:#17211c}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-blue{color:#9fc1ff}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-black{color:#a7b8ad}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-green{color:#8bd3aa}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-yellow{color:#ffd98a}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-red{color:#ffaaa5}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-cyan{color:#84dce5}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-magenta{color:#d7b4f4}
+    :root[data-theme="dark"] #codex-login-output .ansi-bright-white{color:#f2fff7}
   </style>
 </head>
 <body>
@@ -47,7 +55,7 @@
     </aside>
     <section class="chat-panel">
       <div class="agent-heading"><div id="avatar" class="avatar">O</div><div class="agent-copy"><div class="name-row"><h2 id="agent-name">Orchestrator</h2><span id="runtime-badge" class="runtime-badge"></span></div><p id="agent-brief"></p><small id="agent-skills" class="agent-skills"></small><div class="scope-line"><span id="scope-badge" class="scope-badge">Project scope</span><span id="active-model-label">Agent default</span></div></div><button id="external-access-button" class="settings-button" type="button" title="Allow this agent to work outside the project folder">External access</button><button id="git-changes-button" class="settings-button">Git</button><button id="runtime-settings" class="settings-button">⚙ Runtime</button></div>
-      <div class="history-toolbar"><label><span class="sr-only">Search this conversation</span><input id="history-search" type="search" placeholder="Search conversation…" autocomplete="off"></label><span id="history-count"></span></div><div id="messages" class="messages"><div class="empty"><strong>Start a conversation</strong><span>Each team member remembers their own thread, receives team commands and reports, and can read shared MCP context.</span></div></div>
+      <div class="chat-transcript"><div class="history-toolbar"><label><span class="sr-only">Search this conversation</span><input id="history-search" type="search" placeholder="Search conversation…" autocomplete="off"></label><span id="history-count"></span></div><div id="messages" class="messages"><div class="empty"><strong>Start a conversation</strong><span>Each team member remembers their own thread, receives team commands and reports, and can read shared MCP context.</span></div></div><button id="jump-to-latest" class="jump-to-latest hidden" type="button" aria-label="Jump to latest messages">↓ Latest messages</button></div>
       <div id="chat-activity" class="chat-activity hidden" role="status" aria-live="polite"><span class="chat-activity-label"></span><i class="chat-activity-progress" aria-hidden="true"></i></div>
       <div class="chat-overrides"><label>Chat model<select id="chat-model"><option value="">Agent default</option></select></label><label>Effort<select id="chat-effort"><option value="">Agent default</option></select></label><div id="context-meter" class="context-meter" title="Estimated active context usage"><div><span>Context remaining</span><strong id="context-remaining">—</strong></div><div class="context-track"><i id="context-progress"></i></div><small id="context-detail">Estimating…</small></div></div>
       <div id="reply-preview" class="reply-preview hidden"><div><span>Replying to</span><strong id="reply-author"></strong><p id="reply-text"></p></div><button id="cancel-reply" type="button" title="Cancel reply">×</button></div>
@@ -139,6 +147,6 @@
       <section class="connection-card"><div><h3>OpenAI-compatible endpoint</h3><p>Optional key for Ollama, LM Studio, vLLM, or a remote compatible server.</p><input id="compatible-credential" type="password" autocomplete="off" placeholder="Paste local/remote server key"></div><div><span id="compatible-connection" class="connection-state"></span><button data-connect="compatible">Save key</button><button data-disconnect="compatible" class="danger">Remove</button></div></section>
     </div>
   </dialog>
-  <script src="/static/app.js?v=20260807-55"></script>
+  <script src="/static/app.js?v=20260809-56"></script>
 </body>
 </html>

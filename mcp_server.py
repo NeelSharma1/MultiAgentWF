@@ -62,7 +62,9 @@ def project_python_executable(project_root: Path) -> Path:
         candidate = environment_root / bin_name / executable_name
         expected.append(str(candidate))
         if candidate.is_file():
-            return candidate.resolve()
+            # Preserve the POSIX venv launcher symlink; resolving it would
+            # bypass the virtual environment and lose its site-packages.
+            return candidate
     raise FileNotFoundError(
         "No project virtual environment was found. Create a venv in the project "
         f"before running tests. Checked: {', '.join(expected)}"

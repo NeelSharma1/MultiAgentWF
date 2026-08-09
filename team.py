@@ -328,7 +328,10 @@ def project_python_executable(working_root: Path) -> Path:
         candidate = environment_root / bin_name / executable_name
         expected.append(str(candidate))
         if candidate.is_file():
-            return candidate.resolve()
+            # On POSIX, .venv/bin/python is usually a symlink. Resolving it
+            # escapes the virtual environment and launches the base Python,
+            # which cannot see the packages installed in the venv.
+            return candidate
     raise FileNotFoundError(
         "No project virtual environment was found. Create a venv in the project "
         f"before running agent Python commands. Checked: {', '.join(expected)}"
