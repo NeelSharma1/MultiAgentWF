@@ -452,20 +452,24 @@ class GitWorkflowStore:
         # --root ensures the first commit is summarized as a diff against an
         # empty tree, which is especially important for a newly initialized
         # agent workspace.
-        numbers = self._run(repository, "diff-tree", "--root", "--no-commit-id", "--numstat", "-r", "--find-renames", commit_hash).stdout
-        statuses = self._run(repository, "diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "--find-renames", commit_hash).stdout
+        numbers = self._run(repository, "diff-tree", "--root", "--no-commit-id", "--numstat", "-r", "-m", "--find-renames", commit_hash).stdout
+        statuses = self._run(repository, "diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "-m", "--find-renames", commit_hash).stdout
         status_by_path: dict[str, str] = {}
         for line in statuses.splitlines():
             parts = line.split("\t")
             if len(parts) >= 2:
                 status_by_path[parts[-1]] = parts[0]
         files = []
+        seen_paths: set[str] = set()
         for line in numbers.splitlines():
             parts = line.split("\t")
             if len(parts) < 3:
                 continue
             additions, deletions = parts[0], parts[1]
             path = parts[-1]
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
             previous = parts[-2] if len(parts) > 3 else ""
             files.append({
                 "path": path, "previous_path": previous, "status": status_by_path.get(path, "M"),
@@ -483,6 +487,46 @@ class GitWorkflowStore:
             item["files"] = []
         item["pushed"] = bool(item.get("pushed"))
         return item
+
+    @staticmethod
+    def _resolve_commit(repository: Path, commit_hash: str) -> str:
+        normalized = str(commit_hash or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{4,64}", normalized):
+            raise GitWorkflowError("Commit IDs must be hexadecimal Git hashes")
+        resolved = GitWorkflowStore._run(
+            repository, "rev-parse", "--verify", f"{normalized}^{{commit}}", check=False,
+        )
+        if resolved.returncode:
+            raise GitWorkflowError(f"Commit '{normalized}' does not exist")
+        return resolved.stdout.strip()
+
+    def commit_detail(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:
+        """Return inspectable metadata and changed files for any repository commit."""
+        _, repository = self._configured_repository(project_id, project_root)
+        resolved = self._resolve_commit(repository, commit_hash)
+        values = self._run(
+            repository, "show", "-s", "--date=short",
+            "--format=%H%x1f%P%x1f%D%x1f%h%x1f%an%x1f%ad%x1f%s", resolved,
+        ).stdout.strip().split("\x1f")
+        values += [""] * (7 - len(values))
+        tracked: dict[str, Any] | None = None
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM agent_git_commits WHERE project_id=? AND commit_hash=?",
+                (project_id, resolved),
+            ).fetchone()
+        if row:
+            tracked = self._record(row)
+        return {
+            "hash": values[0] or resolved,
+            "parents": values[1].split() if values[1] else [],
+            "decorations": values[2].strip(),
+            "short_hash": values[3] or resolved[:12],
+            "author": values[4], "date": values[5], "subject": values[6],
+            "files": self._file_summaries(repository, resolved),
+            "agent_commit": bool(tracked),
+            "tracked": tracked,
+        }
 
     def commit(self, project_id: int, commit_hash: str) -> dict[str, Any]:
         with self._connect() as db:
@@ -504,23 +548,23 @@ class GitWorkflowStore:
         return [self._record(row) for row in rows]
 
     def file_diff(self, project_id: int, project_root: Path, commit_hash: str, path: str) -> dict[str, Any]:
-        record = self.commit(project_id, commit_hash)
+        record = self.commit_detail(project_id, project_root, commit_hash)
         _, repository = self._configured_repository(project_id, project_root)
         path = _relative_git_path(path)
         if path not in {item["path"] for item in record["files"]}:
-            raise GitWorkflowError("That file was not changed by the selected agent commit")
-        diff = self._run(repository, "show", "--format=", "--find-renames", "--unified=3", commit_hash, "--", path).stdout
+            raise GitWorkflowError("That file was not changed by the selected commit")
+        diff = self._run(repository, "show", "--format=", "--root", "-m", "--find-renames", "--unified=3", record["hash"], "--", path).stdout
         if len(diff.encode("utf-8")) > MAX_DIFF_BYTES:
             diff = diff.encode("utf-8")[:MAX_DIFF_BYTES].decode("utf-8", errors="replace") + "\n… diff truncated …\n"
         return {"commit": record, "path": path, "diff": diff}
 
     def open_diff(self, project_id: int, project_root: Path, commit_hash: str, path: str, editor: str) -> dict[str, str]:
-        record = self.commit(project_id, commit_hash)
+        record = self.commit_detail(project_id, project_root, commit_hash)
         _, repository = self._configured_repository(project_id, project_root)
         path = _relative_git_path(path)
         if path not in {item["path"] for item in record["files"]}:
-            raise GitWorkflowError("That file was not changed by the selected agent commit")
-        parent = record.get("parent_hash") or ""
+            raise GitWorkflowError("That file was not changed by the selected commit")
+        parent = (record.get("parents") or [""])[0]
         before = self._show_file(repository, parent, path) if parent else ""
         after = self._show_file(repository, commit_hash, path)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
@@ -558,13 +602,19 @@ class GitWorkflowStore:
         raise GitWorkflowError("Editor must be 'pycharm' or 'vscode'")
 
     def revert(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:
-        record = self.commit(project_id, commit_hash)
         configuration, repository = self._configured_repository(project_id, project_root)
+        resolved = self._resolve_commit(repository, commit_hash)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM agent_git_commits WHERE project_id=? AND commit_hash=?",
+                (project_id, resolved),
+            ).fetchone()
+        record = self._record(row) if row else None
         if self._run(repository, "status", "--porcelain").stdout.strip():
             raise GitWorkflowError("The working tree must be clean before reverting a commit")
         main_branch = self._main_branch(configuration)
         self._checkout_main(repository, main_branch, configuration.get("remote", ""))
-        target = record.get("merge_hash") or commit_hash
+        target = self._resolve_commit(repository, record.get("merge_hash") if record else resolved)
         parent_count = len(self._run(repository, "show", "-s", "--format=%P", target).stdout.strip().split())
         args = ["revert", "--no-edit"]
         if parent_count > 1:
@@ -572,10 +622,65 @@ class GitWorkflowStore:
         args.append(target)
         self._run(repository, *args, timeout=60)
         reverted_by = self._run(repository, "rev-parse", "HEAD").stdout.strip()
-        with self._connect() as db:
-            db.execute("UPDATE agent_git_commits SET state='reverted' WHERE project_id=? AND commit_hash=?",
-                       (project_id, commit_hash))
-        return {"reverted": commit_hash, "revert_commit": reverted_by, "main_branch": main_branch}
+        if record:
+            with self._connect() as db:
+                db.execute("UPDATE agent_git_commits SET state='reverted' WHERE project_id=? AND commit_hash=?",
+                           (project_id, resolved))
+        return {"reverted": resolved, "revert_commit": reverted_by, "main_branch": main_branch}
+
+    def _restore_branch(self, repository: Path, branch: str, head: str) -> None:
+        if branch:
+            self._run(repository, "checkout", "--no-guess", branch)
+        elif head:
+            self._run(repository, "checkout", "--detach", head)
+
+    def _prepare_branch_operation(self, repository: Path, branch: str) -> tuple[str, str]:
+        branch = self._validate_branch(repository, branch)
+        if self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode:
+            raise GitWorkflowError(f"Branch '{branch}' does not exist")
+        if self._run(repository, "status", "--porcelain").stdout.strip():
+            raise GitWorkflowError("The working tree must be clean before changing branch history")
+        previous_branch = self._run(repository, "branch", "--show-current").stdout.strip()
+        previous_head = self._run(repository, "rev-parse", "HEAD", check=False).stdout.strip()
+        if previous_branch != branch:
+            self._run(repository, "checkout", "--no-guess", branch)
+        return previous_branch, previous_head
+
+    def rebase(self, project_id: int, project_root: Path, commit_hash: str, branch: str) -> dict[str, Any]:
+        """Rebase a selected local branch onto a selected commit, aborting conflicts safely."""
+        _, repository = self._configured_repository(project_id, project_root)
+        target = self._resolve_commit(repository, commit_hash)
+        previous_branch, previous_head = self._prepare_branch_operation(repository, branch)
+        branch = self._validate_branch(repository, branch)
+        try:
+            self._run(repository, "rebase", target, timeout=120)
+        except GitWorkflowError as exc:
+            self._run(repository, "rebase", "--abort", check=False)
+            self._restore_branch(repository, previous_branch, previous_head)
+            raise GitWorkflowError(
+                f"Rebase of '{branch}' onto {target[:12]} failed and was aborted. {exc}"
+            ) from exc
+        head = self._run(repository, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        self._restore_branch(repository, previous_branch, previous_head)
+        return {"rebased": branch, "onto": target, "head": head, "current_branch": previous_branch or "(detached HEAD)"}
+
+    def merge(self, project_id: int, project_root: Path, commit_hash: str, branch: str) -> dict[str, Any]:
+        """Merge a selected commit into a selected local branch, aborting conflicts safely."""
+        _, repository = self._configured_repository(project_id, project_root)
+        target = self._resolve_commit(repository, commit_hash)
+        previous_branch, previous_head = self._prepare_branch_operation(repository, branch)
+        branch = self._validate_branch(repository, branch)
+        try:
+            self._run(repository, "merge", "--no-ff", "--no-edit", target, timeout=120)
+        except GitWorkflowError as exc:
+            self._run(repository, "merge", "--abort", check=False)
+            self._restore_branch(repository, previous_branch, previous_head)
+            raise GitWorkflowError(
+                f"Merge of {target[:12]} into '{branch}' failed and was aborted. {exc}"
+            ) from exc
+        head = self._run(repository, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        self._restore_branch(repository, previous_branch, previous_head)
+        return {"merged": target, "target_branch": branch, "head": head, "current_branch": previous_branch or "(detached HEAD)"}
 
     def rollback(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:
         record = self.commit(project_id, commit_hash)
