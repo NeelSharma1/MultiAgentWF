@@ -893,7 +893,7 @@ function renderVersionDiffPreview(diff){
   })
 }
 function renderVersionCommitInspector(){
-  const detail=state.selectedVersionCommitDetail, hash=state.selectedVersionCommit, title=$('#version-selected-commit-title'), meta=$('#version-selected-commit-meta'), target=$('#version-commit-target-branch'), rebase=$('#version-rebase-commit'), merge=$('#version-merge-commit'), revert=$('#version-revert-commit'), files=$('#version-commit-files'), fileCount=$('#version-commit-file-count'), diffTitle=$('#version-diff-title'), diffMeta=$('#version-diff-meta');
+  const detail=state.selectedVersionCommitDetail, hash=state.selectedVersionCommit, title=$('#version-selected-commit-title'), meta=$('#version-selected-commit-meta'), target=$('#version-commit-target-branch'), rebase=$('#version-rebase-commit'), merge=$('#version-merge-commit'), mergeAll=$('#version-merge-all-branches'), revert=$('#version-revert-commit'), files=$('#version-commit-files'), fileCount=$('#version-commit-file-count'), diffTitle=$('#version-diff-title'), diffMeta=$('#version-diff-meta');
   if(!title||!target)return;
   const valid=Boolean(state.gitOverview?.is_repository&&detail&&detail.hash===hash), branches=state.gitOverview?.branches||[], branchNames=branches.map(item=>item.name), fallback=state.gitOverview?.current_branch||state.gitOverview?.main_branch||branchNames[0]||'';
   target.innerHTML='';
@@ -905,6 +905,7 @@ function renderVersionCommitInspector(){
   target.disabled=!valid||state.versionCommitActionBusy||!branchNames.length;
   rebase.disabled=!valid||state.versionCommitActionBusy||!target.value;
   merge.disabled=!valid||state.versionCommitActionBusy||!target.value;
+  mergeAll.disabled=!valid||state.versionCommitActionBusy||!branchNames.length;
   revert.disabled=!valid||state.versionCommitActionBusy;
   $('#version-commit-action-status').textContent=state.versionCommitActionStatus||'';
   if(!valid){
@@ -962,24 +963,34 @@ async function runVersionCommitAction(action){
   const messages={
     rebase:`Rebase '${target}' onto commit ${shortHash}? This rewrites the target branch history. The working tree must be clean.`,
     merge:`Merge commit ${shortHash} into '${target}'? This creates a merge commit on the target branch.`,
+    'merge-all':`Merge commit ${shortHash} into every local branch that does not already contain it? This may create merge commits on multiple branches.`,
     revert:`Create a new revert commit for ${shortHash} on the configured main branch?`
   };
   if(!confirm(messages[action]))return;
   state.versionCommitActionBusy=true;
-  state.versionCommitActionStatus=action==='rebase'?`Rebasing '${target}'…`:action==='merge'?`Merging into '${target}'…`:'Creating revert commit on the configured main branch…';
+  state.versionCommitActionStatus=action==='rebase'?`Rebasing '${target}'…`:action==='merge'?`Merging into '${target}'…`:action==='merge-all'?`Merging into all missing branches…`:'Creating revert commit on the configured main branch…';
   renderVersionCommitInspector();
   try{
-    const body=action==='revert'?undefined:JSON.stringify({branch:target});
+    const body=action==='revert'||action==='merge-all'?undefined:JSON.stringify({branch:target});
     const result=await api(`/api/projects/${state.project.id}/git/commits/${encodeURIComponent(hash)}/${action}`,{method:'POST',...(body?{body}:{})});
     state.versionCommitActionStatus=action==='rebase'
       ? `Rebased '${result.rebased}' onto ${shortHash}.`
       : action==='merge'
         ? `Merged ${shortHash} into '${result.target_branch}'.`
-        : `Created revert commit ${String(result.revert_commit||'').slice(0,12)} on '${result.main_branch}'.`;
+        : action==='merge-all'
+          ? formatMergeAllStatus(shortHash,result)
+          : `Created revert commit ${String(result.revert_commit||'').slice(0,12)} on '${result.main_branch}'.`;
     await loadVersionControl()
   }
   catch(err){state.versionCommitActionStatus=`${action[0].toUpperCase()+action.slice(1)} failed: ${err.message}`}
   finally{state.versionCommitActionBusy=false;renderVersionCommitInspector()}
+}
+function formatMergeAllStatus(shortHash,result){
+  const merged=result.merged||[], skipped=result.skipped||[], failed=result.failed||[];
+  let status=merged.length?`Merged ${shortHash} into ${merged.join(', ')}.`:'No branches needed a merge.';
+  if(skipped.length)status+=` Already present in ${skipped.join(', ')}.`;
+  if(failed.length)status+=` Failed on ${failed.map(item=>`${item.branch}: ${item.error}`).join(' · ')}.`;
+  return status
 }
 function branchCommitHistory(head, commitByHash){
   const history=new Set(), pending=[head];
@@ -4070,6 +4081,7 @@ $('#version-graph-reset').onclick=resetVersionGraphView;
 $('#version-commit-target-branch').onchange=event=>{state.versionCommitTargetBranch=event.target.value};
 $('#version-rebase-commit').onclick=()=>runVersionCommitAction('rebase');
 $('#version-merge-commit').onclick=()=>runVersionCommitAction('merge');
+$('#version-merge-all-branches').onclick=()=>runVersionCommitAction('merge-all');
 $('#version-revert-commit').onclick=()=>runVersionCommitAction('revert');
 $('#version-control-agent-git-button').onclick=()=>{
   const panel=$('#version-agent-git-submenu'), button=$('#version-control-agent-git-button'), open=panel.classList.contains('hidden');

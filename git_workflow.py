@@ -682,6 +682,50 @@ class GitWorkflowStore:
         self._restore_branch(repository, previous_branch, previous_head)
         return {"merged": target, "target_branch": branch, "head": head, "current_branch": previous_branch or "(detached HEAD)"}
 
+    def merge_into_all_branches(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:
+        """Merge a selected commit into every local branch that does not contain it."""
+        _, repository = self._configured_repository(project_id, project_root)
+        target = self._resolve_commit(repository, commit_hash)
+        if self._run(repository, "status", "--porcelain").stdout.strip():
+            raise GitWorkflowError("The working tree must be clean before merging into multiple branches")
+        previous_branch = self._run(repository, "branch", "--show-current").stdout.strip()
+        previous_head = self._run(repository, "rev-parse", "HEAD", check=False).stdout.strip()
+        branches = [
+            value.strip() for value in self._run(
+                repository, "for-each-ref", "--format=%(refname:short)", "refs/heads",
+            ).stdout.splitlines() if value.strip()
+        ]
+        skipped: list[str] = []
+        candidates: list[str] = []
+        for branch in branches:
+            if self._run(
+                repository, "merge-base", "--is-ancestor", target, f"refs/heads/{branch}", check=False,
+            ).returncode == 0:
+                skipped.append(branch)
+            else:
+                candidates.append(branch)
+        merged: list[str] = []
+        failed: list[dict[str, str]] = []
+        try:
+            for branch in candidates:
+                self._validate_branch(repository, branch)
+                current = self._run(repository, "branch", "--show-current").stdout.strip()
+                if current != branch:
+                    self._run(repository, "checkout", "--no-guess", branch)
+                try:
+                    self._run(repository, "merge", "--no-ff", "--no-edit", target, timeout=120)
+                except GitWorkflowError as exc:
+                    self._run(repository, "merge", "--abort", check=False)
+                    failed.append({"branch": branch, "error": str(exc)})
+                else:
+                    merged.append(branch)
+        finally:
+            self._restore_branch(repository, previous_branch, previous_head)
+        return {
+            "merged_commit": target, "merged": merged, "skipped": skipped, "failed": failed,
+            "current_branch": previous_branch or "(detached HEAD)",
+        }
+
     def rollback(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:
         record = self.commit(project_id, commit_hash)
         configuration, repository = self._configured_repository(project_id, project_root)
