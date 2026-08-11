@@ -146,3 +146,75 @@ def test_version_control_overview_and_branch_management(tmp_path):
         workflow.delete_branch(1, repository, "team-main")
     assert workflow.checkout_branch(1, repository, "team-main")["branch"] == "team-main"
     assert workflow.delete_branch(1, repository, "review") == {"deleted": "review"}
+
+
+def test_commit_inspection_rebase_merge_and_revert_for_regular_commits(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "tracked.py").write_text("tracked = True\n", encoding="utf-8")
+    tracked = workflow.finish_agent_run(1, "programmer", "run-detail", repository, "Add tracked file")
+    assert tracked is not None
+    detail = workflow.commit_detail(1, repository, tracked["commit_hash"])
+    assert detail["hash"] == tracked["commit_hash"]
+    assert detail["files"][0]["path"] == "tracked.py"
+    assert "+tracked = True" in workflow.file_diff(1, repository, tracked["commit_hash"], "tracked.py")["diff"]
+
+    workflow.create_branch(1, repository, "topic", "team-main")
+    workflow.checkout_branch(1, repository, "topic")
+    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
+    _git(workflow, repository, "add", "topic.py")
+    _git(workflow, repository, "commit", "-m", "Topic change")
+    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
+
+    workflow.checkout_branch(1, repository, "team-main")
+    (repository / "main.py").write_text("main = True\n", encoding="utf-8")
+    _git(workflow, repository, "add", "main.py")
+    _git(workflow, repository, "commit", "-m", "Main change")
+    main_commit = _git(workflow, repository, "rev-parse", "HEAD")
+
+    rebased = workflow.rebase(1, repository, main_commit, "topic")
+    assert rebased["rebased"] == "topic"
+    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
+    rebased_topic = _git(workflow, repository, "rev-parse", "refs/heads/topic")
+    assert _git(workflow, repository, "merge-base", "--is-ancestor", main_commit, rebased_topic) == ""
+
+    merged = workflow.merge(1, repository, rebased_topic, "team-main")
+    assert merged["target_branch"] == "team-main"
+    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
+    assert (repository / "topic.py").is_file()
+    merge_detail = workflow.commit_detail(1, repository, merged["head"])
+    assert any(item["path"] == "topic.py" for item in merge_detail["files"])
+    assert "+topic = True" in workflow.file_diff(1, repository, merged["head"], "topic.py")["diff"]
+
+    reverted = workflow.revert(1, repository, rebased_topic)
+    assert reverted["reverted"] == rebased_topic
+    assert not (repository / "topic.py").exists()
+
+
+def test_merge_commit_into_all_branches_skips_branches_that_already_contain_it(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "base.py").write_text("base = True\n", encoding="utf-8")
+    assert workflow.finish_agent_run(1, "programmer", "run-base", repository, "Create base")
+
+    workflow.create_branch(1, repository, "topic", "team-main")
+    workflow.checkout_branch(1, repository, "topic")
+    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
+    _git(workflow, repository, "add", "topic.py")
+    _git(workflow, repository, "commit", "-m", "Topic change")
+    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
+    workflow.checkout_branch(1, repository, "team-main")
+
+    result = workflow.merge_into_all_branches(1, repository, topic_commit)
+
+    assert set(result["merged"]) == {"team-main", "programmer"}
+    assert result["skipped"] == ["topic"]
+    assert result["failed"] == []
+    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
+    for branch in ("team-main", "programmer"):
+        assert _git(workflow, repository, "merge-base", "--is-ancestor", topic_commit, f"refs/heads/{branch}") == ""
+
+    repeat = workflow.merge_into_all_branches(1, repository, topic_commit)
+    assert repeat["merged"] == []
+    assert set(repeat["skipped"]) == {"team-main", "programmer", "topic"}
