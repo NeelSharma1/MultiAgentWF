@@ -63,12 +63,15 @@ def test_generic_command_marker_uses_the_local_approval_flow(tmp_path, monkeypat
     team = AgentTeam(tmp_path)
     team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
     monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    prompts = []
     responses = iter([
         "I need to run a local command.\nCOMMAND - echo local-command",
         "COMMAND - echo local-command",
+        "The command result is available, so I completed the requested work.",
     ])
 
-    async def fake_chat(*_args, **_kwargs):
+    async def fake_chat(*args, **_kwargs):
+        prompts.append(args[1])
         return {"response": next(responses), "answered_by": "Researcher"}
 
     team._agents_chat = fake_chat
@@ -82,8 +85,44 @@ def test_generic_command_marker_uses_the_local_approval_flow(tmp_path, monkeypat
     second = asyncio.run(team.chat(
         "researcher", "Continue", record_user_message=False, temporary_access="workspace",
     ))
+    assert len(prompts) == 3
     assert second["local_commands"][0]["cwd"] == str(tmp_path.resolve())
     assert "local-command" in second["response"]
+
+
+def test_fallback_command_with_shell_diagnostic_continues_at_zero_exit(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    fallback = (
+        subprocess.list2cmdline([sys.executable])
+        if os.name == "nt" else shlex.quote(sys.executable)
+    )
+    missing_launcher = (
+        r".\_venv\Scripts\python.exe"
+        if os.name == "nt" else
+        "./_venv/bin/python"
+    )
+    command = f"{missing_launcher} --version || {fallback} --version"
+    prompts = []
+    responses = iter([
+        f"I will inspect the project.\nCOMMAND - {command}",
+        "The fallback was diagnosed and I continued with the original task.",
+    ])
+
+    async def fake_chat(*args, **_kwargs):
+        prompts.append(args[1])
+        return {"response": next(responses), "answered_by": "Researcher"}
+
+    team._agents_chat = fake_chat
+    result = asyncio.run(team.chat("researcher", "Continue the requested work", temporary_access="workspace"))
+
+    assert len(prompts) == 2
+    assert "Exit code: 0" in prompts[1]
+    assert "failed command segment" in prompts[1]
+    assert result["local_commands"][0]["ok"] is False
+    assert result["local_commands"][0]["shell_diagnostic_failure"] is True
+    assert "continued with the original task" in result["response"]
 
 
 def test_failed_local_command_is_returned_to_agent_for_continuation(tmp_path, monkeypatch):
