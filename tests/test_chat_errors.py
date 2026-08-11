@@ -204,7 +204,9 @@ def test_read_marker_result_is_returned_to_the_agent_before_it_finishes(tmp_path
     assert "2: one" in prompts[1]
     assert "3: two" in prompts[1]
     assert "I used the requested lines" in result["response"]
-    assert "READ `notes.txt`" in result["response"]
+    assert "LOCAL_FILE_ACTION" in result["response"]
+    assert "2: one" not in result["response"]
+    assert "3: two" not in result["response"]
 
 
 def test_queued_user_turns_are_not_leaked_into_the_current_provider_prompt(tmp_path):

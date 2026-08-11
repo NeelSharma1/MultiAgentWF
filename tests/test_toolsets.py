@@ -12,7 +12,7 @@ import pytest
 
 from team import AgentTeam
 from toolsets import (
-    ToolsetStore, normalize_project_venv_command, resolve_command_markers, resolve_file_markers,
+    ToolsetStore, format_file_action_feedback, normalize_project_venv_command, resolve_command_markers, resolve_file_markers,
     resolve_tool_calls, restore_file_action_results,
     run_local_command,
 )
@@ -175,9 +175,11 @@ def test_read_marker_returns_requested_lines_and_stays_permission_gated(tmp_path
     rendered = restore_file_action_results(text, replacements)
     assert pending == []
     assert calls[0]["ok"] is True
-    assert "2: one" in rendered
-    assert "3: two" in rendered
-    assert "1: zero" not in rendered
+    assert "LOCAL_FILE_ACTION" in rendered
+    assert "2: one" not in rendered
+    assert "3: two" not in rendered
+    assert "2: one" in format_file_action_feedback(calls[0])
+    assert "3: two" in format_file_action_feedback(calls[0])
 
 
 def test_create_block_writes_workspace_file_and_shields_nested_markers(tmp_path):
@@ -190,7 +192,10 @@ def test_create_block_writes_workspace_file_and_shields_nested_markers(tmp_path)
     assert pending == []
     assert calls[0]["ok"] is True
     assert command_calls == []
-    assert "CREATE `generated.txt` completed" in rendered
+    assert "LOCAL_FILE_ACTION" in rendered
+    assert "COMMAND - do-not-run" not in rendered
+    assert calls[0]["added_lines"] == 2
+    assert calls[0]["removed_lines"] == 0
     assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "COMMAND - do-not-run\ncreated\n"
 
 
