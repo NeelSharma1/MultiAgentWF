@@ -29,7 +29,7 @@ from skills import (
     normalize_skill_type, skill_slug,
 )
 from toolsets import (
-    ToolsetStore, format_file_action_result, format_local_command_result, resolve_command_markers,
+    ToolsetStore, format_file_action_feedback, format_file_action_result, format_local_command_result, resolve_command_markers,
     resolve_file_markers, resolve_tool_calls, restore_file_action_results, toolset_slug,
 )
 from git_workflow import GitWorkflowStore
@@ -214,7 +214,12 @@ def _format_local_action_result(result: dict[str, Any]) -> str:
 
 def _local_action_success_prompt(original_message: str, actions: list[dict[str, Any]]) -> str:
     """Return successful local action results to the agent that requested them."""
-    details = "\n\n".join(_format_local_action_result(item) for item in actions)
+    details = "\n\n".join(
+        format_file_action_feedback(item)
+        if str(item.get("action") or "").upper() in {"READ", "CREATE"}
+        else _format_local_action_result(item)
+        for item in actions
+    )
     return (
         "<local_action_feedback>\n"
         "The application completed the requested local action. Use the result below as authoritative context "

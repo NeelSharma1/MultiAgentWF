@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -575,34 +576,80 @@ def _execute_file_action(action: dict[str, Any], project_root: Path) -> dict[str
             )
         return {
             "ok": True, "action": "READ", "path": relative, "line_ranges": ranges,
-            "stdout": output, "stderr": "", "exit_code": 0, "cwd": str(Path(project_root).resolve()),
+            "bytes": len(output.encode("utf-8")), "line_count": len(output.splitlines()),
+            "truncated": truncated, "stdout": output, "stderr": "", "exit_code": 0,
+            "cwd": str(Path(project_root).resolve()),
         }
     if action_name == "CREATE":
         content = str(action.get("content") or "")
         if len(content) > CREATE_CONTENT_LIMIT:
             raise ValueError(f"CREATE content cannot exceed {CREATE_CONTENT_LIMIT:,} characters")
+        existed = path.exists()
+        previous_content = path.read_bytes().decode("utf-8", errors="replace") if path.is_file() else ""
+        previous_lines = previous_content.splitlines()
+        new_lines = content.splitlines()
+        additions = deletions = 0
+        for opcode, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+            a=previous_lines, b=new_lines,
+        ).get_opcodes():
+            if opcode != "equal":
+                deletions += old_end - old_start
+                additions += new_end - new_start
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return {
-            "ok": True, "action": "CREATE", "path": relative, "bytes": len(content.encode("utf-8")),
-            "stdout": "", "stderr": "", "exit_code": 0, "cwd": str(Path(project_root).resolve()),
+            "ok": True, "action": "CREATE", "path": relative, "created": not existed,
+            "bytes": len(content.encode("utf-8")), "line_count": len(new_lines),
+            "added_lines": additions, "removed_lines": deletions, "stdout": "", "stderr": "",
+            "exit_code": 0, "cwd": str(Path(project_root).resolve()),
         }
     raise ValueError("Unknown file action")
 
 
+def _file_action_scope(result: dict[str, Any]) -> str:
+    ranges = result.get("line_ranges")
+    return "" if not ranges else ", ".join(f"{start}-{end}" for start, end in ranges)
+
+
 def format_file_action_result(result: dict[str, Any]) -> str:
-    """Render a READ/CREATE result for the agent and the chat transcript."""
+    """Render a compact, content-free READ/CREATE card for the chat transcript."""
+    action = str(result.get("action") or "FILE").upper()
+    path = str(result.get("path") or "")
+    payload: dict[str, Any] = {"action": action, "path": path, "ok": bool(result.get("ok"))}
+    if not result.get("ok"):
+        detail = str(result.get("error") or result.get("stderr") or result.get("stdout") or "").strip()
+        payload["detail"] = (detail or "The file action produced no diagnostic output.")[:320]
+    elif action == "READ":
+        payload.update({
+            "scope": _file_action_scope(result), "bytes": int(result.get("bytes") or 0),
+            "line_count": int(result.get("line_count") or 0), "truncated": bool(result.get("truncated")),
+        })
+    else:
+        payload.update({
+            "created": bool(result.get("created")), "bytes": int(result.get("bytes") or 0),
+            "line_count": int(result.get("line_count") or 0),
+            "added_lines": int(result.get("added_lines") or 0),
+            "removed_lines": int(result.get("removed_lines") or 0),
+        })
+    return f"[[LOCAL_FILE_ACTION {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}]]"
+
+
+def format_file_action_feedback(result: dict[str, Any]) -> str:
+    """Render file-action output for the requesting agent, never for the transcript."""
     action = str(result.get("action") or "FILE").upper()
     path = str(result.get("path") or "")
     if not result.get("ok"):
         detail = str(result.get("error") or result.get("stderr") or result.get("stdout") or "").strip()
         return f"> {action} `{path}` failed.\n> {detail or 'The file action produced no diagnostic output.'}"
     if action == "READ":
-        ranges = result.get("line_ranges")
-        scope = "" if not ranges else f" (requested lines {', '.join(f'{start}-{end}' for start, end in ranges)})"
-        content = str(result.get("stdout") or "")
-        return f"> READ `{path}`{scope}:\n```text\n{content}\n```"
-    return f"> CREATE `{path}` completed ({result.get('bytes', 0)} bytes written)."
+        scope = _file_action_scope(result)
+        scope_text = "" if not scope else f" (requested lines {scope})"
+        return f"> READ `{path}`{scope_text}:\n```text\n{result.get('stdout') or ''}\n```"
+    state = "created" if result.get("created") else "updated"
+    return (
+        f"> CREATE `{path}` {state} ({result.get('bytes', 0)} bytes; "
+        f"+{result.get('added_lines', 0)} / -{result.get('removed_lines', 0)} lines)."
+    )
 
 
 async def resolve_file_markers(

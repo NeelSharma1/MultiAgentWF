@@ -2778,12 +2778,45 @@ function markdownInline(value){
   html=html.replace(/\n/g, '<br>');
   return html.replace(/\u0000md(\d+)\u0000/g, (_, index)=>tokens[Number(index)]||'')
 }
+function parseLocalFileActionCard(value){
+  const match=String(value??'').trim().match(/^\[\[LOCAL_FILE_ACTION\s+(.+)\]\]$/);
+  if(!match)return null;
+  try{
+    const payload=JSON.parse(match[1]);
+    return ['READ','CREATE'].includes(String(payload?.action||'').toUpperCase())?payload:null
+  }catch{return null}
+}
+function formatFileActionBytes(value){
+  const bytes=Math.max(0, Number(value)||0);
+  if(bytes<1024)return `${bytes} B`;
+  if(bytes<1024*1024)return `${(bytes/1024).toFixed(bytes<10*1024?1:0)} KB`;
+  return `${(bytes/(1024*1024)).toFixed(1)} MB`
+}
+function renderLocalFileActionCard(payload){
+  const action=String(payload.action||'').toUpperCase(), ok=Boolean(payload.ok), path=String(payload.path||'Untitled file');
+  if(!['READ','CREATE'].includes(action))return '';
+  const heading=action==='READ'?'Read Files':'Changed Files', icon=ok?'✓':'!', status=ok?'Done':'Failed';
+  let detail='';
+  if(!ok){
+    detail=`<span class="local-file-action-error">${escapeHtml(String(payload.detail||'The file action did not complete.'))}</span>`
+  }else if(action==='READ'){
+    const scope=String(payload.scope||'').trim(), lines=Number(payload.line_count)||0;
+    const location=scope?`Lines ${escapeHtml(scope)}`:`${lines} line${lines===1?'':'s'}`;
+    detail=`<span class="local-file-action-meta">${location} · ${formatFileActionBytes(payload.bytes)}${payload.truncated?' · Preview capped':''}</span>`
+  }else{
+    const additions=Number(payload.added_lines)||0, removals=Number(payload.removed_lines)||0;
+    const state=payload.created?'Created':'Updated';
+    detail=`<span class="local-file-action-meta">${state} · ${formatFileActionBytes(payload.bytes)}</span><span class="local-file-action-delta add">+${additions}</span><span class="local-file-action-delta remove">-${removals}</span>`
+  }
+  return `<section class="local-file-action-card ${ok?'success':'failure'}"><div class="local-file-action-status"><span class="local-file-action-icon">${icon}</span><strong>${status}</strong></div><strong class="local-file-action-heading">${heading}</strong><div class="local-file-action-row"><code>${escapeHtml(path)}</code>${detail}</div></section>`
+}
 function renderMarkdown(value){
   const lines=String(value??'').replace(/\r\n?/g, '\n').split('\n');
   const blocks=[];
   const blank=line=>/^\s*$/.test(line);
   const listPattern=/^\s{0,3}([-+*]|\d+[.)])\s+(.*)$/;
   const blockStart=(line, next='')=>{
+    if(parseLocalFileActionCard(line))return true;
     if(/^\s{0,3}(?:`{3,}|~{3,})/.test(line))return true;
     if(/^\s{0,3}#{1,6}\s+/.test(line))return true;
     if(/^\s{0,3}> ?/.test(line))return true;
@@ -2798,6 +2831,12 @@ function renderMarkdown(value){
       continue
     }
     const line=lines[index];
+    const localFileAction=parseLocalFileActionCard(line);
+    if(localFileAction){
+      blocks.push(renderLocalFileActionCard(localFileAction));
+      index++;
+      continue
+    }
     const fence=line.match(/^\s{0,3}(`{3,}|~{3,})\s*([^\s]*)\s*$/);
     if(fence){
       const marker=fence[1][0], size=fence[1].length, code=[];
@@ -2967,6 +3006,28 @@ function wireCodeActions(container){
     }
   })
 }
+function summarizeFileActionPermission(command){
+  const raw=String(command??'').trim();
+  const read=raw.match(/^READ\s*-\s*([\s\S]+)$/i);
+  if(read){
+    const payload=read[1].trim();
+    const selection=payload.match(/^(.*)\s+-\s+((?:lines?\s*[:=]?\s*)?\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)$/i);
+    return {
+      action:'Read', path:(selection?selection[1]:payload).trim(),
+      meta:selection?`Lines ${selection[2].replace(/^lines?\s*[:=]?\s*/i, '')}`:'Whole file'
+    }
+  }
+  const block=raw.match(/^CREATE\s*-\s*([^\r\n]+?)\s*\r?\n([\s\S]*?)\r?\nEND\s+CREATE\s*$/i);
+  let path='', content='';
+  if(block){path=block[1].trim();content=block[2]}
+  else{
+    const inline=raw.match(/^CREATE\s*-\s*([\s\S]+)$/i), payload=inline?.[1]||'', separator=payload.indexOf(' - ');
+    if(separator>=0){path=payload.slice(0,separator).trim();content=payload.slice(separator+3)}
+  }
+  if(!path)return null;
+  const bytes=typeof TextEncoder==='undefined'?content.length:new TextEncoder().encode(content).length;
+  return {action:'Create', path, meta:`${formatFileActionBytes(bytes)} content hidden`}
+}
 function renderMessages(){
   const box=$('#messages'),
   allItems=(state.messages[state.active]||[]).filter(m=>!m.internal),
@@ -3058,8 +3119,17 @@ function renderMessages(){
       if(request.commands?.length){
         const list=document.createElement('ol');
         request.commands.forEach(command=>{
-          const item=document.createElement('li'), code=document.createElement('code');
-          code.textContent=command; item.append(code); list.append(item)
+          const item=document.createElement('li'), summary=summarizeFileActionPermission(command);
+          if(summary){
+            item.className='permission-file-action';
+            const action=document.createElement('strong'), code=document.createElement('code'), meta=document.createElement('small');
+            action.textContent=summary.action; code.textContent=summary.path; meta.textContent=summary.meta;
+            item.append(action,code,meta)
+          }else{
+            const code=document.createElement('code');
+            code.textContent=command; item.append(code)
+          }
+          list.append(item)
         });
         commands.append(list)
       }
