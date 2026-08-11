@@ -190,3 +190,31 @@ def test_commit_inspection_rebase_merge_and_revert_for_regular_commits(tmp_path)
     reverted = workflow.revert(1, repository, rebased_topic)
     assert reverted["reverted"] == rebased_topic
     assert not (repository / "topic.py").exists()
+
+
+def test_merge_commit_into_all_branches_skips_branches_that_already_contain_it(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "base.py").write_text("base = True\n", encoding="utf-8")
+    assert workflow.finish_agent_run(1, "programmer", "run-base", repository, "Create base")
+
+    workflow.create_branch(1, repository, "topic", "team-main")
+    workflow.checkout_branch(1, repository, "topic")
+    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
+    _git(workflow, repository, "add", "topic.py")
+    _git(workflow, repository, "commit", "-m", "Topic change")
+    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
+    workflow.checkout_branch(1, repository, "team-main")
+
+    result = workflow.merge_into_all_branches(1, repository, topic_commit)
+
+    assert set(result["merged"]) == {"team-main", "programmer"}
+    assert result["skipped"] == ["topic"]
+    assert result["failed"] == []
+    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
+    for branch in ("team-main", "programmer"):
+        assert _git(workflow, repository, "merge-base", "--is-ancestor", topic_commit, f"refs/heads/{branch}") == ""
+
+    repeat = workflow.merge_into_all_branches(1, repository, topic_commit)
+    assert repeat["merged"] == []
+    assert set(repeat["skipped"]) == {"team-main", "programmer", "topic"}
