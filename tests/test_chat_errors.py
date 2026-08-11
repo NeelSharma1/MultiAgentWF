@@ -56,6 +56,33 @@ def test_internal_continuation_prompt_is_not_saved_as_a_user_message(tmp_path):
     assert "Process the queued team messages now." not in history[0]["content"]
 
 
+def test_generic_command_marker_uses_the_local_approval_flow(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    responses = iter([
+        "I need to run a local command.\nCOMMAND - echo local-command",
+        "COMMAND - echo local-command",
+    ])
+
+    async def fake_chat(*_args, **_kwargs):
+        return {"response": next(responses), "answered_by": "Researcher"}
+
+    team._agents_chat = fake_chat
+    first = asyncio.run(team.chat("researcher", "Run it"))
+
+    request = first["assistant_message"]["permission_request"]
+    assert request["scope"] == "workspace"
+    assert request["commands"] == ["echo local-command"]
+    assert "COMMAND -" not in first["response"]
+
+    second = asyncio.run(team.chat(
+        "researcher", "Continue", record_user_message=False, temporary_access="workspace",
+    ))
+    assert second["local_commands"][0]["cwd"] == str(tmp_path.resolve())
+    assert "local-command" in second["response"]
+
+
 def test_queued_user_turns_are_not_leaked_into_the_current_provider_prompt(tmp_path):
     team = AgentTeam(tmp_path)
     team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")

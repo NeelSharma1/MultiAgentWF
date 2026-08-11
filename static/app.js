@@ -48,7 +48,10 @@ function applyTheme(theme){
   localStorage.setItem(THEME_KEY,dark?'dark':'light');
   const button=$('#theme-toggle');
   if(button){
-    button.textContent=dark?'Light mode':'Dark mode';
+    const description=button.querySelector('small');
+    if(description)description.textContent=dark?'Switch to light mode.':'Switch to dark mode.';
+    else button.textContent=dark?'Light mode':'Dark mode';
+    button.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode');
     button.setAttribute('aria-pressed',String(dark))
   }
 }
@@ -66,7 +69,21 @@ const state={
   gitStatus: null,
   gitOverview: null,
   selectedVersionBranch: '',
+  selectedVersionBranches: [],
   selectedVersionCommit: '',
+  selectedVersionCommitDetail: null,
+  selectedVersionDiffPath: '',
+  selectedVersionDiff: '',
+  versionCommitDiffLoading: false,
+  versionCommitDetailRequest: 0,
+  versionCommitDiffRequest: 0,
+  versionCommitActionBusy: false,
+  versionCommitActionStatus: '',
+  versionCommitTargetBranch: '',
+  versionGraphView: null,
+  versionGraphFull: null,
+  versionGraphPanMoved: false,
+  versionAgentSearch: '',
   pendingGitAgent: null,
   pendingGitEnableAgent: null,
   marketplace: [],
@@ -354,18 +371,29 @@ function runtimeLabel(r){
 }
 function showDashboard(){
   $('#workspace').classList.add('hidden');
+  $('#version-control').classList.add('hidden');
   $('#dashboard').classList.remove('hidden');
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#dashboard'));
   renderFlowchart()
 }
 function showWorkspace(role=state.active){
   $('#dashboard').classList.add('hidden');
+  $('#version-control').classList.add('hidden');
   $('#workspace').classList.remove('hidden');
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#workspace'));
   selectAgent(role);
   // The workspace may have been hidden while the transcript was first
   // rendered. Scroll again after making it visible so its dimensions exist.
   requestAnimationFrame(scrollMessagesToLatest)
+}
+async function showVersionControl(){
+  const opening=$('#version-control').classList.contains('hidden');
+  $('#dashboard').classList.add('hidden');
+  $('#workspace').classList.add('hidden');
+  $('#version-control').classList.remove('hidden');
+  document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#version-control'));
+  if(opening)state.versionGraphView=null;
+  await loadVersionControl()
 }
 document.querySelectorAll('.settings-tabs a').forEach(tab=>tab.addEventListener('click', event=>{
   event.preventDefault();
@@ -374,7 +402,7 @@ document.querySelectorAll('.settings-tabs a').forEach(tab=>tab.addEventListener(
   else if(target==='#workspace'||target==='#context-list'){
     showWorkspace();
     if(target==='#context-list')setTimeout(()=>$('#context-list')?.scrollIntoView({behavior:'smooth',block:'start'}),0)
-  }
+  }else if(target==='#version-control')showVersionControl().catch(err=>alert(err.message));
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item===tab));
 }));
 function renderProjects(){
@@ -823,24 +851,242 @@ async function loadVersionControl(){
   renderVersionControl(state.gitOverview);
   return state.gitOverview
 }
-function selectVersionBranch(name){
-  state.selectedVersionBranch=name;
+function selectVersionBranch(name, additive=false){
+  const selected=[...(state.selectedVersionBranches||[])];
+  if(additive&&selected.length){
+    const index=selected.indexOf(name);
+    if(index>=0&&selected.length>1)selected.splice(index,1);
+    else if(index<0)selected.push(name)
+  }else selected.splice(0,selected.length,name);
+  state.selectedVersionBranches=selected.length?selected:[name];
+  state.selectedVersionBranch=state.selectedVersionBranches[state.selectedVersionBranches.length-1]||name;
   renderVersionControl(state.gitOverview)
 }
 function selectVersionCommit(hash){
   state.selectedVersionCommit=hash;
-  renderVersionCommitGraph(state.gitOverview)
+  state.selectedVersionCommitDetail=null;
+  state.selectedVersionDiffPath='';
+  state.selectedVersionDiff='';
+  state.versionCommitDiffLoading=false;
+  state.versionCommitActionStatus='';
+  renderVersionCommitGraph(state.gitOverview);
+  requestAnimationFrame(()=>$('#version-commit-inspector')?.scrollIntoView({behavior:'smooth',block:'start',inline:'nearest'}));
+  loadVersionCommitDetails(hash).catch(err=>{
+    state.versionCommitDiffLoading=false;
+    state.versionCommitActionStatus=`Could not load commit details: ${err.message}`;
+    renderVersionCommitInspector()
+  })
+}
+function renderVersionDiffPreview(diff){
+  const host=$('#version-commit-diff');
+  if(!host)return;
+  host.innerHTML='';
+  if(!diff){
+    host.textContent='No textual diff is available for this file (it may be binary or unchanged in the selected parent).';
+    return
+  }
+  String(diff).split(/\r?\n/).forEach(line=>{
+    const row=document.createElement('span');
+    row.className=`version-diff-line${line.startsWith('@@')?' hunk':line.startsWith('+++')||line.startsWith('---')||line.startsWith('diff ')||line.startsWith('index ')?' header':line.startsWith('+')?' addition':line.startsWith('-')?' removal':''}`;
+    row.textContent=line||' ';
+    host.append(row)
+  })
+}
+function renderVersionCommitInspector(){
+  const detail=state.selectedVersionCommitDetail, hash=state.selectedVersionCommit, title=$('#version-selected-commit-title'), meta=$('#version-selected-commit-meta'), target=$('#version-commit-target-branch'), rebase=$('#version-rebase-commit'), merge=$('#version-merge-commit'), mergeAll=$('#version-merge-all-branches'), revert=$('#version-revert-commit'), files=$('#version-commit-files'), fileCount=$('#version-commit-file-count'), diffTitle=$('#version-diff-title'), diffMeta=$('#version-diff-meta');
+  if(!title||!target)return;
+  const valid=Boolean(state.gitOverview?.is_repository&&detail&&detail.hash===hash), branches=state.gitOverview?.branches||[], branchNames=branches.map(item=>item.name), fallback=state.gitOverview?.current_branch||state.gitOverview?.main_branch||branchNames[0]||'';
+  target.innerHTML='';
+  branchNames.forEach(name=>{
+    const option=document.createElement('option'); option.value=name; option.textContent=name; target.append(option)
+  });
+  if(!branchNames.includes(state.versionCommitTargetBranch))state.versionCommitTargetBranch=fallback;
+  target.value=state.versionCommitTargetBranch;
+  target.disabled=!valid||state.versionCommitActionBusy||!branchNames.length;
+  rebase.disabled=!valid||state.versionCommitActionBusy||!target.value;
+  merge.disabled=!valid||state.versionCommitActionBusy||!target.value;
+  mergeAll.disabled=!valid||state.versionCommitActionBusy||!branchNames.length;
+  revert.disabled=!valid||state.versionCommitActionBusy;
+  $('#version-commit-action-status').textContent=state.versionCommitActionStatus||'';
+  if(!valid){
+    title.textContent='Select a commit';
+    meta.textContent='Click an individual commit in the graph to inspect it.';
+    files.innerHTML='<div class="version-empty">No commit selected.</div>';
+    fileCount.textContent=''; diffTitle.textContent='Commit diff'; diffMeta.textContent=''; renderVersionDiffPreview('Choose a commit to inspect its diff.');
+    return
+  }
+  title.textContent=`${detail.short_hash} · ${detail.subject||'Commit'}`;
+  meta.textContent=`${detail.author||'Unknown author'} · ${detail.date||'Unknown date'} · ${detail.hash.slice(0,12)}${detail.decorations?` · ${detail.decorations}`:''}`;
+  const changedFiles=detail.files||[];
+  fileCount.textContent=`${changedFiles.length} file${changedFiles.length===1?'':'s'}`;
+  files.innerHTML='';
+  if(!changedFiles.length)files.innerHTML='<div class="version-empty">This commit has no file changes.</div>';
+  changedFiles.forEach(file=>{
+    const button=document.createElement('button'), name=document.createElement('strong'), stats=document.createElement('small');
+    button.type='button'; button.className=`version-commit-file${state.selectedVersionDiffPath===file.path?' active':''}`;
+    name.textContent=file.path; stats.textContent=`${file.status||'M'} · +${file.additions??'?'} / -${file.deletions??'?'}`;
+    button.append(name,stats); button.onclick=()=>loadVersionCommitDiff(detail.hash,file.path).catch(err=>{state.versionCommitDiffLoading=false;state.versionCommitActionStatus=`Could not load diff: ${err.message}`;renderVersionCommitInspector()}); files.append(button)
+  });
+  const selectedFile=changedFiles.find(file=>file.path===state.selectedVersionDiffPath)||changedFiles[0];
+  if(!selectedFile){diffTitle.textContent='Commit diff';diffMeta.textContent='';renderVersionDiffPreview('This commit has no file changes.');return}
+  diffTitle.textContent=`Diff · ${selectedFile.path}`;
+  diffMeta.textContent=`${selectedFile.status||'M'} · +${selectedFile.additions??'?'} / -${selectedFile.deletions??'?'}`;
+  renderVersionDiffPreview(state.versionCommitDiffLoading?'Loading diff…':state.selectedVersionDiff)
+}
+async function loadVersionCommitDetails(hash){
+  if(!state.project||!hash)return;
+  const request=++state.versionCommitDetailRequest;
+  state.selectedVersionCommitDetail=null;
+  state.selectedVersionDiffPath=''; state.selectedVersionDiff=''; state.versionCommitDiffLoading=false;
+  renderVersionCommitInspector();
+  const detail=await api(`/api/projects/${state.project.id}/git/commits/${encodeURIComponent(hash)}`);
+  if(request!==state.versionCommitDetailRequest||state.selectedVersionCommit!==hash)return;
+  state.selectedVersionCommitDetail=detail;
+  renderVersionCommitInspector();
+  const firstFile=detail.files?.[0];
+  if(firstFile)await loadVersionCommitDiff(detail.hash,firstFile.path)
+}
+async function loadVersionCommitDiff(hash,path){
+  if(!state.project||!hash||!path)return;
+  const request=++state.versionCommitDiffRequest;
+  state.selectedVersionDiffPath=path; state.selectedVersionDiff=''; state.versionCommitDiffLoading=true;
+  renderVersionCommitInspector();
+  const result=await api(`/api/projects/${state.project.id}/git/commits/${encodeURIComponent(hash)}/diff?path=${encodeURIComponent(path)}`);
+  if(request!==state.versionCommitDiffRequest||state.selectedVersionCommit!==hash)return;
+  state.selectedVersionDiff=result.diff||''; state.versionCommitDiffLoading=false; renderVersionCommitInspector()
+}
+async function runVersionCommitAction(action){
+  const hash=state.selectedVersionCommit, target=$('#version-commit-target-branch')?.value||'';
+  if(!hash||state.versionCommitActionBusy)return;
+  if((action==='rebase'||action==='merge')&&!target)return alert('Choose a target branch first.');
+  const shortHash=hash.slice(0,12);
+  const messages={
+    rebase:`Rebase '${target}' onto commit ${shortHash}? This rewrites the target branch history. The working tree must be clean.`,
+    merge:`Merge commit ${shortHash} into '${target}'? This creates a merge commit on the target branch.`,
+    'merge-all':`Merge commit ${shortHash} into every local branch that does not already contain it? This may create merge commits on multiple branches.`,
+    revert:`Create a new revert commit for ${shortHash} on the configured main branch?`
+  };
+  if(!confirm(messages[action]))return;
+  state.versionCommitActionBusy=true;
+  state.versionCommitActionStatus=action==='rebase'?`Rebasing '${target}'…`:action==='merge'?`Merging into '${target}'…`:action==='merge-all'?`Merging into all missing branches…`:'Creating revert commit on the configured main branch…';
+  renderVersionCommitInspector();
+  try{
+    const body=action==='revert'||action==='merge-all'?undefined:JSON.stringify({branch:target});
+    const result=await api(`/api/projects/${state.project.id}/git/commits/${encodeURIComponent(hash)}/${action}`,{method:'POST',...(body?{body}:{})});
+    state.versionCommitActionStatus=action==='rebase'
+      ? `Rebased '${result.rebased}' onto ${shortHash}.`
+      : action==='merge'
+        ? `Merged ${shortHash} into '${result.target_branch}'.`
+        : action==='merge-all'
+          ? formatMergeAllStatus(shortHash,result)
+          : `Created revert commit ${String(result.revert_commit||'').slice(0,12)} on '${result.main_branch}'.`;
+    await loadVersionControl()
+  }
+  catch(err){state.versionCommitActionStatus=`${action[0].toUpperCase()+action.slice(1)} failed: ${err.message}`}
+  finally{state.versionCommitActionBusy=false;renderVersionCommitInspector()}
+}
+function formatMergeAllStatus(shortHash,result){
+  const merged=result.merged||[], skipped=result.skipped||[], failed=result.failed||[];
+  let status=merged.length?`Merged ${shortHash} into ${merged.join(', ')}.`:'No branches needed a merge.';
+  if(skipped.length)status+=` Already present in ${skipped.join(', ')}.`;
+  if(failed.length)status+=` Failed on ${failed.map(item=>`${item.branch}: ${item.error}`).join(' · ')}.`;
+  return status
+}
+function branchCommitHistory(head, commitByHash){
+  const history=new Set(), pending=[head];
+  while(pending.length){
+    const hash=pending.pop();
+    if(!hash||history.has(hash)||!commitByHash.has(hash))continue;
+    history.add(hash);
+    (commitByHash.get(hash).parents||[]).forEach(parent=>pending.push(parent))
+  }
+  return history
+}
+const VERSION_BRANCH_COLORS=['#4d8df7','#c45b48','#9b62c2','#c39424','#269b91','#d14d78','#7d8f2e','#8a5b3c','#5d6fd0','#b75c99','#4c8a62'];
+function versionBranchColor(item,index,branchItems=[]){
+  if(item.main)return '#1d684b';
+  const nonMainIndex=branchItems.filter(branch=>!branch.main).findIndex(branch=>branch.name===item.name);
+  return VERSION_BRANCH_COLORS[(nonMainIndex>=0?nonMainIndex:index)%VERSION_BRANCH_COLORS.length]
+}
+function normalizeVersionGraphView(view, full){
+  const minWidth=Math.min(full.width,Math.max(480,full.initialWidth*.35)), minHeight=Math.min(full.height,Math.max(240,full.height*.45));
+  const width=Math.min(full.width,Math.max(minWidth,Number(view.width)||full.initialWidth)), height=Math.min(full.height,Math.max(minHeight,Number(view.height)||full.initialHeight));
+  return {
+    x:Math.max(0,Math.min(full.width-width,Number(view.x)||0)),
+    y:Math.max(0,Math.min(full.height-height,Number(view.y)||0)),
+    width,height
+  }
+}
+function setVersionGraphView(view){
+  const svg=$('#version-commit-graph svg'), full=state.versionGraphFull;
+  if(!svg||!full)return;
+  const next=normalizeVersionGraphView(view,full);
+  state.versionGraphView=next;
+  svg.setAttribute('viewBox',`${next.x} ${next.y} ${next.width} ${next.height}`);
+  const label=$('#version-graph-zoom-label');
+  if(label){
+    const initial=full.initialCommitCount<=5&&Math.abs(next.width-full.initialWidth)<1;
+    label.textContent=initial?`${full.initialCommitCount} commits`:`${Math.round((full.width/next.width)*100)}%`
+  }
+}
+function versionGraphMetrics(svg){
+  const rect=svg.getBoundingClientRect(), view=state.versionGraphView, scale=Math.min(rect.width/Math.max(1,view.width),rect.height/Math.max(1,view.height)), renderedWidth=view.width*scale, renderedHeight=view.height*scale;
+  return {rect,scale,offsetX:(rect.width-renderedWidth)/2,offsetY:(rect.height-renderedHeight)/2,renderedWidth,renderedHeight}
+}
+function zoomVersionGraph(multiplier, clientX=null, clientY=null){
+  const svg=$('#version-commit-graph svg'), full=state.versionGraphFull, current=state.versionGraphView;
+  if(!svg||!full||!current)return;
+  const metrics=versionGraphMetrics(svg), focusX=clientX===null?0.5:Math.max(0,Math.min(1,(clientX-metrics.rect.left-metrics.offsetX)/Math.max(1,metrics.renderedWidth))), focusY=clientY===null?0.5:Math.max(0,Math.min(1,(clientY-metrics.rect.top-metrics.offsetY)/Math.max(1,metrics.renderedHeight))), width=current.width*multiplier, height=current.height*multiplier;
+  setVersionGraphView({x:current.x+(current.width-width)*focusX,y:current.y+(current.height-height)*focusY,width,height})
+}
+function resetVersionGraphView(){
+  if(state.versionGraphFull)setVersionGraphView(state.versionGraphFull.initial)
+}
+function bindVersionGraphInteractions(){
+  const host=$('#version-commit-graph');
+  if(!host)return;
+  host.onwheel=event=>{
+    event.preventDefault();
+    const delta=event.deltaMode===1?event.deltaY*16:event.deltaY, normalized=Math.max(-1.5,Math.min(1.5,delta/120));
+    zoomVersionGraph(Math.exp(normalized*.08),event.clientX,event.clientY)
+  };
+  host.onpointerdown=event=>{
+    if(event.button!==0||!state.versionGraphView)return;
+    if(event.target?.closest?.('.version-commit-node,.version-commit-branch-label')){
+      state.versionGraphPanMoved=false;
+      return
+    }
+    host._versionGraphPointer={clientX:event.clientX,clientY:event.clientY,view:{...state.versionGraphView}};
+    state.versionGraphPanMoved=false;
+    host.classList.add('panning');
+    host.setPointerCapture?.(event.pointerId)
+  };
+  host.onpointermove=event=>{
+    const pointer=host._versionGraphPointer;
+    if(!pointer)return;
+    const svg=host.querySelector('svg'), metrics=svg?versionGraphMetrics(svg):null, scale=metrics?.scale||1, dx=(event.clientX-pointer.clientX)/scale, dy=(event.clientY-pointer.clientY)/scale;
+    if(Math.abs(event.clientX-pointer.clientX)>3||Math.abs(event.clientY-pointer.clientY)>3)state.versionGraphPanMoved=true;
+    setVersionGraphView({x:pointer.view.x-dx,y:pointer.view.y-dy,width:pointer.view.width,height:pointer.view.height})
+  };
+  const endPointer=event=>{
+    if(host._versionGraphPointer){host.releasePointerCapture?.(event.pointerId);host._versionGraphPointer=null}
+    host.classList.remove('panning')
+  };
+  host.onpointerup=endPointer; host.onpointercancel=endPointer; host.oncontextmenu=event=>event.preventDefault()
 }
 function renderVersionCommitGraph(data){
-  const host=$('#version-commit-graph'), detail=$('#version-commit-detail'), commits=data?.commits||[];
+  const host=$('#version-commit-graph'), detail=$('#version-commit-detail'), commits=data?.commits||[], branchItems=data?.branches||[];
   host.innerHTML='';
   if(!commits.length){
+    state.versionGraphView=null;
+    state.versionGraphFull=null;
     host.innerHTML='<div class="version-empty">No commits are available yet.</div>';
     detail.textContent='Create a commit to populate the graph.';
     return
   }
   if(!state.selectedVersionCommit||!commits.some(item=>item.hash===state.selectedVersionCommit))state.selectedVersionCommit=commits[0].hash;
-  const chronological=[...commits].reverse(), known=new Set(commits.map(item=>item.hash)), children=new Map(), laneByHash=new Map(), coordinates=new Map();
+  const chronological=[...commits].reverse(), known=new Set(commits.map(item=>item.hash)), commitByHash=new Map(commits.map(item=>[item.hash,item])), children=new Map(), laneByHash=new Map(), coordinates=new Map();
+  const findCommit=reference=>commits.find(item=>item.hash===reference||item.short_hash===reference||item.hash.startsWith(reference||''));
   chronological.forEach(commit=>commit.parents.filter(parent=>known.has(parent)).forEach(parent=>{
     if(!children.has(parent))children.set(parent,[]);
     children.get(parent).push(commit.hash)
@@ -849,89 +1095,142 @@ function renderVersionCommitGraph(data){
   chronological.forEach((commit,index)=>{
     const lane=laneByHash.has(commit.hash)?laneByHash.get(commit.hash):nextLane++;
     laneByHash.set(commit.hash,lane);
-    coordinates.set(commit.hash,{x:42+index*88,y:42+lane*58,lane});
-    (children.get(commit.hash)||[]).forEach((child,index)=>{
-      if(!laneByHash.has(child))laneByHash.set(child,index===0?lane:nextLane++)
+    coordinates.set(commit.hash,{x:54+index*96,y:48+lane*58,lane});
+    (children.get(commit.hash)||[]).forEach((child,childIndex)=>{
+      if(!laneByHash.has(child))laneByHash.set(child,childIndex===0?lane:nextLane++)
     })
   });
-  const maxLane=Math.max(0,...[...coordinates.values()].map(item=>item.lane)), width=Math.max(690,chronological.length*88+82), height=Math.max(128,(maxLane+1)*58+76), svgNs='http://www.w3.org/2000/svg';
-  const svg=document.createElementNS(svgNs,'svg'); svg.classList.add('version-commit-svg'); svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.setAttribute('role','img'); svg.setAttribute('aria-label','Interactive repository commit graph');
+  const branchHistories=new Map(branchItems.map(item=>[item.name,branchCommitHistory(findCommit(item.head)?.hash,commitByHash)]));
+  const selectedNames=new Set((state.selectedVersionBranches?.length?state.selectedVersionBranches:[state.selectedVersionBranch]).filter(Boolean));
+  const selectedHashes=new Set();
+  selectedNames.forEach(name=>(branchHistories.get(name)||new Set()).forEach(hash=>selectedHashes.add(hash)));
+  const branchColorByName=new Map(branchItems.map((item,index)=>[item.name,versionBranchColor(item,index,branchItems)]));
+  const worktreeByBranch=new Map((data.worktrees||[]).filter(item=>item.branch).map(item=>[item.branch,item]));
+  const maxLane=Math.max(0,...[...coordinates.values()].map(item=>item.lane));
+  const timelineWidth=Math.max(760,chronological.length*96+80), labelX=timelineWidth+28, labelWidth=250, width=labelX+labelWidth+34;
+  const height=Math.max(300,(maxLane+1)*58+92,branchItems.length*52+66), svgNs='http://www.w3.org/2000/svg';
+  const initialCommitCount=Math.min(5,chronological.length), initialStart=Math.max(0,chronological.length-initialCommitCount), initialPoint=coordinates.get(chronological[initialStart].hash), initialX=Math.max(0,(initialPoint?.x||0)-72), initialWidth=Math.min(width,Math.max(520,width-initialX)), previousFull=state.versionGraphFull, preserveView=Boolean(state.versionGraphView&&previousFull?.width===width&&previousFull?.height===height), full={width,height,initialWidth,initialHeight:height,initialCommitCount,initial:{x:initialX,y:0,width:initialWidth,height}};
+  state.versionGraphFull=full;
+  if(!preserveView)state.versionGraphView=full.initial;
+  const svg=document.createElementNS(svgNs,'svg'); svg.classList.add('version-commit-svg'); svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.setAttribute('preserveAspectRatio','xMidYMid meet'); svg.setAttribute('role','img'); svg.setAttribute('aria-label','Interactive repository commit graph with branch and worktree labels');
   chronological.forEach(commit=>{
     const child=coordinates.get(commit.hash);
     commit.parents.filter(parent=>coordinates.has(parent)).forEach(parent=>{
-      const source=coordinates.get(parent), path=document.createElementNS(svgNs,'path');
-      path.setAttribute('class',`version-commit-edge lane-${child.lane%6}`);
-      path.setAttribute('d',`M ${source.x} ${source.y} C ${source.x+32} ${source.y}, ${child.x-32} ${child.y}, ${child.x} ${child.y}`);
+      const source=coordinates.get(parent), path=document.createElementNS(svgNs,'path'), selected=selectedHashes.has(parent)&&selectedHashes.has(commit.hash), selectedBranchName=[...selectedNames].find(name=>branchHistories.get(name)?.has(parent)&&branchHistories.get(name)?.has(commit.hash));
+      path.setAttribute('class',`version-commit-edge lane-${child.lane%6}${selected?' selected':''}`);
+      if(selectedBranchName)path.style.stroke=branchColorByName.get(selectedBranchName);
+      path.setAttribute('d',`M ${source.x} ${source.y} C ${source.x+34} ${source.y}, ${child.x-34} ${child.y}, ${child.x} ${child.y}`);
       svg.append(path)
     })
   });
   chronological.forEach(commit=>{
-    const point=coordinates.get(commit.hash), group=document.createElementNS(svgNs,'g'), outer=document.createElementNS(svgNs,'circle'), title=document.createElementNS(svgNs,'title');
-    group.setAttribute('class','version-commit-node'); group.setAttribute('tabindex','0'); group.setAttribute('role','button'); group.setAttribute('aria-label',`${commit.short_hash}: ${commit.subject||'commit'}`);
-    outer.setAttribute('cx',String(point.x)); outer.setAttribute('cy',String(point.y)); outer.setAttribute('r','9'); outer.setAttribute('class',`lane-${point.lane%6}${commit.agent_commit?' agent':''}`);
-    title.textContent=`${commit.short_hash} ${commit.subject||''}`; group.append(outer,title);
+    const point=coordinates.get(commit.hash), selectedBranchName=[...selectedNames].find(name=>branchHistories.get(name)?.has(commit.hash)), selectedBranch=selectedHashes.has(commit.hash), group=document.createElementNS(svgNs,'g'), hit=document.createElementNS(svgNs,'circle'), outer=document.createElementNS(svgNs,'circle'), title=document.createElementNS(svgNs,'title');
+    group.setAttribute('class',`version-commit-node${selectedBranch?' selected-branch':''}`); group.setAttribute('tabindex','0'); group.setAttribute('role','button'); group.setAttribute('aria-label',`${commit.short_hash}: ${commit.subject||'commit'}`);
+    hit.setAttribute('cx',String(point.x)); hit.setAttribute('cy',String(point.y)); hit.setAttribute('r','19'); hit.setAttribute('class','version-commit-hit');
+    outer.setAttribute('cx',String(point.x)); outer.setAttribute('cy',String(point.y)); outer.setAttribute('r','9'); outer.setAttribute('class',`version-commit-outer lane-${point.lane%6}${commit.agent_commit?' agent':''}`);
+    if(selectedBranchName){outer.style.stroke=branchColorByName.get(selectedBranchName);outer.style.strokeWidth='4'}
+    title.textContent=`${commit.short_hash} ${commit.subject||''}`; group.append(hit,outer,title);
     if(commit.hash===state.selectedVersionCommit){
       const inner=document.createElementNS(svgNs,'circle'); inner.setAttribute('cx',String(point.x)); inner.setAttribute('cy',String(point.y)); inner.setAttribute('r','3.5'); inner.setAttribute('class','version-commit-selected-dot'); group.append(inner)
     }
-    group.onclick=()=>selectVersionCommit(commit.hash); group.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectVersionCommit(commit.hash)}}; svg.append(group)
+    group.onclick=()=>{if(state.versionGraphPanMoved){state.versionGraphPanMoved=false;return}selectVersionCommit(commit.hash)}; group.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectVersionCommit(commit.hash)}}; svg.append(group)
+  });
+  branchItems.forEach((item,index)=>{
+    const head=findCommit(item.head), point=head&&coordinates.get(head.hash), rowY=38+index*52, selected=selectedNames.has(item.name), color=versionBranchColor(item,index,branchItems), worktree=worktreeByBranch.get(item.name), group=document.createElementNS(svgNs,'g'), connector=document.createElementNS(svgNs,'path'), rect=document.createElementNS(svgNs,'rect'), name=document.createElementNS(svgNs,'text'), meta=document.createElementNS(svgNs,'text'), title=document.createElementNS(svgNs,'title');
+    connector.setAttribute('class',`version-commit-branch-edge${selected?' selected':''}`); connector.style.stroke=color; connector.style.strokeWidth=selected?'4':'2'; connector.setAttribute('d',`M ${point?.x||timelineWidth-18} ${point?.y||rowY} C ${timelineWidth-12} ${point?.y||rowY}, ${labelX-28} ${rowY}, ${labelX} ${rowY}`); svg.append(connector);
+    group.setAttribute('class',`version-commit-branch-label${item.main?' main':''}${item.current?' current':''}${selected?' selected':''}`); group.setAttribute('tabindex','0'); group.setAttribute('role','button'); group.setAttribute('aria-label',`Select branch ${item.name}`);
+    rect.setAttribute('x',String(labelX)); rect.setAttribute('y',String(rowY-19)); rect.setAttribute('width',String(labelWidth)); rect.setAttribute('height','38'); rect.setAttribute('rx','9'); rect.style.stroke=color; rect.style.strokeWidth=selected?'3':'1.5'; if(item.main)rect.style.fill=color;
+    name.setAttribute('x',String(labelX+12)); name.setAttribute('y',String(rowY-2)); name.setAttribute('class','version-commit-branch-name'); name.textContent=item.name;
+    const worktreeLabel=worktree?(worktree.primary?'⌂ project folder':`⌂ ${(worktree.path||'worktree').split(/[\\/]/).pop()}`):item.current?'checked out':item.main?'main branch':'local branch';
+    meta.setAttribute('x',String(labelX+12)); meta.setAttribute('y',String(rowY+13)); meta.setAttribute('class','version-commit-branch-meta'); meta.textContent=worktreeLabel;
+    title.textContent=`${item.name}${worktree?.path?` · ${worktree.path}`:''}`; group.append(rect,name,meta,title); group.onclick=event=>{if(state.versionGraphPanMoved){state.versionGraphPanMoved=false;return}selectVersionBranch(item.name,event.metaKey||event.ctrlKey||event.shiftKey)}; group.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectVersionBranch(item.name,event.metaKey||event.ctrlKey||event.shiftKey)}}; svg.append(group)
   });
   host.append(svg);
+  setVersionGraphView(state.versionGraphView);
+  bindVersionGraphInteractions();
   const selected=commits.find(item=>item.hash===state.selectedVersionCommit);
   if(selected){
-    const parentText=selected.parents.length?selected.parents.map(parent=>parent.slice(0,12)).join(', '):'none (root commit)';
-    detail.textContent=`${selected.short_hash} · parents: ${parentText}${selected.decorations?` · ${selected.decorations}`:''}${data.commits_truncated?' · showing the latest 1,000 commits.':''}`
+    const parentText=selected.parents.length?selected.parents.map(parent=>parent.slice(0,12)).join(', '):'none (root commit)', branchText=selectedNames.size?` · highlighted: ${[...selectedNames].join(', ')}`:'';
+    detail.textContent=`${selected.short_hash} · parents: ${parentText}${selected.decorations?` · ${selected.decorations}`:''}${branchText}${data.commits_truncated?' · showing the latest 1,000 commits.':''}`
   }
 }
-function renderVersionControl(data){
-  const status=$('#version-control-status'), topology=$('#worktree-topology'), branches=$('#version-branch-list'), agents=$('#version-agent-list'), source=$('#version-branch-source');
-  if(!data?.is_repository){
-    status.textContent='This project folder is not a Git repository. Configure Git to initialize it or add a remote.';
-    topology.innerHTML='<div class="version-empty">No repository topology is available.</div>';
-    branches.innerHTML=''; agents.innerHTML=''; source.innerHTML=''; return
-  }
-  const current=data.current_branch||'(detached HEAD)', main=data.main_branch||'';
-  status.textContent=current===main
-    ? `On main branch “${main}” · ${data.clean?'working tree clean':'uncommitted changes'}`
-    : `On branch “${current}”${main?` · main branch “${main}”`:''} · ${data.clean?'working tree clean':'uncommitted changes'}`;
-  const branchItems=data.branches||[];
-  if(!state.selectedVersionBranch||!branchItems.some(item=>item.name===state.selectedVersionBranch))state.selectedVersionBranch=data.current_branch||data.main_branch||branchItems[0]?.name||'';
-  topology.innerHTML='';
-  const diagram=document.createElement('div'); diagram.className='worktree-diagram';
-  const worktreeColumn=document.createElement('div'); worktreeColumn.className='worktree-column';
-  (data.worktrees||[]).forEach(item=>{
-    const card=document.createElement('button'); card.type='button'; card.className=`worktree-card${item.primary?' primary':''}`;
-    const title=document.createElement('strong'), meta=document.createElement('small');
-    title.textContent=item.branch||'(detached HEAD)'; meta.textContent=item.path||'Unknown worktree';
-    card.append(title,meta); card.onclick=()=>item.branch&&selectVersionBranch(item.branch); worktreeColumn.append(card)
+function renderBranchTopology(data, branchItems){
+  const graph=document.createElement('div'); graph.className='branch-topology-graph';
+  if(!branchItems.length){graph.innerHTML='<div class="version-empty">No branches are available.</div>';return graph}
+  const svgNs='http://www.w3.org/2000/svg';
+  const svgElement=(name,attributes={})=>{
+    const element=document.createElementNS(svgNs,name);
+    Object.entries(attributes).forEach(([key,value])=>element.setAttribute(key,String(value)));
+    return element
+  };
+  const commits=data.commits||[], commitByHash=new Map(commits.map(commit=>[commit.hash,commit]));
+  const findCommit=reference=>commits.find(commit=>commit.hash===reference||commit.short_hash===reference||commit.hash.startsWith(reference||''));
+  const firstParentPath=start=>{
+    const path=[], seen=new Set(); let current=start;
+    while(current&&!seen.has(current.hash)){
+      seen.add(current.hash); path.push(current.hash);
+      current=commitByHash.get(current.parents?.[0]);
+    }
+    return path
+  };
+  const mainItem=branchItems.find(item=>item.name===data.main_branch)||branchItems.find(item=>item.main)||branchItems[0];
+  const mainHead=findCommit(mainItem?.head)||commits[0];
+  const mainPath=firstParentPath(mainHead), mainSet=new Set(mainPath), chronological=[...mainPath].reverse();
+  const mainLabelWidth=Math.max(78,(mainItem?.name||'main').length*7+24), mainStartX=18+mainLabelWidth+20;
+  const mainX=new Map(chronological.map((hash,index)=>[hash,mainStartX+index*72]));
+  const sideBranches=branchItems.filter(item=>item.name!==mainItem?.name);
+  const topCount=Math.ceil(sideBranches.length/2), bottomCount=Math.floor(sideBranches.length/2), mainY=50+topCount*50;
+  const branchRows=sideBranches.map((item,index)=>{
+    const head=findCommit(item.head), path=firstParentPath(head), commonIndex=path.findIndex(hash=>mainSet.has(hash));
+    const commonHash=commonIndex>=0?path[commonIndex]:mainPath[mainPath.length-1];
+    const baseX=mainX.get(commonHash)||mainStartX, uniqueCount=commonIndex>=0?commonIndex:path.length;
+    const labelWidth=Math.max(78,item.name.length*7+24), targetX=baseX+Math.max(112,uniqueCount*52+labelWidth+20);
+    const side=index%2===0?-1:1, lane=Math.floor(index/2)+1;
+    return {item,baseX,targetX,labelWidth,uniqueCount,side,lane,y:mainY+side*lane*50}
   });
-  const branchColumn=document.createElement('div'); branchColumn.className='branch-topology-column';
-  branchItems.forEach(item=>{
-    const node=document.createElement('button'); node.type='button'; node.className=`branch-topology-node${item.main?' main':''}${item.current?' current':''}${item.name===state.selectedVersionBranch?' selected':''}`;
-    node.textContent=item.name; node.title=item.upstream?`${item.name} tracks ${item.upstream}`:item.name;
-    node.onclick=()=>selectVersionBranch(item.name); branchColumn.append(node)
+  const mainEnd=Math.max(mainStartX+(chronological.length-1)*72,mainStartX), maxX=Math.max(mainEnd+130,...branchRows.map(row=>row.targetX+row.labelWidth+20),540);
+  const height=Math.max(140,mainY+bottomCount*50+62), svg=svgElement('svg',{class:'branch-topology-svg',viewBox:`0 0 ${maxX} ${height}`,role:'img','aria-label':'Repository branch topology'});
+  const trunk=svgElement('path',{class:'branch-topology-trunk',d:`M ${mainStartX} ${mainY} H ${mainEnd}`}); svg.append(trunk);
+  chronological.forEach(hash=>{
+    const point=svgElement('circle',{class:'branch-topology-commit',cx:mainX.get(hash),cy:mainY,r:5});
+    const commit=commitByHash.get(hash);
+    if(commit){const title=svgElement('title'); title.textContent=`${commit.short_hash} ${commit.subject||''}`; point.append(title)}
+    svg.append(point)
   });
-  diagram.append(worktreeColumn,branchColumn); topology.append(diagram);
-  renderVersionCommitGraph(data);
-  branches.innerHTML=''; source.innerHTML='';
-  branchItems.forEach(item=>{
-    const option=document.createElement('option'); option.value=item.name; option.textContent=item.main?`${item.name} (main)`:item.name; option.selected=item.name===(data.main_branch||data.current_branch); source.append(option);
-    const row=document.createElement('article'); row.className=`version-branch-row${item.name===state.selectedVersionBranch?' selected':''}`;
-    const info=document.createElement('button'); info.type='button'; info.className='version-branch-info';
-    const name=document.createElement('strong'), meta=document.createElement('small'); name.textContent=item.name;
-    meta.textContent=`${item.main?'main branch / ':''}${item.current?'checked out / ':''}${item.upstream?`tracks ${item.upstream}`:'local only'} / ${item.head||'no commits'}`;
-    info.append(name,meta); info.onclick=()=>selectVersionBranch(item.name);
-    const actions=document.createElement('div'); actions.className='version-branch-actions';
-    const checkout=document.createElement('button'); checkout.type='button'; checkout.className='secondary compact'; checkout.textContent=item.current?'Checked out':'Checkout'; checkout.disabled=item.current;
-    checkout.onclick=async()=>{try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}/checkout`,{method:'POST'});await loadVersionControl()}catch(err){alert(err.message)}};
-    const agentBranch=(data.agents||[]).some(agent=>agent.enabled&&agent.branch===item.name);
-    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent='Delete'; remove.disabled=item.main||item.current||agentBranch;
-    remove.onclick=async()=>{if(!confirm(`Delete branch '${item.name}'?`))return;try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}`,{method:'DELETE'});await loadVersionControl()}catch(err){alert(err.message)}};
-    actions.append(checkout,remove); row.append(info,actions); branches.append(row)
+  const addBranchLabel=(row)=>{
+    const {item,targetX,labelWidth,y}=row, selected=item.name===state.selectedVersionBranch;
+    const group=svgElement('g',{class:`branch-topology-label-group${item.main?' main':''}${item.current?' current':''}${selected?' selected':''}`,tabindex:'0',role:'button','aria-label':`Select branch ${item.name}`});
+    const rect=svgElement('rect',{class:'branch-topology-label',x:targetX,y:y-16,width:labelWidth,height:32,rx:8});
+    const text=svgElement('text',{class:'branch-topology-label-text',x:targetX+10,y:y+4}); text.textContent=item.name;
+    group.append(rect,text); group.addEventListener('click',()=>selectVersionBranch(item.name)); group.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectVersionBranch(item.name)}});
+    svg.append(group)
+  };
+  const mainLabel={item:mainItem,targetX:12,labelWidth:mainLabelWidth,y:mainY,uniqueCount:0};
+  addBranchLabel(mainLabel);
+  branchRows.forEach(row=>{
+    const {baseX,targetX,y,side,uniqueCount}=row;
+    const edge=svgElement('path',{class:`branch-topology-edge lane-${(side<0?0:1)+Math.floor((row.lane-1)/2)*2}`,d:`M ${baseX} ${mainY} C ${baseX+30} ${mainY}, ${baseX+30} ${y}, ${baseX+62} ${y} H ${targetX}`});
+    edge.setAttribute('stroke-width',String(Math.min(5,2.2+uniqueCount*.35))); svg.insertBefore(edge,svg.firstChild);
+    const commitCount=Math.min(uniqueCount,6);
+    for(let commitIndex=0;commitIndex<commitCount;commitIndex++){
+      const x=baseX+((targetX-baseX)*(commitIndex+1))/(commitCount+1);
+      svg.append(svgElement('circle',{class:`branch-topology-commit lane-${(side<0?0:1)+Math.floor((row.lane-1)/2)*2}`,cx:x,cy:y,r:4}))
+    }
+    addBranchLabel(row)
   });
-  const selected=branchItems.find(item=>item.name===state.selectedVersionBranch);
-  $('#version-branch-detail').textContent=selected?`${selected.name}${selected.main?' is the configured main branch.':selected.current?' is checked out.':' is a local branch.'}`:'Select a branch to inspect it.';
+  graph.append(svg); return graph
+}
+function renderVersionAgentList(data){
+  const agents=$('#version-agent-list');
+  if(!agents)return;
+  const query=String(state.versionAgentSearch||'').trim().toLowerCase();
+  const items=(data?.agents||[]).filter(item=>`${item.name} ${item.role} ${item.branch}`.toLowerCase().includes(query));
   agents.innerHTML='';
-  (data.agents||[]).forEach(item=>{
+  if(!items.length){
+    agents.innerHTML='<div class="version-empty">No matching agents.</div>';
+    return
+  }
+  items.forEach(item=>{
     const card=document.createElement('article'); card.className='version-agent-card';
     const copy=document.createElement('div'), title=document.createElement('strong'), meta=document.createElement('small'), actions=document.createElement('div');
     title.textContent=item.name; meta.textContent=`${item.enabled?'Git enabled':'Git disabled'} / ${item.branch}${item.branch_exists?item.merged_into_main?' / merged into main':' / unmerged':''}`;
@@ -943,9 +1242,58 @@ function renderVersionControl(data){
     actions.append(toggle,changes); card.append(copy,actions); agents.append(card)
   })
 }
+function renderVersionControl(data){
+  const status=$('#version-control-status'), graph=$('#version-commit-graph'), branches=$('#version-branch-list'), source=$('#version-branch-source');
+  if(!data?.is_repository){
+    status.textContent='This project folder is not a Git repository. Configure Git to initialize it or add a remote.';
+    graph.innerHTML='<div class="version-empty">No repository graph is available.</div>';
+    branches.innerHTML=''; source.innerHTML=''; renderVersionCommitInspector(); renderVersionAgentList(data); return
+  }
+  const current=data.current_branch||'(detached HEAD)', main=data.main_branch||'';
+  status.textContent=current===main
+    ? `On main branch “${main}” · ${data.clean?'working tree clean':'uncommitted changes'}`
+    : `On branch “${current}”${main?` · main branch “${main}”`:''} · ${data.clean?'working tree clean':'uncommitted changes'}`;
+  const branchItems=data.branches||[];
+  const validSelected=(state.selectedVersionBranches||[]).filter(name=>branchItems.some(item=>item.name===name));
+  if(!validSelected.length){
+    const fallback=data.current_branch||data.main_branch||branchItems[0]?.name||'';
+    if(fallback)validSelected.push(fallback)
+  }
+  state.selectedVersionBranches=validSelected;
+  state.selectedVersionBranch=validSelected[validSelected.length-1]||'';
+  renderVersionCommitGraph(data);
+  renderVersionCommitInspector();
+  if(state.selectedVersionCommit&&state.selectedVersionCommitDetail?.hash!==state.selectedVersionCommit){
+    loadVersionCommitDetails(state.selectedVersionCommit).catch(err=>{
+      state.versionCommitDiffLoading=false;
+      state.versionCommitActionStatus=`Could not load commit details: ${err.message}`;
+      renderVersionCommitInspector()
+    })
+  }
+  branches.innerHTML=''; source.innerHTML='';
+  const selectedNames=new Set(state.selectedVersionBranches), worktreeByBranch=new Map((data.worktrees||[]).filter(item=>item.branch).map(item=>[item.branch,item]));
+  branchItems.forEach((item,index)=>{
+    const option=document.createElement('option'); option.value=item.name; option.textContent=item.main?`${item.name} (main)`:item.name; option.selected=item.name===(data.main_branch||data.current_branch); source.append(option);
+    const color=versionBranchColor(item,index,branchItems), row=document.createElement('article'); row.className=`version-branch-row${selectedNames.has(item.name)?' selected':''}`; row.style.setProperty('--version-branch-color',color);
+    const info=document.createElement('button'); info.type='button'; info.className='version-branch-info'; info.setAttribute('aria-pressed',String(selectedNames.has(item.name))); info.title='Select this branch. Hold Command or Control to highlight multiple branches.';
+    const name=document.createElement('strong'), meta=document.createElement('small'); name.textContent=item.name;
+    const worktree=worktreeByBranch.get(item.name), worktreeText=worktree?`worktree: ${worktree.primary?'project folder':worktree.path}`:'';
+    meta.textContent=[item.main?'main branch': '',item.current?'checked out':'',item.upstream?`tracks ${item.upstream}`:'local only',item.head||'no commits',worktreeText].filter(Boolean).join(' / ');
+    info.append(name,meta); info.onclick=event=>selectVersionBranch(item.name,event.metaKey||event.ctrlKey||event.shiftKey);
+    const actions=document.createElement('div'); actions.className='version-branch-actions';
+    const checkout=document.createElement('button'); checkout.type='button'; checkout.className='secondary compact'; checkout.textContent=item.current?'Checked out':'Checkout'; checkout.disabled=item.current;
+    checkout.onclick=async()=>{try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}/checkout`,{method:'POST'});await loadVersionControl()}catch(err){alert(err.message)}};
+    const agentBranch=(data.agents||[]).some(agent=>agent.enabled&&agent.branch===item.name);
+    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent='Delete'; remove.disabled=item.main||item.current||agentBranch;
+    remove.onclick=async()=>{if(!confirm(`Delete branch '${item.name}'?`))return;try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}`,{method:'DELETE'});await loadVersionControl()}catch(err){alert(err.message)}};
+    actions.append(checkout,remove); row.append(info,actions); branches.append(row)
+  });
+  const selected=branchItems.filter(item=>selectedNames.has(item.name));
+  $('#version-branch-detail').textContent=selected.length?`${selected.map(item=>item.name).join(', ')} highlighted · ${selected.length===1?(selected[0].main?'configured main branch':selected[0].current?'checked out':'local branch'):'multiple branches selected'}`:'Select a branch to inspect it.';
+  renderVersionAgentList(data)
+}
 async function openVersionControl(){
-  await loadVersionControl();
-  if(!$('#version-control-dialog').open)$('#version-control-dialog').showModal()
+  return showVersionControl()
 }
 function renderMarketplace(){
   const list=$('#marketplace-results');
@@ -1084,6 +1432,17 @@ async function selectProject(id){
   const project=state.projects.find(p=>p.id===id);
   if(!project)return;
   state.project=project;
+  state.selectedVersionCommitDetail=null;
+  state.selectedVersionDiffPath='';
+  state.selectedVersionDiff='';
+  state.versionCommitDiffLoading=false;
+  state.versionCommitActionBusy=false;
+  state.versionCommitActionStatus='';
+  state.versionCommitTargetBranch='';
+  state.versionCommitDetailRequest++;
+  state.versionCommitDiffRequest++;
+  state.versionGraphView=null;
+  state.versionGraphFull=null;
   state.messages={};
   state.pendingAttachments={};
   state.replyTo={};
@@ -3461,7 +3820,38 @@ $('#add-agent-dashboard').onclick=openAgentDialog;
 $('#close-agent').onclick=()=>$('#agent-dialog').close();
 $('#workflow-button').onclick=()=>openWorkflowDialog().catch(err=>alert(err.message));
 $('#close-workflow').onclick=()=>$('#workflow-dialog').close();
-$('#permissions-button').onclick=()=>openPermissionsDialog().catch(err=>alert(err.message));
+function filterSettingsMenu(value=''){
+  const query=String(value).trim().toLowerCase(), sections=[...document.querySelectorAll('#settings-menu-panel [data-settings-section]')];
+  let visible=0;
+  sections.forEach(section=>{
+    const matches=!query||section.dataset.settingsSearch.includes(query);
+    section.classList.toggle('hidden',!matches);
+    if(matches)visible++
+  });
+  $('#settings-menu-empty')?.classList.toggle('hidden',visible>0)
+}
+function setSettingsMenuOpen(open){
+  const panel=$('#settings-menu-panel'), trigger=$('#settings-button');
+  if(!panel||!trigger)return;
+  panel.classList.toggle('hidden',!open);
+  trigger.setAttribute('aria-expanded',String(open));
+  if(open){
+    filterSettingsMenu($('#settings-search')?.value||'');
+    requestAnimationFrame(()=>$('#settings-search')?.focus())
+  }else{
+    const search=$('#settings-search');
+    if(search){search.value='';filterSettingsMenu('')}
+  }
+}
+$('#settings-button').onclick=()=>{
+  const panel=$('#settings-menu-panel');
+  setSettingsMenuOpen(panel?.classList.contains('hidden'))
+};
+$('#settings-search').oninput=event=>filterSettingsMenu(event.currentTarget.value);
+$('#permissions-button').onclick=()=>{
+  setSettingsMenuOpen(false);
+  openPermissionsDialog().catch(err=>alert(err.message))
+};
 $('#close-permissions').onclick=()=>$('#permissions-dialog').close();
 $('#memory-button').onclick=()=>openWorkflowMemories().catch(err=>alert(err.message));
 $('#close-memory').onclick=()=>$('#memory-dialog').close();
@@ -3573,8 +3963,20 @@ $('#external-access-button').onclick=async()=>{
   }
   catch(err){alert(err.message)}
 };
-$('#theme-toggle').onclick=()=>applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+$('#theme-toggle').onclick=()=>{
+  applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+  setSettingsMenuOpen(false)
+};
+document.addEventListener('pointerdown',event=>{
+  const menu=$('#settings-menu');
+  if(menu&&!menu.contains(event.target))setSettingsMenuOpen(false)
+});
 document.addEventListener('keydown', event=>{
+  if(event.key==='Escape'&&!$('#settings-menu-panel')?.classList.contains('hidden')){
+    setSettingsMenuOpen(false);
+    $('#settings-button')?.focus();
+    return
+  }
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){
     event.preventDefault();
     $('#agent-search')?.focus()
@@ -3665,8 +4067,6 @@ $('#close-dialog').onclick=()=>$('#context-dialog').close();
 $('#close-code-terminal').onclick=()=>$('#code-terminal-dialog').close();
 $('#tools-button').onclick=()=>openToolsDialog().catch(err=>alert(err.message));
 $('#close-tools').onclick=()=>$('#tools-dialog').close();
-$('#version-control-button').onclick=()=>openVersionControl().catch(err=>alert(err.message));
-$('#close-version-control').onclick=()=>$('#version-control-dialog').close();
 $('#version-control-configure').onclick=async()=>{
   try{
     state.pendingGitAgent=null;
@@ -3675,6 +4075,26 @@ $('#version-control-configure').onclick=async()=>{
   }
   catch(err){alert(err.message)}
 };
+$('#version-graph-zoom-out').onclick=()=>zoomVersionGraph(1.15);
+$('#version-graph-zoom-in').onclick=()=>zoomVersionGraph(0.87);
+$('#version-graph-reset').onclick=resetVersionGraphView;
+$('#version-commit-target-branch').onchange=event=>{state.versionCommitTargetBranch=event.target.value};
+$('#version-rebase-commit').onclick=()=>runVersionCommitAction('rebase');
+$('#version-merge-commit').onclick=()=>runVersionCommitAction('merge');
+$('#version-merge-all-branches').onclick=()=>runVersionCommitAction('merge-all');
+$('#version-revert-commit').onclick=()=>runVersionCommitAction('revert');
+$('#version-control-agent-git-button').onclick=()=>{
+  const panel=$('#version-agent-git-submenu'), button=$('#version-control-agent-git-button'), open=panel.classList.contains('hidden');
+  panel.classList.toggle('hidden',!open); panel.setAttribute('aria-hidden',String(!open)); button.setAttribute('aria-expanded',String(open));
+  if(open){$('#version-agent-search').focus();panel.scrollIntoView({behavior:'smooth',block:'start'})}
+};
+$('#close-version-agent-git').onclick=()=>{
+  $('#version-agent-git-submenu').classList.add('hidden');
+  $('#version-agent-git-submenu').setAttribute('aria-hidden','true');
+  $('#version-control-agent-git-button').setAttribute('aria-expanded','false');
+  $('#version-control-agent-git-button').focus()
+};
+$('#version-agent-search').oninput=event=>{state.versionAgentSearch=event.target.value;renderVersionAgentList(state.gitOverview)};
 $('#git-changes-button').onclick=()=>openGitChanges().catch(err=>alert(err.message));
 $('#close-git-changes').onclick=()=>$('#git-changes-dialog').close();
 $('#configure-git').onclick=async()=>{
@@ -3713,7 +4133,7 @@ $('#git-setup-form').onsubmit=async e=>{
     });
     if(pending)await createAgent(pending);
     else if(pendingEnable)await saveExistingAgentGitEnabled(pendingEnable, true);
-    if($('#version-control-dialog').open)await loadVersionControl()
+    if(!$('#version-control').classList.contains('hidden'))await loadVersionControl()
     $('#git-setup-dialog').close();
     state.pendingGitAgent=null;
     state.pendingGitEnableAgent=null
@@ -3977,6 +4397,7 @@ async function refreshProviders(){
   renderFlowchart()
 }
 $('#connections-button').onclick=async()=>{
+  setSettingsMenuOpen(false);
   $('#connections-dialog').showModal();
   await loadConnections()
 };

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from team import AgentTeam
-from toolsets import ToolsetStore, resolve_tool_calls
+from toolsets import ToolsetStore, resolve_command_markers, resolve_tool_calls
 
 
 def echo_toolset() -> dict:
@@ -57,7 +57,31 @@ def test_team_prompt_uses_striated_toolset_discovery(tmp_path):
     assert "You have access to the following tools" in instructions
     assert ".agents/tools/local-helpers/TOOLSET.md" in instructions
     assert "TOOLCALL - <toolset>/<tool name> - [arguments]." in instructions
+    assert "COMMAND - <text of command>" in instructions
     assert "Returns each positional argument as JSON." not in instructions
+
+
+def test_command_marker_executes_on_the_host_from_the_project_root(tmp_path):
+    text, calls, pending = asyncio.run(resolve_command_markers(
+        "Before\nCOMMAND - echo local-command\nAfter", tmp_path,
+    ))
+
+    assert pending == []
+    assert calls[0]["ok"] is True
+    assert calls[0]["cwd"] == str(tmp_path.resolve())
+    assert "local-command" in text
+    assert "COMMAND -" not in text
+
+
+def test_command_marker_is_returned_for_ui_approval_without_permission(tmp_path):
+    text, calls, pending = asyncio.run(resolve_command_markers(
+        "Before\nCOMMAND - echo local-command\nAfter", tmp_path, allow_execution=False,
+    ))
+
+    assert calls == []
+    assert pending == ["echo local-command"]
+    assert "COMMAND -" not in text
+    assert text == "Before\n\nAfter"
 
 
 def test_toolcall_executes_and_replaces_marker_with_formatted_result(tmp_path):
