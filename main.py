@@ -43,7 +43,7 @@ def bind_available_port(host: str = "127.0.0.1", start_port: int = 8000) -> tupl
         return listener, port
     raise OSError(f"No available TCP port found from {start_port} through 65535")
 
-from shared_context import ContextStore, ROLES  # noqa: E402
+from graph_context import GraphContextError, GraphContextStore, ROLES  # noqa: E402
 from team import AgentTeam, ROLE_BRIEFS, project_python_executable  # noqa: E402
 from mcp_server import mcp as workspace_mcp  # noqa: E402
 from credentials import LocalCredentialStore  # noqa: E402
@@ -52,7 +52,7 @@ from github_status import GitReportError, collect_git_report, format_git_report 
 from skills import normalize_skill_secret_refs, run_skill_script_async, skill_secret_names  # noqa: E402
 from git_workflow import GitWorkflowError  # noqa: E402
 
-store = ContextStore(ROOT / "data" / "workspace.db")
+graph_store = GraphContextStore(ROOT / "data" / "workspace.db")
 team = AgentTeam(ROOT)
 credentials = LocalCredentialStore(ROOT / ".env.local")
 skill_credentials = LocalCredentialStore(ROOT / "data" / ".skill-secrets.local")
@@ -61,6 +61,11 @@ chat_tasks: set[asyncio.Task] = set()
 git_run_locks: dict[int, asyncio.Lock] = {}
 agent_dispatch_task: asyncio.Task | None = None
 workspace_mcp_http_app = workspace_mcp.streamable_http_app()
+
+
+def graph_project_root(project: dict[str, Any]) -> Path:
+    """Resolve only the configured project root, never an arbitrary request path."""
+    return GraphContextStore.resolve_project_root(project.get("root_path") or ROOT)
 AUTOMATIC_AGENT_PROMPT = (
     "Process the queued team messages now. Follow each command, use reports as context, "
     "and send a concise report to the requesting agent when the work is complete."
@@ -140,10 +145,22 @@ class AgentMessageInput(BaseModel):
     project_id: int = 1
 
 
-class ContextInput(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-    content: str = Field(min_length=1, max_length=100_000)
-    roles: list[str] = Field(default_factory=list)
+class GraphMetadataInput(BaseModel):
+    keywords: list[str] | None = Field(default=None, max_length=12)
+    vector: list[float] | None = Field(default=None, min_length=GraphContextStore.VECTOR_DIMENSIONS,
+                                       max_length=GraphContextStore.VECTOR_DIMENSIONS)
+    source: str = Field(default="manual", max_length=40)
+    model: str = Field(default="", max_length=160)
+    project_id: int = 1
+
+
+class GraphScanInput(BaseModel):
+    project_id: int = 1
+    max_files: int = Field(default=GraphContextStore.MAX_FILES, ge=1, le=GraphContextStore.MAX_FILES)
+
+
+class GraphGenerateInput(BaseModel):
+    path: str = Field(default="", max_length=2000)
     project_id: int = 1
 
 
@@ -1898,41 +1915,112 @@ async def app_message(role: str, payload: AppMessageInput):
         raise HTTPException(404, str(exc)) from exc
 
 
-@app.get("/api/context")
-async def list_context(project_id: int = 1):
+@app.get("/api/graph-context")
+async def list_graph_context(project_id: int = 1, path: str | None = None):
+    try:
+        projects.get(project_id)
+        return graph_store.list(project_id, path)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GraphContextError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/graph-context/scan")
+async def scan_graph_context(payload: GraphScanInput):
+    try:
+        project = projects.get(payload.project_id)
+        result = await asyncio.to_thread(
+            graph_store.scan, graph_project_root(project), payload.project_id, payload.max_files,
+        )
+        result["items"] = graph_store.list(payload.project_id)
+        return result
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GraphContextError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/graph-context/generate")
+async def generate_graph_context(payload: GraphGenerateInput):
+    try:
+        project = projects.get(payload.project_id)
+        root = graph_project_root(project)
+        selected_path = graph_store.normalize_path(payload.path)
+        if selected_path:
+            selected = graph_store.get_by_path(selected_path, payload.project_id)
+            if selected is None:
+                raise HTTPException(404, "Graph node not found")
+            nodes = (
+                [selected] if selected["node_type"] == "file"
+                else graph_store.list(payload.project_id, selected_path)
+            )
+        else:
+            nodes = graph_store.list(payload.project_id)
+        if not nodes:
+            raise HTTPException(409, "Scan the project before generating graph metadata")
+
+        # A bounded batch keeps a whole-project request from overwhelming the
+        # configured provider or blocking the event loop on filesystem reads.
+        max_nodes = 100
+        truncated = len(nodes) > max_nodes
+        nodes = nodes[:max_nodes]
+        semaphore = asyncio.Semaphore(4)
+
+        async def generate_node(node: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    text = await asyncio.to_thread(graph_store.content_for_node, root, node)
+                except GraphContextError as exc:
+                    return {"id": node["id"], "path": node["path"], "status": "skipped", "detail": str(exc)}
+                metadata = await team.generate_graph_metadata(text, node["path"] or ".", payload.project_id)
+                saved = graph_store.apply_generated_metadata(
+                    node["id"], payload.project_id, node["content_hash"], metadata,
+                )
+                return {
+                    "id": node["id"], "path": node["path"],
+                    "status": "generated" if saved else "stale",
+                    "source": (saved or node).get("source", metadata.get("source", "")),
+                }
+
+        results = await asyncio.gather(*(generate_node(node) for node in nodes))
+        return {
+            "items": graph_store.list(payload.project_id),
+            "results": results,
+            "generated": sum(item["status"] == "generated" for item in results),
+            "truncated": truncated,
+        }
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GraphContextError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/graph-context/{node_id}")
+async def update_graph_context(node_id: str, payload: GraphMetadataInput):
+    try:
+        projects.get(payload.project_id)
+        saved = graph_store.update_metadata(
+            node_id, payload.project_id, keywords=payload.keywords, vector=payload.vector,
+            source=payload.source, model=payload.model,
+        )
+        if saved is None:
+            raise HTTPException(404, "Graph node not found")
+        return saved
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GraphContextError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/graph-context/{node_id}", status_code=204)
+async def delete_graph_context(node_id: str, project_id: int = 1):
     try:
         projects.get(project_id)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
-    return store.list(project_id=project_id)
-
-
-@app.post("/api/context", status_code=201)
-async def create_context(payload: ContextInput):
-    try:
-        projects.get(payload.project_id)
-        return store.save(payload.title, payload.content, payload.roles, project_id=payload.project_id)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-
-@app.put("/api/context/{item_id}")
-async def update_context(item_id: int, payload: ContextInput):
-    try:
-        projects.get(payload.project_id)
-        return store.save(payload.title, payload.content, payload.roles, item_id, payload.project_id)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-
-@app.delete("/api/context/{item_id}", status_code=204)
-async def delete_context(item_id: int, project_id: int = 1):
-    if not store.delete(item_id, project_id):
-        raise HTTPException(404, "Context item not found")
+    if not graph_store.delete(node_id, project_id):
+        raise HTTPException(404, "Graph node not found")
 
 
 if __name__ == "__main__":

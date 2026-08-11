@@ -11,7 +11,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from shared_context import ContextStore
+from graph_context import GraphContextError, GraphContextStore
 from project_store import ProjectStore
 from agent_definitions import AgentDefinitionStore
 from runtime_config import RuntimeConfigStore
@@ -21,7 +21,7 @@ from toolsets import ToolsetStore
 
 
 DB_PATH = Path(os.getenv("WORKSPACE_DB", Path(__file__).parent / "data" / "workspace.db"))
-store = ContextStore(DB_PATH)
+store = GraphContextStore(DB_PATH)
 projects = ProjectStore(DB_PATH)
 definitions = AgentDefinitionStore(DB_PATH)
 # This process is an auxiliary MCP tool host, not the application owner.  It
@@ -146,21 +146,34 @@ def list_agent_messages(role: str, project_id: int = 1, include_delivered: bool 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_shared_context(role: str, project_id: int = 1) -> list[dict]:
-    """List context visible to a role. Items with no assigned roles are visible to everyone."""
-    return store.list(role, project_id)
+    """List project graph metadata available to every role in this project."""
+    projects.get(project_id)
+    definitions.get(role, project_id)
+    return store.list(project_id)
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
-def get_shared_context(item_id: int, project_id: int = 1) -> dict:
-    """Read one shared context item by numeric ID."""
+def get_shared_context(item_id: str, project_id: int = 1) -> dict:
+    """Read one project/folder/file graph metadata node by its stable ID."""
+    projects.get(project_id)
     item = store.get(item_id, project_id)
-    return item or {"error": f"Context item {item_id} was not found"}
+    return item or {"error": f"Graph context node {item_id} was not found"}
 
 
 @mcp.tool()
-def publish_shared_context(title: str, content: str, roles: list[str], project_id: int = 1) -> dict:
-    """Publish useful findings for selected roles. Use an empty roles list to share with the whole team."""
-    return store.save(title, content, roles, project_id=project_id)
+def publish_shared_context(path: str, keywords: list[str], vector: list[float], project_id: int = 1,
+                           source: str = "agent", model: str = "") -> dict:
+    """Update metadata for a scanned graph node. Structural paths are scanner-owned."""
+    projects.get(project_id)
+    try:
+        node = store.get_by_path(path, project_id)
+        if not node:
+            return {"ok": False, "error": "Scan the project and use an existing graph path first"}
+        return store.update_metadata(
+            node["id"], project_id, keywords=keywords, vector=vector, source=source, model=model,
+        )
+    except GraphContextError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
