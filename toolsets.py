@@ -27,7 +27,7 @@ LOCAL_COMMAND_RE = re.compile(
 PROJECT_VENV_LAUNCHER_RE = re.compile(
     r"(?<![A-Za-z0-9_.\\/-])"
     r"(?P<prefix>\.?[\\/])?"
-    r"(?P<environment>venv|\.venv|env)"
+    r"(?P<environment>_venv|venv|\.venv|env)"
     r"(?P<separator>[\\/])"
     r"(?P<bin>bin|Scripts)"
     r"(?P=separator)"
@@ -46,10 +46,19 @@ FILE_ACTION_MARKER_RE = re.compile(
     r"|(?P<create_inline>^[ \t]*CREATE[ \t]*-[ \t]*(?P<create_payload>\S[^\r\n]*?)[ \t]*$)",
     flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
 )
+SHELL_FAILURE_DIAGNOSTIC_RE = re.compile(
+    r"(?:"
+    r"(?:^|\r?\n)\s*(?:/bin/)?(?:sh|bash|zsh)(?:\.exe)?\s*:.*?"
+    r"(?:no such file or directory|command not found|not found|cannot execute|permission denied)"
+    r"|is not recognized as an internal or external command"
+    r"|the system cannot find the (?:file|path) specified"
+    r")",
+    flags=re.IGNORECASE,
+)
 TOOL_TIMEOUT_SECONDS = 60
 LOCAL_COMMAND_TIMEOUT_SECONDS = 600
 TOOL_OUTPUT_LIMIT = 200_000
-PROJECT_ENVIRONMENT_NAMES = ("venv", ".venv", "env")
+PROJECT_ENVIRONMENT_NAMES = ("venv", ".venv", "env", "_venv")
 FILE_READ_OUTPUT_LIMIT = 200_000
 CREATE_CONTENT_LIMIT = 1_000_000
 SAFE_ENV_NAMES = {
@@ -722,12 +731,14 @@ async def run_local_command(command: str, project_root: Path) -> dict[str, Any]:
         stdout = f"{stdout}\n[stdout truncated after {TOOL_OUTPUT_LIMIT:,} bytes]".strip()
     if stderr_truncated:
         stderr = f"{stderr}\n[stderr truncated after {TOOL_OUTPUT_LIMIT:,} bytes]".strip()
+    shell_diagnostic_failure = bool(SHELL_FAILURE_DIAGNOSTIC_RE.search(stderr or ""))
     result = {
-        "ok": process.returncode == 0 and not timed_out,
+        "ok": process.returncode == 0 and not timed_out and not shell_diagnostic_failure,
         "command": command,
         "cwd": str(root),
         "exit_code": process.returncode,
         "timed_out": timed_out,
+        "shell_diagnostic_failure": shell_diagnostic_failure,
         "stdout": stdout,
         "stderr": stderr,
     }
@@ -748,6 +759,10 @@ def format_local_command_result(result: dict[str, Any]) -> str:
     if requested_command and requested_command != result.get("command"):
         lines.append(
             f"> Routed project environment command `{requested_command}` to `{result.get('command')}`."
+        )
+    if result.get("shell_diagnostic_failure"):
+        lines.append(
+            "> The shell reported a failed command segment even though the overall shell exit code was zero."
         )
     stdout = str(result.get("stdout") or "").strip()
     stderr = str(result.get("stderr") or "").strip()

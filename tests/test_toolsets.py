@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ from team import AgentTeam
 from toolsets import (
     ToolsetStore, normalize_project_venv_command, resolve_command_markers, resolve_file_markers,
     resolve_tool_calls, restore_file_action_results,
+    run_local_command,
 )
 
 
@@ -113,6 +117,34 @@ def test_relative_venv_launcher_is_routed_to_the_detected_project_environment(tm
         "./.venv/bin/python"
     )
     assert normalized.startswith(expected_prefix)
+
+    alternate_command = (
+        r".\_venv\Scripts\python.exe -c \"print('ok')\""
+        if os.name == "nt" else
+        "./_venv/bin/python -c \"print('ok')\""
+    )
+    alternate_normalized = normalize_project_venv_command(alternate_command, tmp_path)
+    assert alternate_normalized.startswith(expected_prefix)
+
+
+def test_shell_diagnostic_is_failure_even_when_a_fallback_exits_zero(tmp_path):
+    fallback = (
+        subprocess.list2cmdline([sys.executable])
+        if os.name == "nt" else shlex.quote(sys.executable)
+    )
+    missing_launcher = (
+        r".\_venv\Scripts\python.exe"
+        if os.name == "nt" else
+        "./_venv/bin/python"
+    )
+    result = asyncio.run(run_local_command(
+        f"{missing_launcher} --version || {fallback} --version", tmp_path,
+    ))
+
+    assert result["exit_code"] == 0
+    assert result["shell_diagnostic_failure"] is True
+    assert result["ok"] is False
+    assert "No such file or directory" in result["stderr"] or "not found" in result["stderr"].lower()
 
 
 def test_command_marker_is_returned_for_ui_approval_without_permission(tmp_path):

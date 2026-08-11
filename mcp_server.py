@@ -57,7 +57,7 @@ def project_python_executable(project_root: Path) -> Path:
     executable_name = "python.exe" if os.name == "nt" else "python"
     bin_name = "Scripts" if os.name == "nt" else "bin"
     expected: list[str] = []
-    for environment_name in ("venv", ".venv", "env"):
+    for environment_name in ("venv", ".venv", "env", "_venv"):
         environment_root = root / environment_name
         candidate = environment_root / bin_name / executable_name
         expected.append(str(candidate))
