@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from team import AgentTeam
-from toolsets import ToolsetStore, resolve_command_markers, resolve_tool_calls
+from toolsets import (
+    ToolsetStore, normalize_project_venv_command, resolve_command_markers, resolve_file_markers,
+    resolve_tool_calls, restore_file_action_results,
+)
 
 
 def echo_toolset() -> dict:
@@ -61,6 +65,24 @@ def test_team_prompt_uses_striated_toolset_discovery(tmp_path):
     assert "Returns each positional argument as JSON." not in instructions
 
 
+def test_team_prompt_uses_the_detected_project_python_path(tmp_path):
+    launcher_directory = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    launcher_directory.mkdir(parents=True)
+    (launcher_directory / ("python.exe" if os.name == "nt" else "python")).touch()
+    team = AgentTeam(tmp_path)
+    team._project_root = lambda _project_id: tmp_path
+
+    instructions = team._action_guidance("researcher", 1)
+
+    expected = (
+        r".\.venv\Scripts\python.exe -m pytest"
+        if os.name == "nt" else
+        "./.venv/bin/python -m pytest"
+    )
+    assert expected in instructions
+    assert "Do not assume `./venv` exists" in instructions
+
+
 def test_command_marker_executes_on_the_host_from_the_project_root(tmp_path):
     text, calls, pending = asyncio.run(resolve_command_markers(
         "Before\nCOMMAND - echo local-command\nAfter", tmp_path,
@@ -73,6 +95,26 @@ def test_command_marker_executes_on_the_host_from_the_project_root(tmp_path):
     assert "COMMAND -" not in text
 
 
+def test_relative_venv_launcher_is_routed_to_the_detected_project_environment(tmp_path):
+    launcher_directory = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    launcher_directory.mkdir(parents=True)
+    (launcher_directory / ("python.exe" if os.name == "nt" else "python")).touch()
+    command = (
+        r".\venv\Scripts\python.exe -c \"print('ok')\""
+        if os.name == "nt" else
+        "./venv/bin/python -c \"print('ok')\""
+    )
+
+    normalized = normalize_project_venv_command(command, tmp_path)
+
+    expected_prefix = (
+        r".\.venv\Scripts\python.exe"
+        if os.name == "nt" else
+        "./.venv/bin/python"
+    )
+    assert normalized.startswith(expected_prefix)
+
+
 def test_command_marker_is_returned_for_ui_approval_without_permission(tmp_path):
     text, calls, pending = asyncio.run(resolve_command_markers(
         "Before\nCOMMAND - echo local-command\nAfter", tmp_path, allow_execution=False,
@@ -82,6 +124,54 @@ def test_command_marker_is_returned_for_ui_approval_without_permission(tmp_path)
     assert pending == ["echo local-command"]
     assert "COMMAND -" not in text
     assert text == "Before\n\nAfter"
+
+
+def test_read_marker_returns_requested_lines_and_stays_permission_gated(tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("zero\none\ntwo\nthree\n", encoding="utf-8")
+
+    pending_text, pending_calls, pending, _ = asyncio.run(resolve_file_markers(
+        "Before\nREAD - notes.txt - lines 2-3\nAfter", tmp_path, allow_read=False,
+    ))
+    assert pending_calls == []
+    assert pending == ["READ - notes.txt - lines 2-3"]
+    assert "READ -" not in pending_text
+
+    text, calls, pending, replacements = asyncio.run(resolve_file_markers(
+        "Before\nREAD - notes.txt - lines 2-3\nAfter", tmp_path,
+    ))
+    rendered = restore_file_action_results(text, replacements)
+    assert pending == []
+    assert calls[0]["ok"] is True
+    assert "2: one" in rendered
+    assert "3: two" in rendered
+    assert "1: zero" not in rendered
+
+
+def test_create_block_writes_workspace_file_and_shields_nested_markers(tmp_path):
+    text, calls, pending, replacements = asyncio.run(resolve_file_markers(
+        "CREATE - generated.txt\nCOMMAND - do-not-run\ncreated\nEND CREATE", tmp_path,
+    ))
+    command_text, command_calls, _ = asyncio.run(resolve_command_markers(text, tmp_path))
+    rendered = restore_file_action_results(command_text, replacements)
+
+    assert pending == []
+    assert calls[0]["ok"] is True
+    assert command_calls == []
+    assert "CREATE `generated.txt` completed" in rendered
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "COMMAND - do-not-run\ncreated\n"
+
+
+def test_create_marker_rejects_workspace_escape(tmp_path):
+    text, calls, pending, replacements = asyncio.run(resolve_file_markers(
+        "CREATE - ../outside.txt - blocked", tmp_path,
+    ))
+    rendered = restore_file_action_results(text, replacements)
+
+    assert pending == []
+    assert calls[0]["ok"] is False
+    assert "relative path inside the project workspace" in rendered
+    assert not (tmp_path.parent / "outside.txt").exists()
 
 
 def test_toolcall_executes_and_replaces_marker_with_formatted_result(tmp_path):
