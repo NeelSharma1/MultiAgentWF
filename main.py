@@ -884,6 +884,18 @@ async def merge_git_commit_into_all_branches(project_id: int, commit_hash: str):
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post("/api/projects/{project_id}/git/consolidate")
+async def consolidate_git_branches(project_id: int):
+    try:
+        return await asyncio.to_thread(
+            team.git.consolidate_branches, project_id, _git_project_root(project_id),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.post("/api/projects/{project_id}/git/commits/{commit_hash}/rollback")
 async def rollback_git_commit(project_id: int, commit_hash: str):
     try:

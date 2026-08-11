@@ -205,6 +205,7 @@ def test_merge_commit_into_all_branches_skips_branches_that_already_contain_it(t
     _git(workflow, repository, "commit", "-m", "Topic change")
     topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
     workflow.checkout_branch(1, repository, "team-main")
+    (repository / "base.py").write_text("keep my local edit\n", encoding="utf-8")
 
     result = workflow.merge_into_all_branches(1, repository, topic_commit)
 
@@ -212,9 +213,41 @@ def test_merge_commit_into_all_branches_skips_branches_that_already_contain_it(t
     assert result["skipped"] == ["topic"]
     assert result["failed"] == []
     assert _git(workflow, repository, "branch", "--show-current") == "team-main"
+    assert (repository / "base.py").read_text(encoding="utf-8") == "keep my local edit\n"
     for branch in ("team-main", "programmer"):
         assert _git(workflow, repository, "merge-base", "--is-ancestor", topic_commit, f"refs/heads/{branch}") == ""
 
     repeat = workflow.merge_into_all_branches(1, repository, topic_commit)
     assert repeat["merged"] == []
     assert set(repeat["skipped"]) == {"team-main", "programmer", "topic"}
+
+
+def test_consolidate_branches_integrates_divergent_heads_into_main_and_retains_refs(tmp_path):
+    workflow, repository, _ = _workflow(tmp_path)
+    workflow.begin_agent_run(1, "programmer", repository)
+    (repository / "base.py").write_text("base = True\n", encoding="utf-8")
+    assert workflow.finish_agent_run(1, "programmer", "run-base", repository, "Create base")
+
+    workflow.create_branch(1, repository, "topic", "team-main")
+    workflow.checkout_branch(1, repository, "topic")
+    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
+    _git(workflow, repository, "add", "topic.py")
+    _git(workflow, repository, "commit", "-m", "Topic change")
+    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
+    workflow.checkout_branch(1, repository, "team-main")
+    (repository / "base.py").write_text("keep my local edit\n", encoding="utf-8")
+
+    result = workflow.consolidate_branches(1, repository)
+
+    assert result["main_branch"] == "team-main"
+    assert result["merged"] == ["topic"]
+    assert "programmer" in result["skipped"]
+    assert result["failed"] == []
+    assert result["consolidated"] is True
+    assert _git(workflow, repository, "merge-base", "--is-ancestor", topic_commit, "refs/heads/team-main") == ""
+    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
+    assert (repository / "base.py").read_text(encoding="utf-8") == "keep my local edit\n"
+    overview = workflow.overview(1, repository, [{"role": "programmer", "name": "Programmer"}])
+    branches = {item["name"]: item for item in overview["branches"]}
+    assert branches["topic"]["merged_into_main"] is True
+    assert branches["programmer"]["merged_into_main"] is True

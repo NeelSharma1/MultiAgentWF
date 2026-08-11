@@ -7,7 +7,7 @@ import re
 import signal
 import shutil
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -24,9 +24,34 @@ LOCAL_COMMAND_RE = re.compile(
     r"(?m)^[ \t]*COMMAND[ \t]*-[ \t]*(?P<command>\S[^\r\n]*?)[ \t]*$",
     flags=re.IGNORECASE,
 )
+PROJECT_VENV_LAUNCHER_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\\/-])"
+    r"(?P<prefix>\.?[\\/])?"
+    r"(?P<environment>venv|\.venv|env)"
+    r"(?P<separator>[\\/])"
+    r"(?P<bin>bin|Scripts)"
+    r"(?P=separator)"
+    r"(?P<executable>[A-Za-z0-9_.+-]+)(?:\.exe)?",
+    flags=re.IGNORECASE,
+)
+READ_LINE_SELECTOR_RE = re.compile(
+    r"^(?:lines?\s*[:=]?\s*)?\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*$",
+    flags=re.IGNORECASE,
+)
+FILE_ACTION_MARKER_RE = re.compile(
+    r"(?P<create_block>^[ \t]*CREATE[ \t]*-[ \t]*"
+    r"(?P<block_path>(?![^\r\n]*[ \t]+-[ \t]+)[^\r\n]+?)[ \t]*\r?\n"
+    r"(?P<block_content>.*?)^[ \t]*END[ \t]+CREATE[ \t]*$)"
+    r"|(?P<read>^[ \t]*READ[ \t]*-[ \t]*(?P<read_payload>\S[^\r\n]*?)[ \t]*$)"
+    r"|(?P<create_inline>^[ \t]*CREATE[ \t]*-[ \t]*(?P<create_payload>\S[^\r\n]*?)[ \t]*$)",
+    flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
 TOOL_TIMEOUT_SECONDS = 60
 LOCAL_COMMAND_TIMEOUT_SECONDS = 600
 TOOL_OUTPUT_LIMIT = 200_000
+PROJECT_ENVIRONMENT_NAMES = ("venv", ".venv", "env")
+FILE_READ_OUTPUT_LIMIT = 200_000
+CREATE_CONTENT_LIMIT = 1_000_000
 SAFE_ENV_NAMES = {
     "PATH", "HOME", "USER", "USERNAME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
     "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
@@ -396,6 +421,244 @@ def _kill_local_command(process: asyncio.subprocess.Process) -> None:
         process.kill()
 
 
+def _project_venv_details(project_root: Path) -> tuple[Path, Path] | None:
+    """Return the selected project environment root and its launcher folder."""
+    executable_name = "python.exe" if os.name == "nt" else "python"
+    bin_name = "Scripts" if os.name == "nt" else "bin"
+    for environment_name in PROJECT_ENVIRONMENT_NAMES:
+        environment_root = project_root / environment_name
+        if (environment_root / bin_name / executable_name).is_file():
+            return environment_root, environment_root / bin_name
+    return None
+
+
+def _project_venv_launcher_name(launcher_directory: Path, requested: str) -> str | None:
+    """Choose the matching launcher, falling back to the environment Python."""
+    suffix = ".exe" if os.name == "nt" else ""
+    requested_name = f"{requested}{suffix}"
+    candidates = [requested_name]
+    if requested.lower().startswith("python"):
+        candidates.append(f"python{suffix}")
+    elif requested.lower().startswith("pytest"):
+        candidates.append(f"pytest{suffix}")
+    elif requested.lower().startswith("pip"):
+        candidates.append(f"pip{suffix}")
+    for candidate in dict.fromkeys(candidates):
+        if (launcher_directory / candidate).is_file():
+            return candidate
+    return None
+
+
+def normalize_project_venv_command(command: str, project_root: Path) -> str:
+    """Route explicit relative venv launchers to the project's actual venv.
+
+    Agents are given a portable default such as ``./venv/bin/python``. Projects
+    commonly use ``.venv`` instead, so leaving that path untouched makes the
+    shell fail before Python can start. Only relative launcher paths are
+    rewritten; absolute paths and unrelated files are left alone.
+    """
+    details = _project_venv_details(project_root)
+    if details is None:
+        return command
+    environment_root, launcher_directory = details
+    target_environment = environment_root.name
+    target_bin = launcher_directory.name
+
+    def replace(match: re.Match[str]) -> str:
+        launcher_name = _project_venv_launcher_name(
+            launcher_directory, match.group("executable"),
+        )
+        if not launcher_name:
+            return match.group(0)
+        prefix = match.group("prefix") or ""
+        separator = match.group("separator")
+        return f"{prefix}{target_environment}{separator}{target_bin}{separator}{launcher_name}"
+
+    return PROJECT_VENV_LAUNCHER_RE.sub(replace, str(command))
+
+
+def _unquote_file_marker_path(value: str) -> str:
+    path = str(value or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in {"'", '"'}:
+        return path[1:-1]
+    return path
+
+
+def _workspace_file_path(project_root: Path, raw_path: str) -> tuple[Path, str]:
+    """Resolve a marker path while keeping it inside the project root."""
+    value = _unquote_file_marker_path(raw_path).replace("\\", "/")
+    portable = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        not value or portable.is_absolute() or windows.is_absolute() or windows.drive
+        or ".." in portable.parts
+    ):
+        raise ValueError("File actions require a relative path inside the project workspace")
+    parts = tuple(part for part in portable.parts if part not in {"", "."})
+    if not parts:
+        raise ValueError("File actions require a file path")
+    root = Path(project_root).expanduser().resolve()
+    candidate = (root.joinpath(*parts)).resolve()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("File actions cannot access paths outside the project workspace") from exc
+    return candidate, relative.as_posix()
+
+
+def _parse_line_ranges(selector: str) -> list[tuple[int, int]]:
+    raw = re.sub(r"^lines?\s*[:=]?\s*", "", str(selector or "").strip(), flags=re.IGNORECASE)
+    if not READ_LINE_SELECTOR_RE.fullmatch(raw):
+        raise ValueError("Line selections must use values such as '1-10' or '1,4,8-12'")
+    ranges: list[tuple[int, int]] = []
+    for item in raw.split(","):
+        values = item.strip().split("-", 1)
+        start = int(values[0])
+        end = int(values[-1])
+        if start < 1 or end < start or end - start > 10_000:
+            raise ValueError("Line selections must be positive, ordered, and at most 10,001 lines wide")
+        ranges.append((start, end))
+    return ranges
+
+
+def _parse_read_marker(payload: str) -> tuple[str, list[tuple[int, int]] | None]:
+    raw = str(payload or "").strip()
+    selector_match = re.match(
+        r"^(?P<path>.+?)\s+-\s+(?P<selector>(?:lines?\s*[:=]?\s*)?\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*?)$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not selector_match:
+        return _unquote_file_marker_path(raw), None
+    return _unquote_file_marker_path(selector_match.group("path")), _parse_line_ranges(
+        selector_match.group("selector"),
+    )
+
+
+def _parse_create_inline_marker(payload: str) -> tuple[str, str]:
+    path, separator, content = str(payload or "").strip().partition(" - ")
+    if not separator:
+        raise ValueError("CREATE requires '<path> - <content>' or a CREATE block")
+    return _unquote_file_marker_path(path), content
+
+
+def _execute_file_action(action: dict[str, Any], project_root: Path) -> dict[str, Any]:
+    path, relative = _workspace_file_path(project_root, str(action.get("path") or ""))
+    action_name = str(action.get("action") or "").upper()
+    if action_name == "READ":
+        if not path.is_file():
+            raise FileNotFoundError(f"File does not exist: {relative}")
+        content = path.read_bytes().decode("utf-8", errors="replace")
+        ranges = action.get("line_ranges")
+        if ranges:
+            lines = content.splitlines()
+            selected: list[str] = []
+            for start, end in ranges:
+                for line_number in range(start, min(end, len(lines)) + 1):
+                    selected.append(f"{line_number}: {lines[line_number - 1]}")
+            output = "\n".join(selected)
+        else:
+            output = content
+        truncated = len(output) > FILE_READ_OUTPUT_LIMIT
+        if truncated:
+            output = output[:FILE_READ_OUTPUT_LIMIT].rstrip() + (
+                f"\n[READ output truncated after {FILE_READ_OUTPUT_LIMIT:,} characters]"
+            )
+        return {
+            "ok": True, "action": "READ", "path": relative, "line_ranges": ranges,
+            "stdout": output, "stderr": "", "exit_code": 0, "cwd": str(Path(project_root).resolve()),
+        }
+    if action_name == "CREATE":
+        content = str(action.get("content") or "")
+        if len(content) > CREATE_CONTENT_LIMIT:
+            raise ValueError(f"CREATE content cannot exceed {CREATE_CONTENT_LIMIT:,} characters")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "ok": True, "action": "CREATE", "path": relative, "bytes": len(content.encode("utf-8")),
+            "stdout": "", "stderr": "", "exit_code": 0, "cwd": str(Path(project_root).resolve()),
+        }
+    raise ValueError("Unknown file action")
+
+
+def format_file_action_result(result: dict[str, Any]) -> str:
+    """Render a READ/CREATE result for the agent and the chat transcript."""
+    action = str(result.get("action") or "FILE").upper()
+    path = str(result.get("path") or "")
+    if not result.get("ok"):
+        detail = str(result.get("error") or result.get("stderr") or result.get("stdout") or "").strip()
+        return f"> {action} `{path}` failed.\n> {detail or 'The file action produced no diagnostic output.'}"
+    if action == "READ":
+        ranges = result.get("line_ranges")
+        scope = "" if not ranges else f" (requested lines {', '.join(f'{start}-{end}' for start, end in ranges)})"
+        content = str(result.get("stdout") or "")
+        return f"> READ `{path}`{scope}:\n```text\n{content}\n```"
+    return f"> CREATE `{path}` completed ({result.get('bytes', 0)} bytes written)."
+
+
+async def resolve_file_markers(
+    text: str, project_root: Path, allow_read: bool = True, allow_create: bool = True,
+) -> tuple[str, list[dict[str, Any]], list[str], dict[str, str]]:
+    """Resolve permission-gated READ and CREATE markers from an agent response."""
+    matches = list(FILE_ACTION_MARKER_RE.finditer(str(text or "")))
+    if not matches:
+        return text, [], [], {}
+    root = Path(project_root).expanduser().resolve()
+    parts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    pending: list[str] = []
+    replacements: dict[str, str] = {}
+    cursor = 0
+    for match in matches:
+        parts.append(text[cursor:match.start()])
+        marker = match.group(0).strip()
+        action_name = "READ" if match.group("read") is not None else "CREATE"
+        try:
+            if action_name == "READ":
+                path, line_ranges = _parse_read_marker(match.group("read_payload"))
+                action = {"action": action_name, "path": path, "line_ranges": line_ranges}
+            elif match.group("create_block") is not None:
+                action = {
+                    "action": action_name,
+                    "path": _unquote_file_marker_path(match.group("block_path")),
+                    "content": match.group("block_content"),
+                }
+            else:
+                path, content = _parse_create_inline_marker(match.group("create_payload"))
+                action = {"action": action_name, "path": path, "content": content}
+        except Exception as exc:
+            action = {"action": action_name, "path": "", "error": str(exc)}
+        allowed = allow_read if action_name == "READ" else allow_create
+        if not allowed:
+            pending.append(marker)
+            cursor = match.end()
+            continue
+        try:
+            result = _execute_file_action(action, root) if "error" not in action else {
+                "ok": False, "action": action_name, "path": action.get("path", ""),
+                "error": action["error"], "exit_code": None, "cwd": str(root),
+            }
+        except Exception as exc:
+            result = {
+                "ok": False, "action": action_name, "path": action.get("path", ""),
+                "error": str(exc), "exit_code": None, "cwd": str(root),
+            }
+        calls.append(result)
+        placeholder = f"__MULTIAGENT_FILE_RESULT_{len(replacements)}__"
+        replacements[placeholder] = format_file_action_result(result)
+        parts.append(placeholder)
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts).strip(), calls, pending, replacements
+
+
+def restore_file_action_results(text: str, replacements: dict[str, str]) -> str:
+    """Restore shielded file results after other marker resolvers finish."""
+    for placeholder, value in replacements.items():
+        text = text.replace(placeholder, value)
+    return text
+
+
 def _local_command_environment(project_root: Path) -> dict[str, str]:
     """Build a small, non-secret environment for a host-side command."""
     environment = {
@@ -404,23 +667,22 @@ def _local_command_environment(project_root: Path) -> dict[str, str]:
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PWD"] = str(project_root)
     executable_name = "python.exe" if os.name == "nt" else "python"
-    bin_name = "Scripts" if os.name == "nt" else "bin"
-    for environment_name in ("venv", ".venv", "env"):
-        environment_root = project_root / environment_name
-        interpreter = environment_root / bin_name / executable_name
-        if interpreter.is_file():
-            environment["VIRTUAL_ENV"] = str(environment_root)
-            environment["PYTHON"] = str(interpreter)
-            environment["PATH"] = os.pathsep.join([
-                str(interpreter.parent), environment.get("PATH", "")
-            ])
-            break
+    details = _project_venv_details(project_root)
+    if details is not None:
+        environment_root, launcher_directory = details
+        interpreter = launcher_directory / executable_name
+        environment["VIRTUAL_ENV"] = str(environment_root)
+        environment["PYTHON"] = str(interpreter)
+        environment["PATH"] = os.pathsep.join([
+            str(interpreter.parent), environment.get("PATH", "")
+        ])
     return environment
 
 
 async def run_local_command(command: str, project_root: Path) -> dict[str, Any]:
     """Run one command on the application host from the configured repository."""
-    command = str(command or "").strip()
+    requested_command = str(command or "").strip()
+    command = requested_command
     root = Path(project_root).expanduser().resolve()
     if not command:
         raise ValueError("Local command cannot be empty")
@@ -428,6 +690,7 @@ async def run_local_command(command: str, project_root: Path) -> dict[str, Any]:
         raise ValueError("Local command cannot contain NUL characters")
     if not root.is_dir():
         raise FileNotFoundError(f"Project folder does not exist: {root}")
+    command = normalize_project_venv_command(command, root)
     process = await asyncio.create_subprocess_shell(
         command,
         cwd=str(root),
@@ -459,7 +722,7 @@ async def run_local_command(command: str, project_root: Path) -> dict[str, Any]:
         stdout = f"{stdout}\n[stdout truncated after {TOOL_OUTPUT_LIMIT:,} bytes]".strip()
     if stderr_truncated:
         stderr = f"{stderr}\n[stderr truncated after {TOOL_OUTPUT_LIMIT:,} bytes]".strip()
-    return {
+    result = {
         "ok": process.returncode == 0 and not timed_out,
         "command": command,
         "cwd": str(root),
@@ -468,6 +731,9 @@ async def run_local_command(command: str, project_root: Path) -> dict[str, Any]:
         "stdout": stdout,
         "stderr": stderr,
     }
+    if command != requested_command:
+        result["requested_command"] = requested_command
+    return result
 
 
 def format_local_command_result(result: dict[str, Any]) -> str:
@@ -478,6 +744,11 @@ def format_local_command_result(result: dict[str, Any]) -> str:
         f"(exit code {result.get('exit_code')}).",
         f"> Working directory: `{result.get('cwd', '')}`",
     ]
+    requested_command = str(result.get("requested_command") or "").strip()
+    if requested_command and requested_command != result.get("command"):
+        lines.append(
+            f"> Routed project environment command `{requested_command}` to `{result.get('command')}`."
+        )
     stdout = str(result.get("stdout") or "").strip()
     stderr = str(result.get("stderr") or "").strip()
     if stdout:

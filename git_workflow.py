@@ -247,9 +247,12 @@ class GitWorkflowStore:
             name, short_hash, upstream, head = (line.split("\t") + ["", "", "", ""])[:4]
             if not name:
                 continue
+            merged_into_main = bool(main_branch and name != main_branch and self._run(
+                repository, "merge-base", "--is-ancestor", f"refs/heads/{name}", f"refs/heads/{main_branch}", check=False,
+            ).returncode == 0)
             branches.append({
                 "name": name, "head": short_hash, "upstream": upstream, "current": head == "*" or name == current,
-                "main": name == main_branch,
+                "main": name == main_branch, "merged_into_main": merged_into_main,
             })
         worktrees: list[dict[str, Any]] = []
         for block in self._run(repository, "worktree", "list", "--porcelain").stdout.strip().split("\n\n"):
@@ -683,13 +686,14 @@ class GitWorkflowStore:
         return {"merged": target, "target_branch": branch, "head": head, "current_branch": previous_branch or "(detached HEAD)"}
 
     def merge_into_all_branches(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:
-        """Merge a selected commit into every local branch that does not contain it."""
+        """Merge a selected commit into every local branch that does not contain it.
+
+        Each merge runs in a temporary detached worktree so uncommitted changes in
+        the user's primary worktree do not prevent branch-only maintenance.
+        """
         _, repository = self._configured_repository(project_id, project_root)
         target = self._resolve_commit(repository, commit_hash)
-        if self._run(repository, "status", "--porcelain").stdout.strip():
-            raise GitWorkflowError("The working tree must be clean before merging into multiple branches")
         previous_branch = self._run(repository, "branch", "--show-current").stdout.strip()
-        previous_head = self._run(repository, "rev-parse", "HEAD", check=False).stdout.strip()
         branches = [
             value.strip() for value in self._run(
                 repository, "for-each-ref", "--format=%(refname:short)", "refs/heads",
@@ -706,24 +710,81 @@ class GitWorkflowStore:
                 candidates.append(branch)
         merged: list[str] = []
         failed: list[dict[str, str]] = []
-        try:
-            for branch in candidates:
+        for branch in candidates:
+            worktree_path: Path | None = None
+            try:
                 self._validate_branch(repository, branch)
-                current = self._run(repository, "branch", "--show-current").stdout.strip()
-                if current != branch:
-                    self._run(repository, "checkout", "--no-guess", branch)
+                old_head = self._run(repository, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+                worktree_path = Path(tempfile.mkdtemp(prefix="git-merge-all-"))
+                self._run(repository, "worktree", "add", "--detach", "--quiet", str(worktree_path), old_head, timeout=60)
                 try:
-                    self._run(repository, "merge", "--no-ff", "--no-edit", target, timeout=120)
+                    self._run(worktree_path, "merge", "--no-ff", "--no-edit", target, timeout=120)
                 except GitWorkflowError as exc:
-                    self._run(repository, "merge", "--abort", check=False)
+                    self._run(worktree_path, "merge", "--abort", check=False)
                     failed.append({"branch": branch, "error": str(exc)})
                 else:
+                    new_head = self._run(worktree_path, "rev-parse", "HEAD").stdout.strip()
+                    self._run(repository, "update-ref", f"refs/heads/{branch}", new_head, old_head)
                     merged.append(branch)
-        finally:
-            self._restore_branch(repository, previous_branch, previous_head)
+            except GitWorkflowError as exc:
+                failed.append({"branch": branch, "error": str(exc)})
+            finally:
+                if worktree_path is not None:
+                    self._run(repository, "worktree", "remove", "--force", str(worktree_path), check=False)
+                    shutil.rmtree(worktree_path, ignore_errors=True)
         return {
             "merged_commit": target, "merged": merged, "skipped": skipped, "failed": failed,
             "current_branch": previous_branch or "(detached HEAD)",
+        }
+
+    def consolidate_branches(self, project_id: int, project_root: Path) -> dict[str, Any]:
+        """Integrate every divergent local branch into the configured main branch.
+
+        Branch refs are retained so the operation preserves recovery points; the
+        UI can present the resulting main history as the consolidated graph.
+        """
+        configuration, repository = self._configured_repository(project_id, project_root)
+        main_branch = self._validate_branch(repository, self._main_branch(configuration))
+        main_head = self._run(repository, "rev-parse", f"refs/heads/{main_branch}").stdout.strip()
+        branches = [
+            value.strip() for value in self._run(
+                repository, "for-each-ref", "--format=%(refname:short)", "refs/heads",
+            ).stdout.splitlines() if value.strip() and value.strip() != main_branch
+        ]
+        merged: list[str] = []
+        skipped: list[str] = []
+        failed: list[dict[str, str]] = []
+        for branch in branches:
+            worktree_path: Path | None = None
+            try:
+                self._validate_branch(repository, branch)
+                branch_head = self._run(repository, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+                if self._run(
+                    repository, "merge-base", "--is-ancestor", branch_head, main_head, check=False,
+                ).returncode == 0:
+                    skipped.append(branch)
+                    continue
+                worktree_path = Path(tempfile.mkdtemp(prefix="git-consolidate-"))
+                self._run(repository, "worktree", "add", "--detach", "--quiet", str(worktree_path), main_head, timeout=60)
+                try:
+                    self._run(worktree_path, "merge", "--no-ff", "--no-edit", branch_head, timeout=120)
+                except GitWorkflowError as exc:
+                    self._run(worktree_path, "merge", "--abort", check=False)
+                    failed.append({"branch": branch, "error": str(exc)})
+                    continue
+                new_head = self._run(worktree_path, "rev-parse", "HEAD").stdout.strip()
+                self._run(repository, "update-ref", f"refs/heads/{main_branch}", new_head, main_head)
+                main_head = new_head
+                merged.append(branch)
+            except GitWorkflowError as exc:
+                failed.append({"branch": branch, "error": str(exc)})
+            finally:
+                if worktree_path is not None:
+                    self._run(repository, "worktree", "remove", "--force", str(worktree_path), check=False)
+                    shutil.rmtree(worktree_path, ignore_errors=True)
+        return {
+            "main_branch": main_branch, "head": main_head, "merged": merged,
+            "skipped": skipped, "failed": failed, "consolidated": not failed,
         }
 
     def rollback(self, project_id: int, project_root: Path, commit_hash: str) -> dict[str, Any]:

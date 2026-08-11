@@ -1,6 +1,7 @@
 const COMMAND_HISTORY_KEY='multiagent-provider-command-history';
 const CHAT_OVERRIDES_KEY='multiagent-chat-overrides';
 const THEME_KEY='multiagent-theme';
+const VERSION_CONSOLIDATED_KEY='multiagent-version-consolidated';
 const INTERNAL_CONTINUATION_PROMPT='Process the queued team messages now. Follow each command, use reports as context, and send a concise report to the requesting agent when the work is complete.';
 function loadCommandHistory(){
   try{
@@ -75,11 +76,16 @@ const state={
   selectedVersionDiffPath: '',
   selectedVersionDiff: '',
   versionCommitDiffLoading: false,
+  versionCommitDetailLoading: false,
   versionCommitDetailRequest: 0,
   versionCommitDiffRequest: 0,
+  versionControlLoadPromise: null,
   versionCommitActionBusy: false,
   versionCommitActionStatus: '',
   versionCommitTargetBranch: '',
+  versionGraphConsolidated: false,
+  versionConsolidationBusy: false,
+  versionConsolidationStatus: '',
   versionGraphView: null,
   versionGraphFull: null,
   versionGraphPanMoved: false,
@@ -847,9 +853,23 @@ async function openGitChanges(){
 }
 async function loadVersionControl(){
   if(!state.project)return null;
-  state.gitOverview=await api(`/api/projects/${state.project.id}/git/overview`);
-  renderVersionControl(state.gitOverview);
-  return state.gitOverview
+  if(state.versionControlLoadPromise)return state.versionControlLoadPromise;
+  const projectId=state.project.id;
+  const request=api(`/api/projects/${projectId}/git/overview`).then(overview=>{
+    if(state.project?.id===projectId){
+      state.gitOverview=overview;
+      renderVersionControl(overview)
+    }
+    return overview
+  });
+  state.versionControlLoadPromise=request;
+  try{return await request}
+  finally{if(state.versionControlLoadPromise===request)state.versionControlLoadPromise=null}
+}
+async function refreshVersionControlIfVisible(){
+  if(!state.project||document.hidden||$('#version-control').classList.contains('hidden')||state.versionCommitActionBusy||state.versionConsolidationBusy)return;
+  try{await loadVersionControl()}
+  catch(err){console.warn('Could not refresh version control',err)}
 }
 function selectVersionBranch(name, additive=false){
   const selected=[...(state.selectedVersionBranches||[])];
@@ -936,15 +956,19 @@ function renderVersionCommitInspector(){
 async function loadVersionCommitDetails(hash){
   if(!state.project||!hash)return;
   const request=++state.versionCommitDetailRequest;
+  state.versionCommitDetailLoading=true;
   state.selectedVersionCommitDetail=null;
   state.selectedVersionDiffPath=''; state.selectedVersionDiff=''; state.versionCommitDiffLoading=false;
   renderVersionCommitInspector();
-  const detail=await api(`/api/projects/${state.project.id}/git/commits/${encodeURIComponent(hash)}`);
-  if(request!==state.versionCommitDetailRequest||state.selectedVersionCommit!==hash)return;
-  state.selectedVersionCommitDetail=detail;
-  renderVersionCommitInspector();
-  const firstFile=detail.files?.[0];
-  if(firstFile)await loadVersionCommitDiff(detail.hash,firstFile.path)
+  try{
+    const detail=await api(`/api/projects/${state.project.id}/git/commits/${encodeURIComponent(hash)}`);
+    if(request!==state.versionCommitDetailRequest||state.selectedVersionCommit!==hash)return;
+    state.selectedVersionCommitDetail=detail;
+    renderVersionCommitInspector();
+    const firstFile=detail.files?.[0];
+    if(firstFile)await loadVersionCommitDiff(detail.hash,firstFile.path)
+  }
+  finally{if(request===state.versionCommitDetailRequest)state.versionCommitDetailLoading=false}
 }
 async function loadVersionCommitDiff(hash,path){
   if(!state.project||!hash||!path)return;
@@ -990,6 +1014,34 @@ function formatMergeAllStatus(shortHash,result){
   let status=merged.length?`Merged ${shortHash} into ${merged.join(', ')}.`:'No branches needed a merge.';
   if(skipped.length)status+=` Already present in ${skipped.join(', ')}.`;
   if(failed.length)status+=` Failed on ${failed.map(item=>`${item.branch}: ${item.error}`).join(' · ')}.`;
+  return status
+}
+async function runVersionConsolidation(){
+  if(!state.project||state.versionConsolidationBusy)return;
+  const main=state.gitOverview?.main_branch||'';
+  if(!main)return alert('Configure a main branch before consolidating branches.');
+  if(!confirm(`Consolidate all local branches into '${main}'? Their histories will be merged into the main branch. Existing branch references will be retained for recovery.`))return;
+  state.versionConsolidationBusy=true;
+  state.versionConsolidationStatus=`Consolidating branches into '${main}'…`;
+  renderVersionControl(state.gitOverview);
+  try{
+    const result=await api(`/api/projects/${state.project.id}/git/consolidate`,{method:'POST'});
+    state.versionGraphConsolidated=Boolean(result.consolidated);
+    const storageKey=`${VERSION_CONSOLIDATED_KEY}:${state.project.id}`;
+    if(state.versionGraphConsolidated)localStorage.setItem(storageKey,'true');
+    else localStorage.removeItem(storageKey);
+    state.versionConsolidationStatus=formatConsolidationStatus(result);
+    await loadVersionControl()
+  }
+  catch(err){state.versionGraphConsolidated=false;localStorage.removeItem(`${VERSION_CONSOLIDATED_KEY}:${state.project.id}`);state.versionConsolidationStatus=`Consolidation failed: ${err.message}`}
+  finally{state.versionConsolidationBusy=false;renderVersionControl(state.gitOverview)}
+}
+function formatConsolidationStatus(result){
+  const merged=result.merged||[], skipped=result.skipped||[], failed=result.failed||[];
+  let status=merged.length?`Consolidated ${merged.join(', ')} into '${result.main_branch}'.`:`'${result.main_branch}' already contained every branch.`;
+  if(skipped.length)status+=` Already contained: ${skipped.join(', ')}.`;
+  if(failed.length)status+=` Failed on ${failed.map(item=>`${item.branch}: ${item.error}`).join(' · ')}.`;
+  if(!failed.length)status+=' Branch references were retained.';
   return status
 }
 function branchCommitHistory(head, commitByHash){
@@ -1075,7 +1127,7 @@ function bindVersionGraphInteractions(){
   host.onpointerup=endPointer; host.onpointercancel=endPointer; host.oncontextmenu=event=>event.preventDefault()
 }
 function renderVersionCommitGraph(data){
-  const host=$('#version-commit-graph'), detail=$('#version-commit-detail'), commits=data?.commits||[], branchItems=data?.branches||[];
+  const host=$('#version-commit-graph'), detail=$('#version-commit-detail'), commits=data?.commits||[], allBranchItems=data?.branches||[], branchItems=state.versionGraphConsolidated?allBranchItems.filter(item=>item.main):allBranchItems, topologyBranchItems=allBranchItems;
   host.innerHTML='';
   if(!commits.length){
     state.versionGraphView=null;
@@ -1085,49 +1137,75 @@ function renderVersionCommitGraph(data){
     return
   }
   if(!state.selectedVersionCommit||!commits.some(item=>item.hash===state.selectedVersionCommit))state.selectedVersionCommit=commits[0].hash;
-  const chronological=[...commits].reverse(), known=new Set(commits.map(item=>item.hash)), commitByHash=new Map(commits.map(item=>[item.hash,item])), children=new Map(), laneByHash=new Map(), coordinates=new Map();
-  const findCommit=reference=>commits.find(item=>item.hash===reference||item.short_hash===reference||item.hash.startsWith(reference||''));
-  chronological.forEach(commit=>commit.parents.filter(parent=>known.has(parent)).forEach(parent=>{
-    if(!children.has(parent))children.set(parent,[]);
-    children.get(parent).push(commit.hash)
+  const chronological=[...commits].reverse(), known=new Set(commits.map(item=>item.hash)), commitByHash=new Map(commits.map(item=>[item.hash,item])), commitOrder=new Map(chronological.map((item,index)=>[item.hash,index])), laneByHash=new Map(), coordinates=new Map(), generationMemo=new Map();
+  const findCommit=reference=>reference?commits.find(item=>item.hash===reference||item.short_hash===reference||item.hash.startsWith(reference)):null;
+  const generationOf=hash=>{
+    if(generationMemo.has(hash))return generationMemo.get(hash);
+    const commit=commitByHash.get(hash);
+    if(!commit){generationMemo.set(hash,0);return 0}
+    const generation=1+Math.max(-1,...commit.parents.filter(parent=>known.has(parent)).map(generationOf));
+    generationMemo.set(hash,generation);
+    return generation
+  };
+  const layoutOrder=[...commits].sort((left,right)=>generationOf(left.hash)-generationOf(right.hash)||(commitOrder.get(left.hash)||0)-(commitOrder.get(right.hash)||0));
+  const branchHistories=new Map(topologyBranchItems.map(item=>[item.name,branchCommitHistory(findCommit(item.head)?.hash,commitByHash)]));
+  const mainItem=topologyBranchItems.find(item=>item.main||item.name===data?.main_branch)||topologyBranchItems.find(item=>item.current)||topologyBranchItems[0];
+  const mainHead=findCommit(mainItem?.head)||commits[0];
+  const trunkHashes=[], trunkSeen=new Set();
+  let trunkCommit=mainHead;
+  while(trunkCommit&&!trunkSeen.has(trunkCommit.hash)){
+    trunkSeen.add(trunkCommit.hash);
+    trunkHashes.push(trunkCommit.hash);
+    trunkCommit=findCommit(trunkCommit.parents?.[0]);
+  }
+  const trunkSet=new Set(trunkHashes);
+  const branchLaneByName=new Map(topologyBranchItems.filter(item=>!item.main).map((item,index)=>{
+    const level=Math.floor(index/2)+1;
+    return [item.name,index%2===0?-level:level]
   }));
-  let nextLane=0;
-  chronological.forEach((commit,index)=>{
-    const lane=laneByHash.has(commit.hash)?laneByHash.get(commit.hash):nextLane++;
-    laneByHash.set(commit.hash,lane);
-    coordinates.set(commit.hash,{x:54+index*96,y:48+lane*58,lane});
-    (children.get(commit.hash)||[]).forEach((child,childIndex)=>{
-      if(!laneByHash.has(child))laneByHash.set(child,childIndex===0?lane:nextLane++)
+  trunkHashes.forEach(hash=>laneByHash.set(hash,0));
+  topologyBranchItems.filter(item=>!item.main).forEach(item=>{
+    const lane=branchLaneByName.get(item.name)||0;
+    (branchHistories.get(item.name)||new Set()).forEach(hash=>{
+      if(!trunkSet.has(hash)&&!laneByHash.has(hash))laneByHash.set(hash,lane)
     })
   });
-  const branchHistories=new Map(branchItems.map(item=>[item.name,branchCommitHistory(findCommit(item.head)?.hash,commitByHash)]));
+  layoutOrder.forEach(commit=>{
+    if(!laneByHash.has(commit.hash))laneByHash.set(commit.hash,0)
+  });
+  const laneSpacing=58, laneValues=[0,...branchLaneByName.values(),...laneByHash.values()], maxAbove=Math.max(0,...laneValues.map(value=>value<0?-value:0)), maxBelow=Math.max(0,...laneValues.map(value=>value>0?value:0)), topPadding=64, bottomPadding=64, trunkY=topPadding+maxAbove*laneSpacing;
+  layoutOrder.forEach((commit,index)=>{
+    const lane=laneByHash.get(commit.hash)||0;
+    coordinates.set(commit.hash,{x:54+index*96,y:trunkY+lane*laneSpacing,lane});
+  });
   const selectedNames=new Set((state.selectedVersionBranches?.length?state.selectedVersionBranches:[state.selectedVersionBranch]).filter(Boolean));
   const selectedHashes=new Set();
   selectedNames.forEach(name=>(branchHistories.get(name)||new Set()).forEach(hash=>selectedHashes.add(hash)));
-  const branchColorByName=new Map(branchItems.map((item,index)=>[item.name,versionBranchColor(item,index,branchItems)]));
+  const branchColorByName=new Map(topologyBranchItems.map((item,index)=>[item.name,versionBranchColor(item,index,topologyBranchItems)]));
   const worktreeByBranch=new Map((data.worktrees||[]).filter(item=>item.branch).map(item=>[item.branch,item]));
-  const maxLane=Math.max(0,...[...coordinates.values()].map(item=>item.lane));
+  const laneColorIndex=lane=>((lane%6)+6)%6;
   const timelineWidth=Math.max(760,chronological.length*96+80), labelX=timelineWidth+28, labelWidth=250, width=labelX+labelWidth+34;
-  const height=Math.max(300,(maxLane+1)*58+92,branchItems.length*52+66), svgNs='http://www.w3.org/2000/svg';
-  const initialCommitCount=Math.min(5,chronological.length), initialStart=Math.max(0,chronological.length-initialCommitCount), initialPoint=coordinates.get(chronological[initialStart].hash), initialX=Math.max(0,(initialPoint?.x||0)-72), initialWidth=Math.min(width,Math.max(520,width-initialX)), previousFull=state.versionGraphFull, preserveView=Boolean(state.versionGraphView&&previousFull?.width===width&&previousFull?.height===height), full={width,height,initialWidth,initialHeight:height,initialCommitCount,initial:{x:initialX,y:0,width:initialWidth,height}};
+  const height=Math.max(300,topPadding+(maxAbove+maxBelow)*laneSpacing+bottomPadding), svgNs='http://www.w3.org/2000/svg';
+  const initialCommitCount=Math.min(5,commits.length), latestPoints=commits.slice(0,initialCommitCount).map(commit=>coordinates.get(commit.hash)).filter(Boolean), initialX=Math.max(0,(Math.min(...latestPoints.map(point=>point.x))||0)-72), initialWidth=Math.min(width,Math.max(520,width-initialX)), previousFull=state.versionGraphFull, preserveView=Boolean(state.versionGraphView&&previousFull?.width===width&&previousFull?.height===height), full={width,height,initialWidth,initialHeight:height,initialCommitCount,initial:{x:initialX,y:0,width:initialWidth,height}};
   state.versionGraphFull=full;
   if(!preserveView)state.versionGraphView=full.initial;
   const svg=document.createElementNS(svgNs,'svg'); svg.classList.add('version-commit-svg'); svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.setAttribute('preserveAspectRatio','xMidYMid meet'); svg.setAttribute('role','img'); svg.setAttribute('aria-label','Interactive repository commit graph with branch and worktree labels');
-  chronological.forEach(commit=>{
+  layoutOrder.forEach(commit=>{
     const child=coordinates.get(commit.hash);
     commit.parents.filter(parent=>coordinates.has(parent)).forEach(parent=>{
       const source=coordinates.get(parent), path=document.createElementNS(svgNs,'path'), selected=selectedHashes.has(parent)&&selectedHashes.has(commit.hash), selectedBranchName=[...selectedNames].find(name=>branchHistories.get(name)?.has(parent)&&branchHistories.get(name)?.has(commit.hash));
-      path.setAttribute('class',`version-commit-edge lane-${child.lane%6}${selected?' selected':''}`);
+      path.setAttribute('class',`version-commit-edge lane-${laneColorIndex(child.lane)}${selected?' selected':''}`);
       if(selectedBranchName)path.style.stroke=branchColorByName.get(selectedBranchName);
-      path.setAttribute('d',`M ${source.x} ${source.y} C ${source.x+34} ${source.y}, ${child.x-34} ${child.y}, ${child.x} ${child.y}`);
+      const midpoint=source.x+(child.x-source.x)*.5;
+      path.setAttribute('d',`M ${source.x} ${source.y} C ${midpoint} ${source.y}, ${midpoint} ${child.y}, ${child.x} ${child.y}`);
       svg.append(path)
     })
   });
-  chronological.forEach(commit=>{
+  layoutOrder.forEach(commit=>{
     const point=coordinates.get(commit.hash), selectedBranchName=[...selectedNames].find(name=>branchHistories.get(name)?.has(commit.hash)), selectedBranch=selectedHashes.has(commit.hash), group=document.createElementNS(svgNs,'g'), hit=document.createElementNS(svgNs,'circle'), outer=document.createElementNS(svgNs,'circle'), title=document.createElementNS(svgNs,'title');
     group.setAttribute('class',`version-commit-node${selectedBranch?' selected-branch':''}`); group.setAttribute('tabindex','0'); group.setAttribute('role','button'); group.setAttribute('aria-label',`${commit.short_hash}: ${commit.subject||'commit'}`);
     hit.setAttribute('cx',String(point.x)); hit.setAttribute('cy',String(point.y)); hit.setAttribute('r','19'); hit.setAttribute('class','version-commit-hit');
-    outer.setAttribute('cx',String(point.x)); outer.setAttribute('cy',String(point.y)); outer.setAttribute('r','9'); outer.setAttribute('class',`version-commit-outer lane-${point.lane%6}${commit.agent_commit?' agent':''}`);
+    outer.setAttribute('cx',String(point.x)); outer.setAttribute('cy',String(point.y)); outer.setAttribute('r','9'); outer.setAttribute('class',`version-commit-outer lane-${laneColorIndex(point.lane)}${commit.agent_commit?' agent':''}`);
     if(selectedBranchName){outer.style.stroke=branchColorByName.get(selectedBranchName);outer.style.strokeWidth='4'}
     title.textContent=`${commit.short_hash} ${commit.subject||''}`; group.append(hit,outer,title);
     if(commit.hash===state.selectedVersionCommit){
@@ -1136,7 +1214,7 @@ function renderVersionCommitGraph(data){
     group.onclick=()=>{if(state.versionGraphPanMoved){state.versionGraphPanMoved=false;return}selectVersionCommit(commit.hash)}; group.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectVersionCommit(commit.hash)}}; svg.append(group)
   });
   branchItems.forEach((item,index)=>{
-    const head=findCommit(item.head), point=head&&coordinates.get(head.hash), rowY=38+index*52, selected=selectedNames.has(item.name), color=versionBranchColor(item,index,branchItems), worktree=worktreeByBranch.get(item.name), group=document.createElementNS(svgNs,'g'), connector=document.createElementNS(svgNs,'path'), rect=document.createElementNS(svgNs,'rect'), name=document.createElementNS(svgNs,'text'), meta=document.createElementNS(svgNs,'text'), title=document.createElementNS(svgNs,'title');
+    const head=findCommit(item.head), point=head&&coordinates.get(head.hash), labelLane=item.main?0:(branchLaneByName.get(item.name)||0), rowY=trunkY+labelLane*laneSpacing, selected=selectedNames.has(item.name), color=versionBranchColor(item,index,topologyBranchItems), worktree=worktreeByBranch.get(item.name), group=document.createElementNS(svgNs,'g'), connector=document.createElementNS(svgNs,'path'), rect=document.createElementNS(svgNs,'rect'), name=document.createElementNS(svgNs,'text'), meta=document.createElementNS(svgNs,'text'), title=document.createElementNS(svgNs,'title');
     connector.setAttribute('class',`version-commit-branch-edge${selected?' selected':''}`); connector.style.stroke=color; connector.style.strokeWidth=selected?'4':'2'; connector.setAttribute('d',`M ${point?.x||timelineWidth-18} ${point?.y||rowY} C ${timelineWidth-12} ${point?.y||rowY}, ${labelX-28} ${rowY}, ${labelX} ${rowY}`); svg.append(connector);
     group.setAttribute('class',`version-commit-branch-label${item.main?' main':''}${item.current?' current':''}${selected?' selected':''}`); group.setAttribute('tabindex','0'); group.setAttribute('role','button'); group.setAttribute('aria-label',`Select branch ${item.name}`);
     rect.setAttribute('x',String(labelX)); rect.setAttribute('y',String(rowY-19)); rect.setAttribute('width',String(labelWidth)); rect.setAttribute('height','38'); rect.setAttribute('rx','9'); rect.style.stroke=color; rect.style.strokeWidth=selected?'3':'1.5'; if(item.main)rect.style.fill=color;
@@ -1243,17 +1321,24 @@ function renderVersionAgentList(data){
   })
 }
 function renderVersionControl(data){
-  const status=$('#version-control-status'), graph=$('#version-commit-graph'), branches=$('#version-branch-list'), source=$('#version-branch-source');
+  const status=$('#version-control-status'), graph=$('#version-commit-graph'), branches=$('#version-branch-list'), source=$('#version-branch-source'), consolidateButton=$('#version-consolidate-branches');
   if(!data?.is_repository){
     status.textContent='This project folder is not a Git repository. Configure Git to initialize it or add a remote.';
     graph.innerHTML='<div class="version-empty">No repository graph is available.</div>';
+    if(consolidateButton)consolidateButton.disabled=true;
     branches.innerHTML=''; source.innerHTML=''; renderVersionCommitInspector(); renderVersionAgentList(data); return
   }
   const current=data.current_branch||'(detached HEAD)', main=data.main_branch||'';
-  status.textContent=current===main
+  const baseStatus=current===main
     ? `On main branch “${main}” · ${data.clean?'working tree clean':'uncommitted changes'}`
     : `On branch “${current}”${main?` · main branch “${main}”`:''} · ${data.clean?'working tree clean':'uncommitted changes'}`;
+  status.textContent=state.versionConsolidationStatus?`${baseStatus} · ${state.versionConsolidationStatus}`:baseStatus;
+  if(consolidateButton)consolidateButton.disabled=state.versionConsolidationBusy||!main;
   const branchItems=data.branches||[];
+  if(state.versionGraphConsolidated&&branchItems.some(item=>!item.main&&!item.merged_into_main)){
+    state.versionGraphConsolidated=false;
+    if(state.project)localStorage.removeItem(`${VERSION_CONSOLIDATED_KEY}:${state.project.id}`)
+  }
   const validSelected=(state.selectedVersionBranches||[]).filter(name=>branchItems.some(item=>item.name===name));
   if(!validSelected.length){
     const fallback=data.current_branch||data.main_branch||branchItems[0]?.name||'';
@@ -1263,7 +1348,7 @@ function renderVersionControl(data){
   state.selectedVersionBranch=validSelected[validSelected.length-1]||'';
   renderVersionCommitGraph(data);
   renderVersionCommitInspector();
-  if(state.selectedVersionCommit&&state.selectedVersionCommitDetail?.hash!==state.selectedVersionCommit){
+  if(state.selectedVersionCommit&&!state.versionCommitDetailLoading&&state.selectedVersionCommitDetail?.hash!==state.selectedVersionCommit){
     loadVersionCommitDetails(state.selectedVersionCommit).catch(err=>{
       state.versionCommitDiffLoading=false;
       state.versionCommitActionStatus=`Could not load commit details: ${err.message}`;
@@ -1436,11 +1521,16 @@ async function selectProject(id){
   state.selectedVersionDiffPath='';
   state.selectedVersionDiff='';
   state.versionCommitDiffLoading=false;
+  state.versionCommitDetailLoading=false;
   state.versionCommitActionBusy=false;
   state.versionCommitActionStatus='';
   state.versionCommitTargetBranch='';
+  state.versionGraphConsolidated=localStorage.getItem(`${VERSION_CONSOLIDATED_KEY}:${id}`)==='true';
+  state.versionConsolidationBusy=false;
+  state.versionConsolidationStatus='';
   state.versionCommitDetailRequest++;
   state.versionCommitDiffRequest++;
+  state.versionControlLoadPromise=null;
   state.versionGraphView=null;
   state.versionGraphFull=null;
   state.messages={};
@@ -4075,6 +4165,7 @@ $('#version-control-configure').onclick=async()=>{
   }
   catch(err){alert(err.message)}
 };
+$('#version-consolidate-branches').onclick=()=>runVersionConsolidation();
 $('#version-graph-zoom-out').onclick=()=>zoomVersionGraph(1.15);
 $('#version-graph-zoom-in').onclick=()=>zoomVersionGraph(0.87);
 $('#version-graph-reset').onclick=resetVersionGraphView;
@@ -4511,5 +4602,6 @@ setupChatEnhancements();
 init();
 setInterval(()=>{
   if(state.project&&state.active&&!state.busy.has(state.active)&&!$('#workspace').classList.contains('hidden'))loadHistory(state.active);
+  refreshVersionControlIfVisible();
   monitorAgentRuns().catch(err=>console.warn('Could not monitor agent runs', err))
 }, 1500);
