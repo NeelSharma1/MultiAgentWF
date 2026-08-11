@@ -1,6 +1,9 @@
 import asyncio
 import json
 import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,6 +84,88 @@ def test_generic_command_marker_uses_the_local_approval_flow(tmp_path, monkeypat
     ))
     assert second["local_commands"][0]["cwd"] == str(tmp_path.resolve())
     assert "local-command" in second["response"]
+
+
+def test_failed_local_command_is_returned_to_agent_for_continuation(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    python = subprocess.list2cmdline([sys.executable]) if os.name == "nt" else shlex.quote(sys.executable)
+    command = f'{python} -c "import sys; sys.exit(7)"'
+    prompts = []
+    responses = iter([
+        f"I will inspect the project.\nCOMMAND - {command}",
+        "The command failed, so I continued with the original task.",
+    ])
+
+    async def fake_chat(*args, **_kwargs):
+        prompts.append(args[1])
+        return {"response": next(responses), "answered_by": "Researcher"}
+
+    team._agents_chat = fake_chat
+    result = asyncio.run(team.chat("researcher", "Continue the requested work", temporary_access="workspace"))
+
+    assert result["ok"] is True
+    assert len(prompts) == 2
+    assert "Continue the requested work" in prompts[1]
+    assert "Exit code: 7" in prompts[1]
+    assert result["local_commands"][0]["exit_code"] == 7
+    assert "continued with the original task" in result["response"]
+    assert "Local command" in result["response"]
+
+
+def test_create_marker_uses_the_existing_file_permission_flow(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    responses = iter([
+        "CREATE - generated.txt - hello from the agent",
+        "CREATE - generated.txt - hello from the agent",
+        "The file was created and I continued with the original task.",
+    ])
+
+    async def fake_chat(*_args, **_kwargs):
+        return {"response": next(responses), "answered_by": "Researcher"}
+
+    team._agents_chat = fake_chat
+    first = asyncio.run(team.chat("researcher", "Create the requested file"))
+
+    request = first["assistant_message"]["permission_request"]
+    assert request["scope"] == "workspace"
+    assert request["commands"] == ["CREATE - generated.txt - hello from the agent"]
+    assert not (tmp_path / "generated.txt").exists()
+
+    second = asyncio.run(team.chat(
+        "researcher", "Continue", record_user_message=False, temporary_access="workspace",
+    ))
+    assert second["file_actions"][0]["ok"] is True
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "hello from the agent"
+    assert "continued with the original task" in second["response"]
+
+
+def test_read_marker_result_is_returned_to_the_agent_before_it_finishes(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    monkeypatch.setattr(team, "_project_root", lambda _project_id: tmp_path)
+    (tmp_path / "notes.txt").write_text("zero\none\ntwo\n", encoding="utf-8")
+    prompts = []
+    responses = iter([
+        "READ - notes.txt - lines 2-3",
+        "I used the requested lines: one and two.",
+    ])
+
+    async def fake_chat(*args, **_kwargs):
+        prompts.append(args[1])
+        return {"response": next(responses), "answered_by": "Researcher"}
+
+    team._agents_chat = fake_chat
+    result = asyncio.run(team.chat("researcher", "Summarize the selected notes", temporary_access="workspace"))
+
+    assert len(prompts) == 2
+    assert "2: one" in prompts[1]
+    assert "3: two" in prompts[1]
+    assert "I used the requested lines" in result["response"]
+    assert "READ `notes.txt`" in result["response"]
 
 
 def test_queued_user_turns_are_not_leaked_into_the_current_provider_prompt(tmp_path):
