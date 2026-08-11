@@ -101,9 +101,11 @@ const state={
   actionPermissions: null,
   workflowMemories: [],
   activeWorkflowMemoryId: 0,
-  contextAgent: null,
-  active: 'orchestrator',
-  context: [],
+   contextAgent: null,
+   active: 'orchestrator',
+   graphContext: [],
+   selectedGraphNodeId: null,
+   graphContextBusy: false,
   messages: {},
   pendingAttachments: {},
   replyTo: {},
@@ -405,9 +407,9 @@ document.querySelectorAll('.settings-tabs a').forEach(tab=>tab.addEventListener(
   event.preventDefault();
   const target=tab.getAttribute('href');
   if(target==='#dashboard')showDashboard();
-  else if(target==='#workspace'||target==='#context-list'){
-    showWorkspace();
-    if(target==='#context-list')setTimeout(()=>$('#context-list')?.scrollIntoView({behavior:'smooth',block:'start'}),0)
+   else if(target==='#workspace'||target==='#graph-context'){
+     showWorkspace();
+     if(target==='#graph-context')setTimeout(()=>$('#graph-context')?.scrollIntoView({behavior:'smooth',block:'start'}),0)
   }else if(target==='#version-control')showVersionControl().catch(err=>alert(err.message));
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item===tab));
 }));
@@ -1558,7 +1560,7 @@ async function selectProject(id){
   else{
     selectAgent('')
   }
-  await loadContext();
+  await loadGraphContext();
   renderFlowchart();
   api(`/health?project_id=${id}`).then(health=>{
     if(state.project?.id===id)$('#status').textContent=`${health.agents} agents · MCP online`
@@ -2792,23 +2794,28 @@ function formatFileActionBytes(value){
   if(bytes<1024*1024)return `${(bytes/1024).toFixed(bytes<10*1024?1:0)} KB`;
   return `${(bytes/(1024*1024)).toFixed(1)} MB`
 }
-function renderLocalFileActionCard(payload){
-  const action=String(payload.action||'').toUpperCase(), ok=Boolean(payload.ok), path=String(payload.path||'Untitled file');
-  if(!['READ','CREATE'].includes(action))return '';
-  const heading=action==='READ'?'Read Files':'Changed Files', icon=ok?'✓':'!', status=ok?'Done':'Failed';
-  let detail='';
-  if(!ok){
-    detail=`<span class="local-file-action-error">${escapeHtml(String(payload.detail||'The file action did not complete.'))}</span>`
-  }else if(action==='READ'){
-    const scope=String(payload.scope||'').trim(), lines=Number(payload.line_count)||0;
-    const location=scope?`Lines ${escapeHtml(scope)}`:`${lines} line${lines===1?'':'s'}`;
-    detail=`<span class="local-file-action-meta">${location} · ${formatFileActionBytes(payload.bytes)}${payload.truncated?' · Preview capped':''}</span>`
-  }else{
-    const additions=Number(payload.added_lines)||0, removals=Number(payload.removed_lines)||0;
-    const state=payload.created?'Created':'Updated';
-    detail=`<span class="local-file-action-meta">${state} · ${formatFileActionBytes(payload.bytes)}</span><span class="local-file-action-delta add">+${additions}</span><span class="local-file-action-delta remove">-${removals}</span>`
-  }
-  return `<section class="local-file-action-card ${ok?'success':'failure'}"><div class="local-file-action-status"><span class="local-file-action-icon">${icon}</span><strong>${status}</strong></div><strong class="local-file-action-heading">${heading}</strong><div class="local-file-action-row"><code>${escapeHtml(path)}</code>${detail}</div></section>`
+function renderLocalFileActionCard(payloads){
+  const actions=(Array.isArray(payloads)?payloads:[payloads]).filter(payload=>['READ','CREATE'].includes(String(payload?.action||'').toUpperCase()));
+  if(!actions.length)return '';
+  const ok=actions.every(payload=>Boolean(payload.ok)), types=new Set(actions.map(payload=>String(payload.action).toUpperCase()));
+  const heading=types.size===1?(types.has('READ')?'Read Files':'Changed Files'):'File Actions', icon=ok?'✓':'!', status=ok?'Done':'Failed';
+  const rows=actions.map(payload=>{
+    const action=String(payload.action||'').toUpperCase(), path=String(payload.path||'Untitled file');
+    let detail='';
+    if(!payload.ok){
+      detail=`<span class="local-file-action-error">${escapeHtml(String(payload.detail||'The file action did not complete.'))}</span>`
+    }else if(action==='READ'){
+      const scope=String(payload.scope||'').trim(), lines=Number(payload.line_count)||0;
+      const location=scope?`Lines ${escapeHtml(scope)}`:`${lines} line${lines===1?'':'s'}`;
+      detail=`<span class="local-file-action-meta">${location} · ${formatFileActionBytes(payload.bytes)}${payload.truncated?' · Preview capped':''}</span>`
+    }else{
+      const additions=Number(payload.added_lines)||0, removals=Number(payload.removed_lines)||0;
+      detail=`<span class="local-file-action-meta">${payload.created?'Created':'Updated'} · ${formatFileActionBytes(payload.bytes)}</span><span class="local-file-action-delta add">+${additions}</span><span class="local-file-action-delta remove">-${removals}</span>`
+    }
+    return `<div class="local-file-action-row"><code>${escapeHtml(path)}</code><span class="local-file-action-details">${detail}</span></div>`
+  }).join('');
+  const count=actions.length>1?`<span class="local-file-action-count">${actions.length} actions</span>`:'';
+  return `<section class="local-file-action-card ${ok?'success':'failure'}"><div class="local-file-action-status"><span class="local-file-action-icon">${icon}</span><strong>${status}</strong>${count}</div><strong class="local-file-action-heading">${heading}</strong><div class="local-file-action-list">${rows}</div></section>`
 }
 function renderMarkdown(value){
   const lines=String(value??'').replace(/\r\n?/g, '\n').split('\n');
@@ -2833,8 +2840,17 @@ function renderMarkdown(value){
     const line=lines[index];
     const localFileAction=parseLocalFileActionCard(line);
     if(localFileAction){
-      blocks.push(renderLocalFileActionCard(localFileAction));
+      const localFileActions=[localFileAction];
       index++;
+      while(index<lines.length){
+        let candidate=index;
+        while(candidate<lines.length&&blank(lines[candidate]))candidate++;
+        const nextAction=parseLocalFileActionCard(lines[candidate]);
+        if(!nextAction)break;
+        localFileActions.push(nextAction);
+        index=candidate+1;
+      }
+      blocks.push(renderLocalFileActionCard(localFileActions));
       continue
     }
     const fence=line.match(/^\s{0,3}(`{3,}|~{3,})\s*([^\s]*)\s*$/);
@@ -3394,34 +3410,86 @@ async function loadTemplates(){
   const box=$('#agent-template-select');
   box.innerHTML='<option value="">No template</option>'+state.templates.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')
 }
-function renderContext(){
-  const box=$('#context-list');
-  $('#context-count').textContent=state.context.length;
-  const summary=$('#context-scope-summary');
-  if(summary){
-    const scoped=state.context.filter(item=>Array.isArray(item.roles)&&item.roles.includes(state.active));
-    summary.textContent=state.active?`${scoped.length} item${scoped.length===1?'':'s'} scoped to this agent · ${state.context.length-scoped.length} shared`:'';
+function graphNodeById(id){return state.graphContext.find(node=>String(node.id)===String(id))||null}
+function renderGraphContext(){
+  const box=$('#graph-context-list');
+  if(!box)return;
+  $('#graph-context-count').textContent=state.graphContext.length;
+  const selected=graphNodeById(state.selectedGraphNodeId), summary=$('#graph-context-scope-summary');
+  if(summary)summary.textContent=selected
+    ? `Selected ${selected.node_type}: ${selected.path||'.'}`
+    : state.project?.root_path?'Scan the configured project folder to refresh this graph.':'Set a project folder, then scan its graph.';
+  box.replaceChildren();
+  if(!state.graphContext.length){
+    const empty=document.createElement('p');
+    empty.className='graph-context-empty';
+    empty.textContent='No graph metadata yet. Scan the project to index safe text files.';
+    box.append(empty);
   }
-  box.innerHTML=state.context.length?'': '<p style="color:var(--muted);font-size:12px">No shared context yet.</p>';
-  state.context.forEach(x=>{
-    const d=document.createElement('article');
-    d.className='context-card';
-    const roles=x.roles?.length?x.roles: ['All agents'];
-    const scope=roles.includes(state.active)?'Available to this agent':(x.roles?.length?'Other agents':'Shared with all agents');
-    d.innerHTML=`<h3></h3><p></p><div class="context-scope-label">${scope}</div><div class="tags">${roles.map(r=>`<span class="tag">${r}</span>`).join('')}</div>`;
-    d.querySelector('h3').textContent=x.title;
-    d.querySelector('p').textContent=x.content;
-    d.onclick=()=>openContext(x);
-    box.append(d)
-  })
+  state.graphContext.forEach(node=>{
+    const card=document.createElement('article'), depth=node.path?node.path.split('/').length:0;
+    card.className=`graph-context-card ${String(node.id)===String(state.selectedGraphNodeId)?'selected':''}`;
+    card.style.marginLeft=`${Math.min(depth,5)*10}px`;
+    card.setAttribute('role','treeitem');
+    card.setAttribute('aria-selected',String(String(node.id)===String(state.selectedGraphNodeId)));
+    const heading=document.createElement('h3'), type=document.createElement('span'), detail=document.createElement('p');
+    heading.textContent=node.path||'.'; type.className='graph-context-type'; type.textContent=node.node_type;
+    detail.textContent=`${node.keywords?.join(', ')||'unclassified'} · ${String(node.vector_hash||'').slice(0,12)||'no vector'}`;
+    const tags=document.createElement('div'); tags.className='graph-context-tags';
+    (node.keywords||[]).slice(0,6).forEach(keyword=>{
+      const tag=document.createElement('span'); tag.className='graph-context-tag'; tag.textContent=keyword; tags.append(tag)
+    });
+    card.append(heading,type,detail,tags);
+    card.onclick=()=>selectGraphNode(node,true);
+    box.append(card)
+  });
+  $('#generate-selected-graph').disabled=!selected||state.graphContextBusy;
 }
-function openContext(item=null){
-  $('#context-id').value=item?.id||'';
-  $('#context-title-input').value=item?.title||'';
-  $('#context-content').value=item?.content||'';
-  document.querySelectorAll('#role-checks input').forEach(c=>c.checked=item?.roles.includes(c.value)||false);
-  $('#delete-context').style.visibility=item?'visible': 'hidden';
-  $('#context-dialog').showModal()
+function selectGraphNode(node, open=false){
+  state.selectedGraphNodeId=node?.id||null;
+  renderGraphContext();
+  if(open&&node)openGraphContext(node)
+}
+function openGraphContext(node){
+  if(!node)return;
+  $('#graph-context-id').value=node.id;
+  $('#graph-context-path').value=node.path||'.';
+  $('#graph-context-type').value=node.node_type;
+  $('#graph-context-keywords').value=(node.keywords||[]).join(', ');
+  $('#graph-context-vector').value=JSON.stringify(node.vector||[]);
+  $('#graph-context-detail').textContent=`Source: ${node.source||'unknown'}${node.model?` · ${node.model}`:''} · Updated ${node.updated_at||'unknown'}`;
+  $('#delete-graph-context').style.visibility=node.node_type==='project'?'hidden':'visible';
+  $('#graph-context-dialog').showModal()
+}
+async function loadGraphContext(){
+  if(!state.project){
+    state.graphContext=[]; state.selectedGraphNodeId=null; renderGraphContext(); return
+  }
+  state.graphContext=await api(`/api/graph-context?project_id=${state.project.id}`);
+  if(!graphNodeById(state.selectedGraphNodeId))state.selectedGraphNodeId=null;
+  renderGraphContext()
+}
+async function scanGraphContext(){
+  if(!state.project||state.graphContextBusy)return;
+  state.graphContextBusy=true; renderGraphContext();
+  try{
+    const result=await api('/api/graph-context/scan',{method:'POST',body:JSON.stringify({project_id:state.project.id})});
+    state.graphContext=result.items||[];
+    state.selectedGraphNodeId=null;
+    renderGraphContext()
+  }catch(err){alert(err.message)}
+  finally{state.graphContextBusy=false;renderGraphContext()}
+}
+async function generateGraphContext(path=''){
+  if(!state.project||state.graphContextBusy)return;
+  state.graphContextBusy=true; renderGraphContext();
+  try{
+    const result=await api('/api/graph-context/generate',{method:'POST',body:JSON.stringify({project_id:state.project.id,path})});
+    state.graphContext=result.items||[];
+    if(result.truncated)alert('Generated the first 100 graph nodes. Select a folder to continue in smaller batches.');
+    renderGraphContext()
+  }catch(err){alert(err.message)}
+  finally{state.graphContextBusy=false;renderGraphContext()}
 }
 function allCommands(){
   const provider=activeAgent()?.runtime?.provider||'*',
@@ -3520,7 +3588,8 @@ async function executeAppCommand(subcommand, arg){
     return true
   }
   if(subcommand==='context'){
-    openContext();
+    showWorkspace();
+    requestAnimationFrame(()=>$('#graph-context')?.scrollIntoView({behavior:'smooth', block:'nearest'}));
     return true
   }
   if(subcommand==='clear'){
@@ -3827,7 +3896,7 @@ $('#chat-form').onsubmit=async e=>{
     });
     submitted=true;
     await waitForChatRun(out.run.id, role, projectId);
-    await loadContext()
+    await loadGraphContext()
     console.log("Posted successfully")
   }
   catch(err){
@@ -3854,20 +3923,23 @@ $('#chat-form').onsubmit=async e=>{
     }
   }
 };
-$('#context-form').onsubmit=async e=>{
+$('#graph-context-form').onsubmit=async e=>{
   e.preventDefault();
-  const id=$('#context-id').value,
-  payload={
-    title: $('#context-title-input').value,
-    content: $('#context-content').value,
-    roles: [...document.querySelectorAll('#role-checks input:checked')].map(x=>x.value),
-    project_id: state.project.id
-  };
-  await api(id?`/api/context/${id}`: '/api/context', {
-    method: id?'PUT': 'POST', body: JSON.stringify(payload)
-  });
-  $('#context-dialog').close();
-  await loadContext()
+  const id=$('#graph-context-id').value;
+  if(!id||!state.project)return;
+  let vector;
+  try{vector=JSON.parse($('#graph-context-vector').value)}
+  catch{return alert('Numeric vector must be valid JSON.')}
+  if(!Array.isArray(vector)||vector.length!==16||vector.some(value=>!Number.isFinite(value))){
+    return alert('Numeric vector must contain exactly 16 finite numbers.')
+  }
+  const keywords=$('#graph-context-keywords').value.split(',').map(value=>value.trim()).filter(Boolean);
+  try{
+    const saved=await api(`/api/graph-context/${encodeURIComponent(id)}`, {method:'PUT', body:JSON.stringify({project_id:state.project.id, keywords, vector, source:'manual'})});
+    state.graphContext=state.graphContext.map(node=>String(node.id)===String(saved.id)?saved:node);
+    $('#graph-context-dialog').close();
+    renderGraphContext()
+  }catch(err){alert(err.message)}
 };
 $('#runtime-form').onsubmit=async e=>{
   e.preventDefault();
@@ -3946,14 +4018,15 @@ $('#clear-history').onclick=async()=>{
     $('#runtime-dialog').close()
   }
 };
-$('#delete-context').onclick=async()=>{
-  const id=$('#context-id').value;
-  if(id&&confirm('Delete this shared context item?')){
-    await api(`/api/context/${id}?project_id=${state.project.id}`, {
-      method: 'DELETE'
-    });
-    $('#context-dialog').close();
-    await loadContext()
+$('#delete-graph-context').onclick=async()=>{
+  const id=$('#graph-context-id').value;
+  if(id&&state.project&&confirm('Delete this graph node metadata?')){
+    try{
+      await api(`/api/graph-context/${encodeURIComponent(id)}?project_id=${state.project.id}`, {method:'DELETE'});
+      $('#graph-context-dialog').close();
+      state.selectedGraphNodeId=null;
+      await loadGraphContext()
+    }catch(err){alert(err.message)}
   }
 };
 function openAgentDialog(){
@@ -3967,7 +4040,17 @@ function selectedSkillRoles(){
 function selectedToolsetRoles(){
   return [...document.querySelectorAll('#toolset-agent-checks input:checked')].map(input=>input.value)
 }
-$('#new-context').onclick=()=>openContext();
+$('#scan-graph-context').onclick=()=>scanGraphContext();
+$('#generate-project-graph').onclick=()=>generateGraphContext();
+$('#generate-selected-graph').onclick=()=>{
+  const node=graphNodeById(state.selectedGraphNodeId);
+  if(node)generateGraphContext(node.path||'')
+};
+$('#generate-graph-context').onclick=()=>{
+  const node=graphNodeById($('#graph-context-id').value);
+  if(node)generateGraphContext(node.path||'')
+};
+$('#close-graph-context-dialog').onclick=()=>$('#graph-context-dialog').close();
 $('#new-agent').onclick=openAgentDialog;
 $('#new-chat').onclick=async()=>{
   if(!activeAgent()||!state.messages[state.active]?.length)return $('#message').focus();
@@ -4223,7 +4306,6 @@ $('#relationship-add-form').onsubmit=event=>{
   if(state.edges.some(item=>item.source_role===edge.source_role&&item.target_role===edge.target_role&&item.relationship===edge.relationship))return alert('That relationship already exists.');
   state.edges.push(edge); saveEdges(); renderWorkflowDialog(); renderFlowchart()
 };
-$('#close-dialog').onclick=()=>$('#context-dialog').close();
 $('#close-code-terminal').onclick=()=>$('#code-terminal-dialog').close();
 $('#tools-button').onclick=()=>openToolsDialog().catch(err=>alert(err.message));
 $('#close-tools').onclick=()=>$('#tools-dialog').close();
@@ -4530,15 +4612,6 @@ $('#project-form').onsubmit=async e=>{
 };
 $('#open-workspace').onclick=()=>showWorkspace();
 $('#home-button').onclick=showDashboard;
-async function loadContext(){
-  if(!state.project){
-    state.context=[];
-    renderContext();
-    return
-  }
-  state.context=await api(`/api/context?project_id=${state.project.id}`);
-  renderContext()
-}
 async function loadConnections(){
   const data=await api('/api/connections');
   for(const id of ['codex', 'openai', 'google', 'anthropic', 'compatible']){

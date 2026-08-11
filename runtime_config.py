@@ -268,23 +268,7 @@ class RuntimeConfigStore:
             if "input_json" not in chat_run_columns:
                 db.execute("ALTER TABLE chat_runs ADD COLUMN input_json TEXT NOT NULL DEFAULT ''")
             if self.recover_interrupted_runs:
-                # A process restart cannot resume an in-memory provider task.
-                # Make that state explicit instead of leaving the UI polling
-                # forever. Queued requests are durable user work and remain
-                # available to the dispatcher after a restart.
-                timestamp = datetime.now(timezone.utc).isoformat()
-                db.execute(
-                    """UPDATE chat_runs SET status='error', error=?, updated_at=?
-                    WHERE status='running'""",
-                    ("The server restarted before this agent run finished. Send the prompt again.", timestamp),
-                )
-                # A process restart can interrupt the provider after messages
-                # were claimed but before they were marked delivered. Requeue
-                # those messages so the next prompt cannot silently miss them.
-                db.execute(
-                    """UPDATE conversation_messages SET delivery_status='pending', delivery_run_id=''
-                    WHERE delivery_status='in_prompt'"""
-                )
+                self._recover_interrupted_runs(db)
             self._migrate_existing_projects(db)
 
     @contextmanager
@@ -296,6 +280,29 @@ class RuntimeConfigStore:
                 yield db
         finally:
             db.close()
+
+    @staticmethod
+    def _recover_interrupted_runs(db: sqlite3.Connection) -> int:
+        """Mark only genuinely orphaned in-memory provider tasks as interrupted."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        cursor = db.execute(
+            """UPDATE chat_runs SET status='error', error=?, updated_at=?
+            WHERE status='running'""",
+            ("The server restarted before this agent run finished. Send the prompt again.", timestamp),
+        )
+        # A process restart can interrupt the provider after messages were
+        # claimed but before they were marked delivered. Requeue those
+        # messages so the next prompt cannot silently miss them.
+        db.execute(
+            """UPDATE conversation_messages SET delivery_status='pending', delivery_run_id=''
+            WHERE delivery_status='in_prompt'"""
+        )
+        return max(0, int(cursor.rowcount))
+
+    def recover_interrupted_runs_now(self) -> int:
+        """Run startup recovery after this process has become the app server."""
+        with self._connect() as db:
+            return self._recover_interrupted_runs(db)
 
     @staticmethod
     def _projects_available(db: sqlite3.Connection) -> bool:

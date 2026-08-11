@@ -211,6 +211,19 @@ def test_auxiliary_runtime_store_does_not_recover_live_runs(tmp_path):
     assert helper.chat_run(run["id"])["status"] == "running"
 
 
+def test_explicit_recovery_does_not_run_until_server_startup(tmp_path):
+    db_path = tmp_path / "explicit-recovery.db"
+    store = RuntimeConfigStore(db_path)
+    run = store.create_chat_run("researcher", 1)
+    store.update_chat_run(run["id"], "running")
+
+    app_store = RuntimeConfigStore(db_path, recover_interrupted_runs=False)
+
+    assert app_store.chat_run(run["id"])["status"] == "running"
+    assert app_store.recover_interrupted_runs_now() == 1
+    assert app_store.chat_run(run["id"])["status"] == "error"
+
+
 def test_pending_agent_recipients_and_latest_runs_are_project_scoped(tmp_path):
     store = RuntimeConfigStore(tmp_path / "dispatcher.db")
     store.send_agent_message("orchestrator", "researcher", "Investigate this.", "command", project_id=4)
