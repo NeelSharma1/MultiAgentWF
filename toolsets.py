@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import shutil
 import sys
 from pathlib import Path, PurePosixPath
@@ -19,7 +20,12 @@ TOOL_CALL_RE = re.compile(
     r"(?P<tool>[a-z0-9]+(?:-[a-z0-9]+)*)[ \t]*-[ \t]*"
     r"(?P<arguments>\[[^\r\n]*\])[ \t]*\.[ \t]*$"
 )
+LOCAL_COMMAND_RE = re.compile(
+    r"(?m)^[ \t]*COMMAND[ \t]*-[ \t]*(?P<command>\S[^\r\n]*?)[ \t]*$",
+    flags=re.IGNORECASE,
+)
 TOOL_TIMEOUT_SECONDS = 60
+LOCAL_COMMAND_TIMEOUT_SECONDS = 600
 TOOL_OUTPUT_LIMIT = 200_000
 SAFE_ENV_NAMES = {
     "PATH", "HOME", "USER", "USERNAME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
@@ -362,6 +368,162 @@ class ToolsetStore:
         if suffix in {".exe", ".com"} or not suffix:
             return [str(path)]
         raise ValueError(f"Unsupported tool executable type: {suffix or '(none)'}")
+
+
+async def _read_limited(stream: asyncio.StreamReader, limit: int) -> tuple[str, bool]:
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    while chunk := await stream.read(8192):
+        if total < limit:
+            remaining = limit - total
+            chunks.append(chunk[:remaining])
+        total += len(chunk)
+        if total > limit:
+            truncated = True
+    return b"".join(chunks).decode(errors="replace"), truncated
+
+
+def _kill_local_command(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    if os.name == "nt":
+        process.kill()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        process.kill()
+
+
+def _local_command_environment(project_root: Path) -> dict[str, str]:
+    """Build a small, non-secret environment for a host-side command."""
+    environment = {
+        key: value for key, value in os.environ.items() if key in SAFE_ENV_NAMES
+    }
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PWD"] = str(project_root)
+    executable_name = "python.exe" if os.name == "nt" else "python"
+    bin_name = "Scripts" if os.name == "nt" else "bin"
+    for environment_name in ("venv", ".venv", "env"):
+        environment_root = project_root / environment_name
+        interpreter = environment_root / bin_name / executable_name
+        if interpreter.is_file():
+            environment["VIRTUAL_ENV"] = str(environment_root)
+            environment["PYTHON"] = str(interpreter)
+            environment["PATH"] = os.pathsep.join([
+                str(interpreter.parent), environment.get("PATH", "")
+            ])
+            break
+    return environment
+
+
+async def run_local_command(command: str, project_root: Path) -> dict[str, Any]:
+    """Run one command on the application host from the configured repository."""
+    command = str(command or "").strip()
+    root = Path(project_root).expanduser().resolve()
+    if not command:
+        raise ValueError("Local command cannot be empty")
+    if "\x00" in command:
+        raise ValueError("Local command cannot contain NUL characters")
+    if not root.is_dir():
+        raise FileNotFoundError(f"Project folder does not exist: {root}")
+    process = await asyncio.create_subprocess_shell(
+        command,
+        cwd=str(root),
+        env=_local_command_environment(root),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=os.name != "nt",
+    )
+    assert process.stdout is not None and process.stderr is not None
+    stdout_task = asyncio.create_task(_read_limited(process.stdout, TOOL_OUTPUT_LIMIT))
+    stderr_task = asyncio.create_task(_read_limited(process.stderr, TOOL_OUTPUT_LIMIT))
+    timed_out = False
+    try:
+        await asyncio.wait_for(process.wait(), timeout=LOCAL_COMMAND_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        timed_out = True
+        _kill_local_command(process)
+        await process.wait()
+    except asyncio.CancelledError:
+        _kill_local_command(process)
+        await process.wait()
+        raise
+    stdout, stdout_truncated = await stdout_task
+    stderr, stderr_truncated = await stderr_task
+    if timed_out:
+        stderr = f"{stderr}\nProcess timed out after {LOCAL_COMMAND_TIMEOUT_SECONDS} seconds.".strip()
+    if stdout_truncated:
+        stdout = f"{stdout}\n[stdout truncated after {TOOL_OUTPUT_LIMIT:,} bytes]".strip()
+    if stderr_truncated:
+        stderr = f"{stderr}\n[stderr truncated after {TOOL_OUTPUT_LIMIT:,} bytes]".strip()
+    return {
+        "ok": process.returncode == 0 and not timed_out,
+        "command": command,
+        "cwd": str(root),
+        "exit_code": process.returncode,
+        "timed_out": timed_out,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def format_local_command_result(result: dict[str, Any]) -> str:
+    """Render a host command result back into the agent's assistant message."""
+    status = "completed" if result.get("ok") else "failed"
+    lines = [
+        f"> Local command `{result.get('command', '')}` {status} "
+        f"(exit code {result.get('exit_code')}).",
+        f"> Working directory: `{result.get('cwd', '')}`",
+    ]
+    stdout = str(result.get("stdout") or "").strip()
+    stderr = str(result.get("stderr") or "").strip()
+    if stdout:
+        lines.extend(["", "```text", stdout, "```"])
+    if stderr:
+        lines.extend(["", "Command diagnostics:", "```text", stderr, "```"])
+    return "\n".join(lines)
+
+
+async def resolve_command_markers(
+    text: str, project_root: Path, allow_execution: bool = True,
+) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """Resolve `COMMAND - …` markers or return them as pending approvals.
+
+    The command itself is deliberately plain text so each provider can emit the
+    same protocol. Execution happens in this application process, with the
+    configured project as its working directory, never in a provider-owned
+    development workspace.
+    """
+    matches = list(LOCAL_COMMAND_RE.finditer(str(text or "")))
+    if not matches:
+        return text, [], []
+    parts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    pending: list[str] = []
+    cursor = 0
+    for match in matches:
+        parts.append(text[cursor:match.start()])
+        command = match.group("command").strip()
+        if not allow_execution:
+            pending.append(command)
+        else:
+            try:
+                result = await run_local_command(command, project_root)
+                calls.append(result)
+                parts.append(format_local_command_result(result))
+            except Exception as exc:
+                result = {
+                    "ok": False, "command": command, "cwd": str(Path(project_root).resolve()),
+                    "exit_code": None, "error": str(exc), "stdout": "", "stderr": "",
+                }
+                calls.append(result)
+                parts.append(f"> Local command `{command}` was rejected: {exc}")
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts).strip(), calls, pending
 
 
 def format_tool_result(result: dict[str, Any]) -> str:

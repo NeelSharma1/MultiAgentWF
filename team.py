@@ -28,7 +28,7 @@ from skills import (
     SkillStore, normalize_skill_language, normalize_skill_platform, normalize_skill_secret_refs,
     normalize_skill_type, skill_slug,
 )
-from toolsets import ToolsetStore, resolve_tool_calls, toolset_slug
+from toolsets import ToolsetStore, resolve_command_markers, resolve_tool_calls, toolset_slug
 from git_workflow import GitWorkflowStore
 
 
@@ -83,7 +83,8 @@ GOOGLE_TEXT_ONLY_INSTRUCTION = (
     "send_agent_message and list_agent_messages. Use them only when inter-agent coordination is needed; "
     "list_shared_context, publish_shared_context, and skill tools are not available on this bridge. "
     "Do not emit tool calls or function calls other than these explicitly supplied provider tools. A textual TOOLCALL marker "
-    "described by an assigned local toolset is allowed and will be handled after this response. Answer the user directly using the "
+    "described by an assigned local toolset and a textual COMMAND - <text of command> marker for a local repository command "
+    "are allowed and will be handled by the local application after this response. Answer the user directly using the "
     "conversation and shared context included here."
 )
 
@@ -622,6 +623,31 @@ class AgentTeam:
             bool(permissions["allow_commands"]) and bool(permissions["allow_file_edits"])
         )
 
+    def _local_workspace_guidance(self, role: str, project_id: int = 1) -> str:
+        """Tell every provider which workspace is authoritative and how to use it."""
+        project_root = self._project_root(project_id)
+        return (
+            "\n\n<local_repository_execution>\n"
+            f"The authoritative repository for this task is the user's local project at `{project_root}`. "
+            "Work against that repository and its current working tree. Do not create or use a provider-hosted "
+            "development workspace, temporary checkout, cloud sandbox, or alternate worktree as the source of truth, "
+            "and do not report changes made only there as local work.\n"
+            "When a command must run on the user's local machine, emit one separate plain-text line in exactly this "
+            "format: `COMMAND - <text of command>`. Emit one marker per command, with the command written exactly as "
+            "the local host should run it from the project root. Do not put COMMAND markers in Markdown fences, do not "
+            "prefix them with bullets, and do not execute generic commands through provider-native shell, terminal, "
+            "file-edit, or development-environment tools. The application removes each marker and runs it on the "
+            "local host with the repository as its working directory.\n"
+            "If the command or file change is not already authorized, request approval through the app using the "
+            "permission_request format below and list the exact command text inside <commands>; after approval, emit "
+            "the approved command as `COMMAND - <text of command>`. Use scope=\"workspace\" for repository work and "
+            "scope=\"external\" only when the command genuinely needs a path or service outside this repository. "
+            "Never claim a local command completed until the application has run it and returned its result.\n"
+            "Assigned TOOLCALL markers remain the only exception for assigned local toolsets; use them only with an "
+            "assigned toolset and let the application execute them.\n"
+            "</local_repository_execution>"
+        )
+
     def _action_guidance(self, role: str, project_id: int = 1, temporary_access: str = "") -> str:
         if os.name == "nt":
             python_command = r".\venv\Scripts\python.exe"
@@ -643,34 +669,37 @@ class AgentTeam:
             "app-managed run_project_tests MCP tool first with "
             f"role='{role}' and project_id={project_id}; it also runs pytest through the project's virtual "
             "environment from the local application outside the provider sandbox. Use a direct shell command only "
-            "when that tool is unavailable or the task specifically requires it. If a direct venv launcher reports "
+            "when that tool is unavailable or the task specifically requires it, and emit that command as a "
+            "`COMMAND - <text of command>` marker. If a direct venv launcher reports "
             "an inaccessible base interpreter, do not retry it; use the MCP runner and report its exact command and "
             "exit status. Never claim tests ran if the interpreter could not start.</Test_execution>"
         )
         if temporary_access == "external":
             return (
                 "\n\nThe user approved one external-access continuation. Perform only the specific action just "
-                "approved, then return to normal permissions. Do not inspect secrets or modify unrelated files."
+                "approved through the local COMMAND protocol, then return to normal permissions. Do not inspect "
+                "secrets or modify unrelated files."
                 + test_guidance
             )
         if temporary_access == "workspace":
             return (
                 "\n\nThe user approved one workspace-access continuation. Perform only the specific action just "
-                "approved inside this workspace, then return to normal permissions."
+                "approved inside this workspace through the local COMMAND protocol, then return to normal permissions."
                 + test_guidance
             )
         permissions = self._action_permissions(role, project_id)
         if permissions["full_system_access"]:
             return (
                 "\n\nThe user has explicitly granted unrestricted local system access for this agent. "
-                "You may read, write, and run commands outside the workspace when the task requires it. "
-                "Act directly without requesting permission, but do not inspect secrets or modify unrelated files."
+                "You may use COMMAND markers for commands outside the workspace when the task requires it. "
+                "No approval request is needed for this turn, but do not inspect secrets or modify unrelated files."
                 + test_guidance
             )
         if self._has_full_workspace_access(role, project_id):
             return (
                 "\n\nThe user has authorized you to run commands and edit files inside this workspace. "
-                "Act directly when needed inside the workspace. For any command or file operation outside the workspace, "
+                "Emit each local action through the COMMAND protocol when needed inside the workspace. For any command "
+                "or file operation outside the workspace, "
                 "do not perform it yet. Reply with a permission_request block on its own lines using exactly this format: "
                 "<permission_request scope=\"external\"><reason>concise reason</reason><commands>\n- exact command 1\n"
                 "- exact command 2\n</commands></permission_request>. Include every command you intend to run and wait for the user's decision."
@@ -680,8 +709,9 @@ class AgentTeam:
             return (
                 "\n\nThe user has authorized this agent to execute commands inside the workspace, including project "
                 "test runners. Command execution may create command-generated artifacts such as test caches or "
-                "temporary files. Do not use direct file-edit operations or intentionally edit project files unless "
-                "file-edit permission is also granted. For any command or file operation outside the workspace, "
+                "temporary files. Emit commands through the COMMAND protocol. Do not use direct file-edit operations or "
+                "intentionally edit project files unless file-edit permission is also granted. For any command or file "
+                "operation outside the workspace, "
                 "do not perform it yet. Reply with a permission_request block on its own lines using exactly this "
                 "format: <permission_request scope=\"external\"><reason>concise reason</reason><commands>\n"
                 "- exact command 1\n- exact command 2\n</commands></permission_request>. Include every "
@@ -694,7 +724,8 @@ class AgentTeam:
             "block on its own lines: <permission_request scope=\"workspace\"> or <permission_request scope=\"external\">, "
             "containing <reason>concise reason</reason><commands> followed by every exact planned command on lines beginning "
             "with '- ', then </commands></permission_request>. Use workspace for project work and external for work outside it. "
-            "Wait for the user's decision. Read-only inspection is allowed."
+            "Wait for the user's decision. Read-only inspection is allowed, but run local inspection commands through "
+            "the COMMAND protocol as well."
             + test_guidance
         )
 
@@ -982,6 +1013,7 @@ class AgentTeam:
             "role specifically needs it; never use native subagents instead of the configured workspace agents. "
             "Never claim another agent completed work unless the conversation or shared context shows it. "
             f"Be direct, practical, and identify assumptions. Your role is {definition['name']}: {definition['instructions']}"
+            f"{self._local_workspace_guidance(role, project_id)}"
             f"{self._action_guidance(role, project_id, temporary_access)}"
             f"{self._skill_guidance(role, project_id)}"
             f"{self._tool_guidance(role, project_id)}"
@@ -1015,12 +1047,13 @@ class AgentTeam:
             return OpenAIChatCompletionsModel(model=model, openai_client=client)
         raise ProviderError(f"{provider} is not an Agents SDK provider")
 
-    def _agent(self, role: str, config: dict[str, str], project_id: int = 1) -> Agent:
+    def _agent(self, role: str, config: dict[str, str], project_id: int = 1,
+               temporary_access: str = "") -> Agent:
         if not self.mcp:
             raise ProviderError("MCP server is not connected")
         return Agent(
             name=self.definitions.get(role, project_id)["name"],
-            instructions=self._instructions(role, project_id),
+            instructions=self._instructions(role, project_id, temporary_access),
             model=self._model(config),
             mcp_servers=[self.mcp],
         )
@@ -1285,8 +1318,9 @@ class AgentTeam:
     async def _agents_chat(self, role: str, message: str, config: dict[str, str], project_id: int = 1,
                            reply_to_id: int | None = None,
                            attachments: list[dict[str, Any]] | None = None,
-                           exclude_message_ids: set[int] | None = None) -> dict[str, str]:
-        agent = self._agent(role, config, project_id)
+                           exclude_message_ids: set[int] | None = None,
+                           temporary_access: str = "") -> dict[str, str]:
+        agent = self._agent(role, config, project_id, temporary_access)
         # Delegation must go through the durable send_agent_message MCP tool.
         # Native Agents SDK handoffs run inside this provider task, bypass the
         # recipient's SQLite transcript/chat_run, and therefore make a
@@ -1314,7 +1348,8 @@ class AgentTeam:
     async def _google_chat(self, role: str, message: str, config: dict[str, str], project_id: int = 1,
                            reply_to_id: int | None = None,
                            attachments: list[dict[str, Any]] | None = None,
-                           exclude_message_ids: set[int] | None = None) -> dict[str, str]:
+                           exclude_message_ids: set[int] | None = None,
+                           temporary_access: str = "") -> dict[str, str]:
         """Use Gemini's OpenAI-compatible chat surface with a small coordination tool bridge."""
         env_name = config["api_key_env"] or "GEMINI_API_KEY"
         key = os.getenv(env_name)
@@ -1324,7 +1359,7 @@ class AgentTeam:
         messages: list[dict[str, Any]] = [{
             "role": "system",
             "content": (
-                f"{self._instructions(role, project_id)}\n\nCurrent shared team context:\n{context_text}\n\n"
+                f"{self._instructions(role, project_id, temporary_access)}\n\nCurrent shared team context:\n{context_text}\n\n"
                 f"{GOOGLE_TEXT_ONLY_INSTRUCTION}{self._agent_directed_compaction_guidance(role, project_id)}"
             ),
         }]
@@ -1541,7 +1576,7 @@ class AgentTeam:
         if existing:
             prompt = (
                 f"The shared team context, reusable skill assignments, and local toolsets may have changed since the prior turn.\n"
-                f"{workspace_team_prompt}{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
+                f"{workspace_team_prompt}{self._local_workspace_guidance(role, project_id)}{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
                 f"User: {message}{reply_prompt}{attachment_prompt}"
             )
         else:
@@ -2102,15 +2137,16 @@ class AgentTeam:
                 await self._compact_context_if_needed(
                     role, config, project_id, exclude_message_ids=excluded_history_ids,
                 )
+                provider_access = {"temporary_access": temporary_access} if temporary_access else {}
                 if config["provider"] == "google":
                     result = await self._google_chat(
                         role, provider_message, config, project_id, reply_to_id, attachments,
-                        excluded_history_ids,
+                        excluded_history_ids, **provider_access,
                     )
                 else:
                     result = await self._agents_chat(
                         role, provider_message, config, project_id, reply_to_id, attachments,
-                        excluded_history_ids,
+                        excluded_history_ids, **provider_access,
                     )
         except Exception as exc:
             self.configs.release_agent_messages(
@@ -2166,11 +2202,26 @@ class AgentTeam:
                 )
                 raise
             action_permissions = self._action_permissions(role, project_id)
+            response_permission_match = re.search(
+                r'<permission_request\s+scope="(workspace|external)">',
+                result["response"], flags=re.IGNORECASE,
+            )
+            command_access_granted = (
+                temporary_access in {"workspace", "external"}
+                or action_permissions["effective_commands"]
+                or self._has_full_workspace_access(role, project_id)
+            )
+            # If the provider included a structured approval request, preserve
+            # its UI gate even when a persistent command grant exists. This
+            # prevents an explicitly external request from being executed by
+            # the host before the user sees and approves it.
+            allow_local_commands = command_access_granted and not response_permission_match
+            response_with_commands, local_commands, pending_commands = await resolve_command_markers(
+                result["response"], self._project_root(project_id), allow_execution=allow_local_commands,
+            )
             resolved_response, tool_calls = await resolve_tool_calls(
-                result["response"], self.toolsets, self._project_root(project_id), project_id, role,
-                allow_execution=temporary_access in {"workspace", "external"} or
-                action_permissions["effective_commands"] or
-                self._has_full_workspace_access(role, project_id),
+                response_with_commands, self.toolsets, self._project_root(project_id), project_id, role,
+                allow_execution=allow_local_commands,
             )
             result["response"] = resolved_response
             agent_requested_compaction = False
@@ -2183,6 +2234,8 @@ class AgentTeam:
                 ).strip()
             if tool_calls:
                 result["tool_calls"] = tool_calls
+            if local_commands:
+                result["local_commands"] = local_commands
             print(result, flush=True)
             user_message = existing_user_message
             if user_message is None and record_user_message:
@@ -2241,9 +2294,16 @@ class AgentTeam:
                     line[2:].strip() for line in (commands_match.group(1).splitlines() if commands_match else [])
                     if line.strip().startswith("- ") and line[2:].strip()
                 ]
+                commands.extend(command for command in pending_commands if command not in commands)
                 assistant_message["permission_request"] = self.projects.record_permission_request(
                     project_id, role, int(assistant_message["id"]), permission_match.group(1).lower(),
                     reason_match.group(1).strip() if reason_match else request_body, commands,
+                )
+            elif pending_commands:
+                assistant_message["permission_request"] = self.projects.record_permission_request(
+                    project_id, role, int(assistant_message["id"]), "workspace",
+                    "This agent requested permission to run commands in the local project repository.",
+                    pending_commands,
                 )
             if user_message is not None:
                 user_message["attachments"] = [

@@ -193,6 +193,11 @@ class GitDiffOpenInput(BaseModel):
 class GitPushInput(BaseModel):
     remote: str = Field(default="", max_length=120)
 
+
+class GitCommitBranchInput(BaseModel):
+    branch: str = Field(min_length=1, max_length=120)
+
+
 class CredentialInput(BaseModel):
     credential: str = Field(min_length=1, max_length=10000)
 
@@ -811,6 +816,16 @@ async def git_file_diff(project_id: int, commit_hash: str, path: str):
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.get("/api/projects/{project_id}/git/commits/{commit_hash}")
+async def git_commit_detail(project_id: int, commit_hash: str):
+    try:
+        return await asyncio.to_thread(team.git.commit_detail, project_id, _git_project_root(project_id), commit_hash)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.post("/api/projects/{project_id}/git/commits/{commit_hash}/open-diff")
 async def open_git_diff(project_id: int, commit_hash: str, payload: GitDiffOpenInput):
     try:
@@ -827,6 +842,42 @@ async def open_git_diff(project_id: int, commit_hash: str, payload: GitDiffOpenI
 async def revert_git_commit(project_id: int, commit_hash: str):
     try:
         return await asyncio.to_thread(team.git.revert, project_id, _git_project_root(project_id), commit_hash)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/rebase")
+async def rebase_git_commit(project_id: int, commit_hash: str, payload: GitCommitBranchInput):
+    try:
+        return await asyncio.to_thread(
+            team.git.rebase, project_id, _git_project_root(project_id), commit_hash, payload.branch,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/merge")
+async def merge_git_commit(project_id: int, commit_hash: str, payload: GitCommitBranchInput):
+    try:
+        return await asyncio.to_thread(
+            team.git.merge, project_id, _git_project_root(project_id), commit_hash, payload.branch,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/commits/{commit_hash}/merge-all")
+async def merge_git_commit_into_all_branches(project_id: int, commit_hash: str):
+    try:
+        return await asyncio.to_thread(
+            team.git.merge_into_all_branches, project_id, _git_project_root(project_id), commit_hash,
+        )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except GitWorkflowError as exc:
@@ -1753,12 +1804,9 @@ async def chat(role: str, payload: ChatInput, request: Request):
 
 @app.post("/api/agents/{role}/permission-response", status_code=202)
 async def permission_response(role: str, payload: PermissionResponseInput, project_id: int = 1):
-    """Resume a Codex turn after the user accepts or denies its structured request."""
+    """Resume an agent turn after the user accepts or denies its structured request."""
     try:
         team.definitions.get(role, project_id)
-        config = team.configs.get(role, project_id)
-        if config["provider"] != "codex":
-            raise ValueError("In-chat local permission approval is available only for Codex agents")
         request = projects.resolve_permission_request(project_id, role, payload.message_id, payload.approved)
         access = request["scope"] if payload.approved else ""
         decision = "approved" if payload.approved else "denied"
