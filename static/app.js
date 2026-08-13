@@ -377,27 +377,12 @@ function providerName(id){
 function runtimeLabel(r){
   return `${providerName(r.provider)}${r.model?` · ${r.model}`:''}${r.reasoning_effort?` · ${r.reasoning_effort}`:''}`
 }
-let flowchartRefreshFrame=0;
-function refreshVisibleFlowchart(){
-  if($('#dashboard')?.classList.contains('hidden')||!state.project)return;
-  // Create the nodes synchronously. On a first/background page load browsers
-  // may defer animation frames, but the Overview should never start blank.
-  renderFlowchart();
-  cancelAnimationFrame(flowchartRefreshFrame);
-  // Once the grid has painted, redraw only the connectors with final bounds.
-  flowchartRefreshFrame=requestAnimationFrame(()=>{
-    flowchartRefreshFrame=requestAnimationFrame(()=>{
-      flowchartRefreshFrame=0;
-      drawLines()
-    })
-  })
-}
 function showDashboard(){
   $('#workspace').classList.add('hidden');
   $('#version-control').classList.add('hidden');
   $('#dashboard').classList.remove('hidden');
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#dashboard'));
-  refreshVisibleFlowchart()
+  renderFlowchart()
 }
 function showWorkspace(role=state.active){
   $('#dashboard').classList.add('hidden');
@@ -1567,10 +1552,10 @@ async function selectProject(id){
   state.skills,
   state.toolsets]=await Promise.all([api(`/api/projects/${id}/layout`), api(`/api/projects/${id}/edges`), api(`/api/skills?project_id=${id}`), api(`/api/toolsets?project_id=${id}`)]);
   renderAgents();
-  // The Overview map is the primary project view. Render it as soon as its
-  // structural data arrives; transcript and metadata requests must never hold
-  // it hostage during the first page load.
-  refreshVisibleFlowchart();
+  // The Overview map depends only on agents, layout, and edges. Draw it now;
+  // an optional transcript or project-graph request must not leave Overview
+  // blank during the initial page load.
+  renderFlowchart();
   if(state.active){
     selectAgent(state.active);
   }
@@ -1849,20 +1834,9 @@ function clearLinkDrawing(redraw=true){
     drawLines()
   }
 }
-function defaultFlowPosition(index){
-  return {x:80+(index%3)*250, y:55+Math.floor(index/3)*190}
-}
 function normalizeGraphState(){
   const roles=new Set(state.agents.map(agent=>agent.id));
-  const savedPositions=new Map(
-    state.layout.filter(item=>item&&roles.has(item.role)).map(item=>[item.role,item])
-  );
-  // Agent definitions are authoritative. A missing or delayed layout record
-  // must never remove an agent from the Overview map.
-  state.layout=state.agents.map((agent,index)=>{
-    const saved=savedPositions.get(agent.id);
-    return saved?{role:agent.id,x:Number(saved.x)||0,y:Number(saved.y)||0}:{role:agent.id,...defaultFlowPosition(index)}
-  });
+  state.layout=state.layout.filter(item=>item&&roles.has(item.role));
   const seenEdges=new Set();
   const nextEdges=state.edges.filter(edge=>{
     if(!edge||edge.source_role===edge.target_role||!roles.has(edge.source_role)||!roles.has(edge.target_role)||!['command','report'].includes(edge.relationship))return false;
@@ -2229,6 +2203,7 @@ function saveEdges(){
 }
 function renderAgents(){
   const nav=$('#agents');
+  if(!nav)return;
   nav.innerHTML='';
   const query=state.agentSearch.trim().toLowerCase();
   const visible=state.agents.filter(a=>!query||`${a.name} ${a.brief} ${a.id}`.toLowerCase().includes(query));
@@ -2241,7 +2216,6 @@ function renderAgents(){
     b.onclick=()=>selectAgent(a.id);
     nav.append(b)
   });
-  $('#role-checks').innerHTML=state.agents.map(a=>`<label><input type="checkbox" value="${a.id}"> ${a.name}</label>`).join('')
 }
 function selectAgent(id){
   state.active=id;
@@ -3923,7 +3897,7 @@ $('#chat-form').onsubmit=async e=>{
     });
     submitted=true;
     await waitForChatRun(out.run.id, role, projectId);
-    await loadGraphContext()
+    loadGraphContext().catch(err=>console.warn('Could not refresh project graph metadata', err))
     console.log("Posted successfully")
   }
   catch(err){
@@ -4737,15 +4711,6 @@ async function init(){
     await selectProject(state.projects.some(p=>p.id===stored)?stored: state.projects[0].id);
     const h=await api(`/health?project_id=${state.project.id}`);
     $('#status').textContent=`${h.agents} agents · MCP online`
-    // The document starts on Overview, but that is not the same as running
-    // the Overview activation path. Invoke it once initial project hydration
-    // is complete so first load has the exact same map render as returning
-    // from Activity or Version control.
-    showDashboard();
-    // Initial scripts can finish before the browser has completed its first
-    // document layout. Re-enter the same map path after load without requiring
-    // any navigation from the user.
-    window.setTimeout(showDashboard, 0);
   }
   catch(err){
     $('#status').textContent=err.message;
@@ -4779,17 +4744,6 @@ function setupChatEnhancements(){
 applyTheme(preferredTheme());
 setupChatEnhancements();
 init();
-window.addEventListener('load',()=>{
-  if(state.project)showDashboard()
-});
-if(typeof ResizeObserver!=='undefined'){
-  new ResizeObserver(()=>{
-    if(!$('#dashboard')?.classList.contains('hidden'))drawLines()
-  }).observe($('#flowchart'))
-}
-document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden)refreshVisibleFlowchart()
-});
 setInterval(()=>{
   if(state.project&&state.active&&!state.busy.has(state.active)&&!$('#workspace').classList.contains('hidden'))loadHistory(state.active);
   refreshVersionControlIfVisible();
