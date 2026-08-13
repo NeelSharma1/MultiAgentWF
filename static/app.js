@@ -1552,16 +1552,17 @@ async function selectProject(id){
   state.skills,
   state.toolsets]=await Promise.all([api(`/api/projects/${id}/layout`), api(`/api/projects/${id}/edges`), api(`/api/skills?project_id=${id}`), api(`/api/toolsets?project_id=${id}`)]);
   renderAgents();
+  // The Overview map depends only on agents, layout, and edges. Draw it now;
+  // an optional transcript or project-graph request must not leave Overview
+  // blank during the initial page load.
+  renderFlowchart();
   if(state.active){
     selectAgent(state.active);
-    await loadHistory(state.active);
-    recoverActiveRun(state.active)
   }
   else{
     selectAgent('')
   }
-  await loadGraphContext();
-  renderFlowchart();
+  loadGraphContext().catch(err=>console.warn('Could not load project graph metadata', err));
   api(`/health?project_id=${id}`).then(health=>{
     if(state.project?.id===id)$('#status').textContent=`${health.agents} agents · MCP online`
   }).catch(()=>{})
@@ -3896,7 +3897,7 @@ $('#chat-form').onsubmit=async e=>{
     });
     submitted=true;
     await waitForChatRun(out.run.id, role, projectId);
-    await loadGraphContext()
+    loadGraphContext().catch(err=>console.warn('Could not refresh project graph metadata', err))
     console.log("Posted successfully")
   }
   catch(err){
