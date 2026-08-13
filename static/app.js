@@ -4726,6 +4726,11 @@ async function init(){
     await selectProject(state.projects.some(p=>p.id===stored)?stored: state.projects[0].id);
     const h=await api(`/health?project_id=${state.project.id}`);
     $('#status').textContent=`${h.agents} agents · MCP online`
+    // The document starts on Overview, but that is not the same as running
+    // the Overview activation path. Invoke it once initial project hydration
+    // is complete so first load has the exact same map render as returning
+    // from Activity or Version control.
+    showDashboard();
   }
   catch(err){
     $('#status').textContent=err.message;
