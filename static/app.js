@@ -1849,9 +1849,20 @@ function clearLinkDrawing(redraw=true){
     drawLines()
   }
 }
+function defaultFlowPosition(index){
+  return {x:80+(index%3)*250, y:55+Math.floor(index/3)*190}
+}
 function normalizeGraphState(){
   const roles=new Set(state.agents.map(agent=>agent.id));
-  state.layout=state.layout.filter(item=>item&&roles.has(item.role));
+  const savedPositions=new Map(
+    state.layout.filter(item=>item&&roles.has(item.role)).map(item=>[item.role,item])
+  );
+  // Agent definitions are authoritative. A missing or delayed layout record
+  // must never remove an agent from the Overview map.
+  state.layout=state.agents.map((agent,index)=>{
+    const saved=savedPositions.get(agent.id);
+    return saved?{role:agent.id,x:Number(saved.x)||0,y:Number(saved.y)||0}:{role:agent.id,...defaultFlowPosition(index)}
+  });
   const seenEdges=new Set();
   const nextEdges=state.edges.filter(edge=>{
     if(!edge||edge.source_role===edge.target_role||!roles.has(edge.source_role)||!roles.has(edge.target_role)||!['command','report'].includes(edge.relationship))return false;
@@ -4731,6 +4742,10 @@ async function init(){
     // is complete so first load has the exact same map render as returning
     // from Activity or Version control.
     showDashboard();
+    // Initial scripts can finish before the browser has completed its first
+    // document layout. Re-enter the same map path after load without requiring
+    // any navigation from the user.
+    window.setTimeout(showDashboard, 0);
   }
   catch(err){
     $('#status').textContent=err.message;
@@ -4764,6 +4779,9 @@ function setupChatEnhancements(){
 applyTheme(preferredTheme());
 setupChatEnhancements();
 init();
+window.addEventListener('load',()=>{
+  if(state.project)showDashboard()
+});
 if(typeof ResizeObserver!=='undefined'){
   new ResizeObserver(()=>{
     if(!$('#dashboard')?.classList.contains('hidden'))drawLines()
