@@ -1565,16 +1565,17 @@ async function selectProject(id){
   state.skills,
   state.toolsets]=await Promise.all([api(`/api/projects/${id}/layout`), api(`/api/projects/${id}/edges`), api(`/api/skills?project_id=${id}`), api(`/api/toolsets?project_id=${id}`)]);
   renderAgents();
+  // The Overview map is the primary project view. Render it as soon as its
+  // structural data arrives; transcript and metadata requests must never hold
+  // it hostage during the first page load.
+  refreshVisibleFlowchart();
   if(state.active){
     selectAgent(state.active);
-    await loadHistory(state.active);
-    recoverActiveRun(state.active)
   }
   else{
     selectAgent('')
   }
-  await loadGraphContext();
-  refreshVisibleFlowchart();
+  loadGraphContext().catch(err=>console.warn('Could not load project graph metadata', err));
   api(`/health?project_id=${id}`).then(health=>{
     if(state.project?.id===id)$('#status').textContent=`${health.agents} agents · MCP online`
   }).catch(()=>{})
