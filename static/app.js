@@ -377,12 +377,25 @@ function providerName(id){
 function runtimeLabel(r){
   return `${providerName(r.provider)}${r.model?` · ${r.model}`:''}${r.reasoning_effort?` · ${r.reasoning_effort}`:''}`
 }
+let flowchartRefreshFrame=0;
+function refreshVisibleFlowchart(){
+  if($('#dashboard')?.classList.contains('hidden')||!state.project)return;
+  cancelAnimationFrame(flowchartRefreshFrame);
+  // A hidden dashboard reports a zero-width chart. Wait for two paints after
+  // it becomes visible so both the grid and the chart have final dimensions.
+  flowchartRefreshFrame=requestAnimationFrame(()=>{
+    flowchartRefreshFrame=requestAnimationFrame(()=>{
+      flowchartRefreshFrame=0;
+      renderFlowchart()
+    })
+  })
+}
 function showDashboard(){
   $('#workspace').classList.add('hidden');
   $('#version-control').classList.add('hidden');
   $('#dashboard').classList.remove('hidden');
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item.getAttribute('href')==='#dashboard'));
-  renderFlowchart()
+  refreshVisibleFlowchart()
 }
 function showWorkspace(role=state.active){
   $('#dashboard').classList.add('hidden');
@@ -1561,7 +1574,7 @@ async function selectProject(id){
     selectAgent('')
   }
   await loadGraphContext();
-  renderFlowchart();
+  refreshVisibleFlowchart();
   api(`/health?project_id=${id}`).then(health=>{
     if(state.project?.id===id)$('#status').textContent=`${health.agents} agents · MCP online`
   }).catch(()=>{})
@@ -4743,6 +4756,11 @@ function setupChatEnhancements(){
 applyTheme(preferredTheme());
 setupChatEnhancements();
 init();
+if(typeof ResizeObserver!=='undefined'){
+  new ResizeObserver(()=>{
+    if(!$('#dashboard')?.classList.contains('hidden'))drawLines()
+  }).observe($('#flowchart'))
+}
 setInterval(()=>{
   if(state.project&&state.active&&!state.busy.has(state.active)&&!$('#workspace').classList.contains('hidden'))loadHistory(state.active);
   refreshVersionControlIfVisible();
