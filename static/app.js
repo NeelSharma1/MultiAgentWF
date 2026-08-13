@@ -380,13 +380,15 @@ function runtimeLabel(r){
 let flowchartRefreshFrame=0;
 function refreshVisibleFlowchart(){
   if($('#dashboard')?.classList.contains('hidden')||!state.project)return;
+  // Create the nodes synchronously. On a first/background page load browsers
+  // may defer animation frames, but the Overview should never start blank.
+  renderFlowchart();
   cancelAnimationFrame(flowchartRefreshFrame);
-  // A hidden dashboard reports a zero-width chart. Wait for two paints after
-  // it becomes visible so both the grid and the chart have final dimensions.
+  // Once the grid has painted, redraw only the connectors with final bounds.
   flowchartRefreshFrame=requestAnimationFrame(()=>{
     flowchartRefreshFrame=requestAnimationFrame(()=>{
       flowchartRefreshFrame=0;
-      renderFlowchart()
+      drawLines()
     })
   })
 }
@@ -4762,6 +4764,9 @@ if(typeof ResizeObserver!=='undefined'){
     if(!$('#dashboard')?.classList.contains('hidden'))drawLines()
   }).observe($('#flowchart'))
 }
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden)refreshVisibleFlowchart()
+});
 setInterval(()=>{
   if(state.project&&state.active&&!state.busy.has(state.active)&&!$('#workspace').classList.contains('hidden'))loadHistory(state.active);
   refreshVersionControlIfVisible();
