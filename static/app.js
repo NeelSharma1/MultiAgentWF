@@ -2203,6 +2203,7 @@ function saveEdges(){
 }
 function renderAgents(){
   const nav=$('#agents');
+  if(!nav)return;
   nav.innerHTML='';
   const query=state.agentSearch.trim().toLowerCase();
   const visible=state.agents.filter(a=>!query||`${a.name} ${a.brief} ${a.id}`.toLowerCase().includes(query));
@@ -2215,7 +2216,6 @@ function renderAgents(){
     b.onclick=()=>selectAgent(a.id);
     nav.append(b)
   });
-  $('#role-checks').innerHTML=state.agents.map(a=>`<label><input type="checkbox" value="${a.id}"> ${a.name}</label>`).join('')
 }
 function selectAgent(id){
   state.active=id;
