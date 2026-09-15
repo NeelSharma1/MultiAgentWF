@@ -1,14 +1,14 @@
 # Agent Team Workspace
 
-A local web workspace whose original workspace is seeded with six specialist agents—Orchestrator, Researcher, Programmer, Reviewer, Formatter, and Documenter—with extensible roles, provider-specific conversations, and MCP-backed shared context.
+A local web workspace whose original workspace is seeded with six specialist agents—Orchestrator, Researcher, Programmer, Reviewer, Formatter, and Documenter—with extensible roles, provider-specific conversations, and grounded project retrieval.
 
 ## What it does
 
 - Talk to each team member in an independent, persistent conversation.
 - Let agents send durable **command** or **report** messages directly into any other agent's project-scoped chat. Messages retain their sender and relationship type, appear in the recipient's groupchat transcript, and automatically start an idle recipient run; messages sent while a run is active remain queued and are synthesized into its next prompt.
 - Multiple unsent commands from the same sender to the same recipient are coalesced into one compiled command request. The transcript renders that bundle as a numbered command card, while every provider receives it as ordinary `[COMMAND from …]` text (never the storage envelope). Once a command has entered a provider prompt, later commands remain separate and are delivered on the following prompt.
-- Assign shared context to everyone or selected roles from the UI.
-- Let agents read and publish shared context through a local MCP server.
+- Opt in to **Project Knowledge** to build a local SQLite index over safe project text. Each agent turn refreshes changed files, combines provider-selected semantic embeddings with SQLite FTS5 lexical search, verifies source hashes, and supplies line-addressable evidence with `[S#]` citations.
+- Let agents run focused follow-up retrieval through the local `search_project_context` MCP tool. Retrieved source, indexing, validation, command, file-change, tool, and Git events are persisted and rendered as collapsible IDE-style chat cards.
 - Let the Orchestrator hand a request to the most appropriate specialist.
 - Choose a provider and model independently for every role: OpenAI, Codex, Google Gemini, or an OpenAI-compatible server.
 - Load each provider's available models into a dropdown instead of entering model IDs manually.
@@ -20,7 +20,7 @@ A local web workspace whose original workspace is seeded with six specialist age
 - Optionally enable a Git workflow while adding an agent, or later from an existing agent's right-click menu. The app asks for the main branch (and offers explicit repository initialization when needed), can add or update a named remote from its URL, gives every Git-enabled agent its own role-named branch, and merges each completed agent commit into main. The **Git** button exposes per-file diff summaries; a commit can be viewed in PyCharm or VS Code, safely reverted with a follow-up commit, rolled back only when it is the current HEAD merge, or pushed to GitHub.
 - Search the SkillsMP marketplace from the Skills dialog, filter installed packages by type, sort them by name/type/source/recent update, and import a GitHub-backed `SKILL.md` package into the local library. Marketplace scripts are downloaded for review and are not assigned automatically. Set `SKILLSMP_API_KEY` for the marketplace's higher authenticated quota, or leave it unset for anonymous search.
 - Marketplace installs stay in the dialog and stream download, extraction, and installation progress to the progress bar. The stream endpoint uses the upstream archive's byte count when available and falls back to an indeterminate progress state.
-- Store each workspace's agent definitions, runtime settings, context, conversations, Codex sessions, and graph locally in SQLite. New workspaces start with a blank graph; agents must be added to that workspace explicitly.
+- Store each workspace's agent definitions, runtime settings, project index, conversations, run events, Codex sessions, and graph locally in SQLite. New workspaces start with Project Knowledge disabled; agents must be added to that workspace explicitly.
 - Use messenger-style chat bubbles with timestamps, persisted reply threads, copy actions, and a queue-aware composer. You can submit another human command while an agent is working; it is persisted as its own transcript bubble and runs on the next turn, where it can be synthesized with any pending team commands or reports.
 - Render fenced Markdown code with a PyCharm-inspired palette. Every block can be copied; Python, JavaScript/Node, POSIX shell, and Ruby blocks can be run after confirmation in the selected project's local terminal pane, with stdout, stderr, exit status, timeout, and runtime errors shown.
 - Preserve failed provider calls in the chat with their HTTP status, error code/type, request ID, message, and provider response body for troubleshooting.
@@ -28,11 +28,11 @@ A local web workspace whose original workspace is seeded with six specialist age
 - Create and switch between Codex-style project workspaces with optional local folder references.
 - Arrange agents on a persistent flowchart and change their reporting relationships visually.
 - Type `/` in any agent chat for command autocomplete. The menu combines the active provider's native catalog (Codex commands are included), app-only commands, and provider commands you have previously used. App commands are namespaced as `/app …` so provider-native slash commands are never intercepted; `/gh` is the one explicit repository-report command.
-- Every Codex-backed project/agent chat owns a persistent headless Codex CLI session. Its thread ID is stored in SQLite and resumed after app shutdown or restart; each turn also receives the latest shared-context snapshot. Clearing that chat's history starts a new Codex session.
+- Every Codex-backed project/agent chat owns a persistent headless Codex CLI session. Its thread ID is stored in SQLite and resumed after app shutdown or restart; each turn also receives freshly retrieved project evidence when Project Knowledge is enabled. Clearing that chat's history starts a new Codex session.
 - Codex slash commands are sent verbatim to the same saved session through the real interactive terminal when one exists. `/status`, for example, returns the exact Codex status panel—including its model, permissions, account, session, and usage limits—rather than a response reconstructed by this app. Other providers receive slash commands as normal model prompts because their API protocols do not define a shared native slash-command catalog; those commands remain available for passthrough and are learned by autocomplete after first use.
 - `/gh` reports the selected project's local repository path, branch, HEAD, working-tree status, staged and unstaged changes, recent commits, and remotes without changing files.
 
-Agents with MCP/tool support can call `send_agent_message` and `list_agent_messages` directly. The REST equivalents are `POST /api/agents/{sender_role}/messages` and `GET /api/agents/{recipient_role}/inbox`; both require a `project_id`, and a message relationship must be `command` or `report`.
+Agents with MCP/tool support can call `send_agent_message`, `list_agent_messages`, and `search_project_context` directly. The REST messaging equivalents are `POST /api/agents/{sender_role}/messages` and `GET /api/agents/{recipient_role}/inbox`; both require a `project_id`, and a message relationship must be `command` or `report`.
 
 The app opens on the project/team map. Drag a team-member card to reposition it, use its **Reports to** menu to change the hierarchy, and double-click it to open that agent's chat. Creating or switching projects alone does not modify the selected folder; explicit actions such as saving a local toolset, materializing an assigned skill, or running code can write or execute within it.
 
@@ -67,6 +67,14 @@ The Gemini bridge preserves the provider's `extra_content.google.thought_signatu
 
 Open **Settings → Accounts** in the app header to connect Codex with ChatGPT device authorization or securely save/remove OpenAI, Gemini, Anthropic, and OpenAI-compatible endpoint credentials. Saved keys are written only to the ignored `.env.local` with owner-only file permissions and are never returned to the frontend.
 
+### Project Knowledge
+
+Project Knowledge is disabled separately for every workspace. New workspaces default to local Ollama with `nomic-embed-text:latest` at its native 768 dimensions and `http://127.0.0.1:11434`; OpenAI `text-embedding-3-small` at 256 dimensions remains available as an explicit per-project choice. The enable dialog performs a real test embedding and identifies the exact destination before consent. Ollama document and query inputs receive Nomic's `search_document:` and `search_query:` prefixes, and no local failure silently falls back to a cloud provider.
+
+Install Ollama and run `ollama pull nomic-embed-text`. When a project is configured for a loopback Ollama endpoint, the app detects an already-running server or starts `ollama serve` from the installed CLI, then performs a project-text-free warmup embedding so Ollama loads the configured model. A server started by the app is stopped during application shutdown; an independently running Ollama service is left alone. The app diagnoses a missing model, invalid vector response, or inference failure but never downloads or upgrades Ollama itself. Changing provider, model, endpoint, dimensions, or resolved model digest invalidates the semantic index and requires fresh consent. Chunks and vectors remain in the ignored local `data/workspace.db`; `.env*`, private keys, Git internals, dependencies, caches, ignored paths, symlinks, binaries, files larger than 128 KB, and content beyond the 5,000-file project limit are not indexed. Disabling Project Knowledge cancels active indexing and removes that workspace's local index.
+
+The retrieval path ranks up to 40 semantic and 40 lexical candidates with reciprocal-rank fusion, returns at most eight non-overlapping excerpts within a 10,000-token evidence budget, and rechecks the current file hash before returning a source. Agent answers use `[S#]` source IDs; unknown citations are rejected by validation and trigger at most one correction pass.
+
 Executable skill helpers receive one JSON object on stdin and in `SKILL_INPUT_JSON`; they should print one JSON value to stdout. The runner selects the current OS variant (`macos`, `linux`, `windows`, then `any`), enforces a 30-second timeout and output cap, and returns both structured output and terminal diagnostics. Instruction-only skills are valid and are loaded from `SKILL.md` rather than executed. Assignments are checked before either a human or an agent can run a skill. ACP packages assigned to a project are materialized under `.agents/skills/<skill-name>` so compatible Codex/agent clients can discover them natively.
 
 Skills may declare `required_secrets` as a JSON array of environment-variable references, for example `[{"name":"WEATHER_API_KEY","label":"Weather API key","required":true}]`. Add or edit those declarations in the Skills editor, then save each value in the same editor. Skill values are stored only in the ignored, owner-readable `data/.skill-secrets.local` file, while provider account keys remain in `.env.local`; the browser sees only configured/missing status. The runner injects only declared values into that skill's child process and redacts them from returned stdout/stderr. Marketplace packages are never allowed to provision or request a value automatically; review a package before assigning it. For production deployments, replace the local credential store with an OS keychain or secret manager.
@@ -92,8 +100,9 @@ pytest
 - `skills.py`: ACP/Agent-Skills package index, SKILL.md parser/writer, OS/version selection, marketplace client, project materialization, resource loading, assignments, and script runners.
 - `toolsets.py`: project-local toolset manifests, summary documents, assignments, `TOOLCALL`/`COMMAND`/`READ`/`CREATE` parsing, local process launch, workspace file actions, and chat-result formatting.
 - `git_workflow.py`: shared-branch Git configuration, run commits, file summaries/diffs, editor launch, revert/rollback, and remote push operations.
-- `mcp_server.py`: stdio MCP server exposing shared-context, reusable-skill, and inter-agent messaging tools.
-- `shared_context.py`: deterministic SQLite context store used by the MCP server and UI.
+- `embedding_providers.py`: shared OpenAI/Ollama embedding profiles, model readiness checks, Nomic task prefixes, and vector validation.
+- `rag.py`: consent-compatible project scanning, token-aware provider-scoped vector storage, FTS5/cosine hybrid ranking, freshness checks, and citation evidence envelopes.
+- `mcp_server.py`: stdio MCP server exposing project retrieval, reusable-skill, and inter-agent messaging tools.
 - `static/`: dependency-free browser interface.
 - `data/`: ignored local SQLite state.
 

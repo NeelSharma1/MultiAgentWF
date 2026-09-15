@@ -205,6 +205,39 @@ def test_read_marker_result_is_returned_to_the_agent_before_it_finishes(tmp_path
     assert "3: two" in prompts[1]
     assert "I used the requested lines" in result["response"]
     assert "LOCAL_FILE_ACTION" in result["response"]
+
+
+def test_rag_answer_gets_one_citation_correction_and_validation_event(tmp_path):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    run = team.configs.create_chat_run("researcher", 1, {"message": "Where is auth?"})
+    calls = []
+    responses = iter([
+        "Authentication is implemented in auth.py.",
+        "Authentication is implemented in auth.py [S1].",
+    ])
+
+    async def fake_prepare(*_args, **_kwargs):
+        hit = {
+            "source_id": "S1", "path": "auth.py", "start_line": 1, "end_line": 4,
+            "content_hash": "abc", "excerpt": "def authenticate(): ...",
+        }
+        return "<project_evidence><source id=\"S1\">auth</source></project_evidence>", [hit]
+
+    async def fake_chat(*args, **_kwargs):
+        calls.append(args[1])
+        return {"response": next(responses), "answered_by": "Researcher"}
+
+    team.prepare_rag_evidence = fake_prepare
+    team._agents_chat = fake_chat
+    result = asyncio.run(team.chat("researcher", "Where is auth?", run_id=run["id"]))
+
+    assert len(calls) == 2
+    assert result["response"].endswith("[S1].")
+    validation = team.configs.run_events(run["id"])[-1]
+    assert validation["event_type"] == "validation"
+    assert validation["status"] == "completed"
+    assert validation["payload"]["citations"] == ["S1"]
     assert "2: one" not in result["response"]
     assert "3: two" not in result["response"]
 

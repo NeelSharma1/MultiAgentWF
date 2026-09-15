@@ -44,6 +44,8 @@ def bind_available_port(host: str = "127.0.0.1", start_port: int = 8000) -> tupl
     raise OSError(f"No available TCP port found from {start_port} through 65535")
 
 from graph_context import GraphContextError, GraphContextStore, ROLES  # noqa: E402
+from embedding_providers import EmbeddingProviderError, profile_from_project  # noqa: E402
+from rag import RagError, eligible_files  # noqa: E402
 from team import AgentTeam, ROLE_BRIEFS, project_python_executable  # noqa: E402
 from mcp_server import mcp as workspace_mcp  # noqa: E402
 from credentials import LocalCredentialStore  # noqa: E402
@@ -58,6 +60,7 @@ credentials = LocalCredentialStore(ROOT / ".env.local")
 skill_credentials = LocalCredentialStore(ROOT / "data" / ".skill-secrets.local")
 projects = ProjectStore(ROOT / "data" / "workspace.db")
 chat_tasks: set[asyncio.Task] = set()
+rag_tasks: dict[tuple[int, str], asyncio.Task] = {}
 git_run_locks: dict[int, asyncio.Lock] = {}
 agent_dispatch_task: asyncio.Task | None = None
 workspace_mcp_http_app = workspace_mcp.streamable_http_app()
@@ -89,8 +92,12 @@ async def lifespan(_: FastAPI):
                 agent_dispatch_task = None
             for task in chat_tasks:
                 task.cancel()
+            for task in rag_tasks.values():
+                task.cancel()
             if chat_tasks:
                 await asyncio.gather(*chat_tasks, return_exceptions=True)
+            if rag_tasks:
+                await asyncio.gather(*rag_tasks.values(), return_exceptions=True)
             await team.stop()
 
 
@@ -162,6 +169,27 @@ class GraphScanInput(BaseModel):
 class GraphGenerateInput(BaseModel):
     path: str = Field(default="", max_length=2000)
     project_id: int = 1
+
+
+class RagConsentInput(BaseModel):
+    enabled: bool
+
+
+class RagEmbeddingSettingsInput(BaseModel):
+    provider: Literal["ollama", "openai"] = "ollama"
+    model: str = Field(default="nomic-embed-text:latest", min_length=1, max_length=200)
+    base_url: str = Field(default="http://127.0.0.1:11434", max_length=2000)
+    dimensions: int = Field(default=768, ge=1, le=16_384)
+
+
+class RagIndexInput(BaseModel):
+    force: bool = False
+
+
+class RagSearchInput(BaseModel):
+    query: str = Field(min_length=1, max_length=20_000)
+    path_prefix: str = Field(default="", max_length=2000)
+    limit: int = Field(default=8, ge=1, le=20)
 
 
 class RuntimeInput(BaseModel):
@@ -588,6 +616,7 @@ async def delete_project(project_id: int):
                 Path(attachment["path"]).unlink(missing_ok=True)
         team.configs.remove_project(project_id)
         team.context.delete_project(project_id)
+        team.rag.delete_project(project_id)
         team.definitions.delete_project(project_id)
         team.git.remove_project(project_id)
         projects.delete(project_id)
@@ -1496,6 +1525,10 @@ async def get_history(role: str, project_id: int = 1):
     messages = team.configs.history(role, limit=200, project_id=project_id)
     for message in messages:
         message["permission_request"] = projects.permission_request(project_id, role, int(message["id"]))
+        message["events"] = (
+            team.configs.run_events(str(message.get("run_id") or ""))
+            if message.get("run_id") and message.get("speaker") in {"assistant", "error"} else []
+        )
     return {"messages": messages}
 
 
@@ -1755,7 +1788,7 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
             return await team.chat(
                 role, payload.message.strip(), payload.model, payload.reasoning_effort, payload.project_id,
                 payload.reply_to_id, payload.attachment_ids, payload.record_user_message,
-                payload.user_message_id, payload.temporary_access,
+                payload.user_message_id, payload.temporary_access, run_id,
             )
 
         if team.git.agent_enabled(payload.project_id, role):
@@ -1776,12 +1809,17 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
                 else:
                     if commit:
                         result["git_commit"] = commit
+                        team.configs.add_run_event(
+                            run_id, payload.project_id, role, "git_summary", "completed",
+                            f"Committed {len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''}",
+                            commit,
+                        )
                         team.configs.add_message(
                             role, "app",
                             f"Committed {commit['commit_hash'][:12]} on agent branch '{commit['agent_branch']}' and "
                             f"merged it into the main branch '{commit['main_branch']}': {commit['message']} "
                             f"({len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''}).",
-                            "git", commit["commit_hash"], payload.project_id,
+                            "git", commit["commit_hash"], payload.project_id, run_id=run_id,
                         )
         else:
             result = await call_provider()
@@ -1923,6 +1961,189 @@ async def list_graph_context(project_id: int = 1, path: str | None = None):
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except GraphContextError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/rag/status")
+async def rag_status(project_id: int):
+    try:
+        project = projects.get(project_id)
+        configured = profile_from_project(project)
+        if configured.provider == "openai":
+            ready = credentials.configured("OPENAI_API_KEY")
+            readiness = {
+                **configured.public(), "ready": ready,
+                "error": "" if ready else "Connect an OpenAI API key in Settings → Accounts",
+            }
+        else:
+            readiness = await team.embedding_preflight(project_id)
+        consent_profile = str(project.get("rag_consent_profile") or "")
+        if (bool(project.get("rag_enabled")) and consent_profile
+                and consent_profile != str(readiness.get("fingerprint") or "")):
+            readiness["ready"] = False
+            readiness["error"] = (
+                "The embedding model changed after consent. Disable and re-enable Project Knowledge."
+            )
+        status = team.rag.status(project_id, configured)
+        status.update({
+            "enabled": bool(project.get("rag_enabled")),
+            "consent_at": project.get("rag_consent_at"),
+            "credential_configured": (
+                configured.provider == "ollama" or credentials.configured("OPENAI_API_KEY")
+            ),
+            "embedding": readiness,
+            "ready": bool(readiness.get("ready")),
+            "documents_detail": team.rag.documents(project_id),
+            "eligible_file_count": len(await asyncio.to_thread(
+                eligible_files, graph_project_root(project)
+            )),
+        })
+        return status
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/rag/embedding-preflight")
+async def rag_embedding_preflight(project_id: int, payload: RagEmbeddingSettingsInput):
+    try:
+        project = projects.get(project_id)
+        candidate = dict(project)
+        candidate.update({
+            "rag_embedding_provider": payload.provider,
+            "rag_embedding_model": payload.model,
+            "rag_embedding_base_url": payload.base_url,
+            "rag_embedding_dimensions": payload.dimensions,
+        })
+        configured = profile_from_project(candidate)
+        try:
+            resolved, _ = await team.embeddings.preflight(configured)
+            return {**resolved.public(), "ready": True, "error": ""}
+        except EmbeddingProviderError as exc:
+            return {**configured.public(), "ready": False, "error": str(exc)}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, EmbeddingProviderError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/rag/embedding-settings")
+async def update_rag_embedding_settings(project_id: int, payload: RagEmbeddingSettingsInput):
+    try:
+        before = projects.get(project_id)
+        candidate = dict(before)
+        candidate.update({
+            "rag_embedding_provider": payload.provider,
+            "rag_embedding_model": payload.model,
+            "rag_embedding_base_url": payload.base_url,
+            "rag_embedding_dimensions": payload.dimensions,
+        })
+        configured = profile_from_project(candidate)
+        resolved, _ = await team.embeddings.preflight(configured)
+        previous = profile_from_project(before)
+        changed = (
+            previous.provider, previous.model, previous.base_url, previous.dimensions,
+        ) != (resolved.provider, resolved.model, resolved.base_url, resolved.dimensions)
+        if changed:
+            active = [task for (owner, _), task in rag_tasks.items() if owner == project_id]
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            team.rag.delete_project(project_id)
+        project = projects.set_rag_embedding_settings(
+            project_id, resolved.provider, resolved.model, resolved.base_url, resolved.dimensions,
+        )
+        return {"project": project, "embedding": {**resolved.public(), "ready": True, "error": ""}}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, EmbeddingProviderError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/rag/consent")
+async def update_rag_consent(project_id: int, payload: RagConsentInput):
+    try:
+        consent_profile = ""
+        if payload.enabled:
+            readiness = await team.embedding_preflight(project_id)
+            if not readiness.get("ready"):
+                raise HTTPException(409, str(readiness.get("error") or "Embedding model is not ready"))
+            consent_profile = str(readiness.get("fingerprint") or "")
+        project = projects.set_rag_enabled(project_id, payload.enabled, consent_profile)
+        if not payload.enabled:
+            active = [task for (owner, _), task in rag_tasks.items() if owner == project_id]
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            team.rag.delete_project(project_id)
+        return {
+            "enabled": bool(project.get("rag_enabled")),
+            "consent_at": project.get("rag_consent_at"),
+            "consent_profile": project.get("rag_consent_profile"),
+        }
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+async def _run_rag_index_job(project_id: int, job_id: str, force: bool) -> None:
+    try:
+        await team.index_project_knowledge(project_id, force=force, job_id=job_id)
+    except asyncio.CancelledError:
+        team.rag._update_job(job_id, status="error", error="Server stopped during indexing")
+        raise
+    except Exception as exc:
+        team.rag._update_job(job_id, status="error", error=str(exc)[:1000])
+
+
+@app.post("/api/projects/{project_id}/rag/index", status_code=202)
+async def start_rag_index(project_id: int, payload: RagIndexInput):
+    try:
+        project = projects.get(project_id)
+        if not bool(project.get("rag_enabled")):
+            raise HTTPException(409, "Enable Project Knowledge and confirm source embedding first")
+        readiness = await team.embedding_preflight(project_id)
+        if not readiness.get("ready"):
+            raise HTTPException(409, str(readiness.get("error") or "Embedding model is not ready"))
+        job = team.rag.create_job(project_id)
+        task = asyncio.create_task(
+            _run_rag_index_job(project_id, str(job["id"]), payload.force),
+            name=f"rag-index-{project_id}-{job['id']}",
+        )
+        task_key = (project_id, str(job["id"]))
+        rag_tasks[task_key] = task
+        task.add_done_callback(lambda _task, key=task_key: rag_tasks.pop(key, None))
+        return {"job": job}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/rag/index/{job_id}")
+async def rag_index_job(project_id: int, job_id: str):
+    try:
+        projects.get(project_id)
+        job = team.rag.job(job_id)
+        if not job or int(job["project_id"]) != project_id:
+            raise HTTPException(404, "Index job not found")
+        return {"job": job}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/rag/search")
+async def search_project_knowledge(project_id: int, payload: RagSearchInput):
+    try:
+        project = projects.get(project_id)
+        if not bool(project.get("rag_enabled")):
+            raise HTTPException(409, "Project Knowledge is not enabled")
+        await team.index_project_knowledge(project_id)
+        results = await team.search_project_knowledge(
+            project_id, payload.query, limit=payload.limit, path_prefix=payload.path_prefix,
+        )
+        return {"query": payload.query, "results": results}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RagError as exc:
         raise HTTPException(422, str(exc)) from exc
 
 

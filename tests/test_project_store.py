@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from project_store import ProjectStore
@@ -69,6 +71,67 @@ def test_relationship_enforcement_is_persisted_per_project(tmp_path, monkeypatch
     updated = store.set_relationship_enforcement(project["id"], True)
     assert updated["enforce_relationships"] == 1
     assert store.get(project["id"])["enforce_relationships"] == 1
+
+
+def test_project_knowledge_requires_explicit_persisted_consent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = ProjectStore(tmp_path / "projects.db")
+    project = store.create("Grounded workspace")
+
+    assert project["rag_enabled"] == 0
+    assert project["rag_consent_at"] is None
+    enabled = store.set_rag_enabled(project["id"], True)
+    assert enabled["rag_enabled"] == 1
+    assert enabled["rag_consent_at"]
+
+    reopened = ProjectStore(tmp_path / "projects.db")
+    assert reopened.get(project["id"])["rag_enabled"] == 1
+    disabled = reopened.set_rag_enabled(project["id"], False)
+    assert disabled["rag_enabled"] == 0
+    assert disabled["rag_consent_at"] is None
+
+
+def test_embedding_settings_default_to_ollama_and_changes_reset_consent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = ProjectStore(tmp_path / "projects.db")
+    project = store.create("Local retrieval")
+
+    assert project["rag_embedding_provider"] == "ollama"
+    assert project["rag_embedding_model"] == "nomic-embed-text:latest"
+    assert project["rag_embedding_dimensions"] == 768
+    enabled = store.set_rag_enabled(project["id"], True, "profile-v1")
+    assert enabled["rag_consent_profile"] == "profile-v1"
+
+    changed = store.set_rag_embedding_settings(
+        project["id"], "openai", "text-embedding-3-small", "", 256,
+    )
+    assert changed["rag_embedding_provider"] == "openai"
+    assert changed["rag_enabled"] == 0
+    assert changed["rag_consent_at"] is None
+    assert changed["rag_consent_profile"] == ""
+
+
+def test_embedding_settings_migration_preserves_enabled_openai_projects(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as db:
+        db.execute("""CREATE TABLE projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',
+            root_path TEXT NOT NULL DEFAULT '',enforce_relationships INTEGER NOT NULL DEFAULT 0,
+            auto_approve_agent_actions INTEGER NOT NULL DEFAULT 0,allow_full_system_access INTEGER NOT NULL DEFAULT 0,
+            active_workflow_memory_id INTEGER NOT NULL DEFAULT 0,rag_enabled INTEGER NOT NULL DEFAULT 0,
+            rag_consent_at TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("INSERT INTO projects(name,rag_enabled,rag_consent_at) VALUES('Enabled',1,CURRENT_TIMESTAMP)")
+        db.execute("INSERT INTO projects(name,rag_enabled) VALUES('Disabled',0)")
+
+    store = ProjectStore(database)
+    enabled, disabled = sorted(store.list(), key=lambda item: item["id"])
+
+    assert enabled["rag_embedding_provider"] == "openai"
+    assert enabled["rag_embedding_dimensions"] == 256
+    assert disabled["rag_embedding_provider"] == "ollama"
+    assert disabled["rag_embedding_dimensions"] == 768
 
 
 def test_agent_action_permissions_default_to_read_only(tmp_path, monkeypatch):

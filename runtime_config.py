@@ -148,7 +148,8 @@ class RuntimeConfigStore:
                     message_kind TEXT NOT NULL DEFAULT '',
                     delivery_status TEXT NOT NULL DEFAULT '',
                     delivered_at TEXT,
-                    delivery_run_id TEXT
+                    delivery_run_id TEXT,
+                    run_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -167,6 +168,8 @@ class RuntimeConfigStore:
                 db.execute("ALTER TABLE conversation_messages ADD COLUMN delivered_at TEXT")
             if "delivery_run_id" not in message_columns:
                 db.execute("ALTER TABLE conversation_messages ADD COLUMN delivery_run_id TEXT")
+            if "run_id" not in message_columns:
+                db.execute("ALTER TABLE conversation_messages ADD COLUMN run_id TEXT NOT NULL DEFAULT ''")
             db.execute(
                 """CREATE INDEX IF NOT EXISTS idx_conversation_agent_inbox
                 ON conversation_messages(project_id, role, speaker, message_kind, delivery_status, id)"""
@@ -267,6 +270,28 @@ class RuntimeConfigStore:
             chat_run_columns = {row[1] for row in db.execute("PRAGMA table_info(chat_runs)")}
             if "input_json" not in chat_run_columns:
                 db.execute("ALTER TABLE chat_runs ADD COLUMN input_json TEXT NOT NULL DEFAULT ''")
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_run_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    project_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(run_id, sequence),
+                    FOREIGN KEY(run_id) REFERENCES chat_runs(id) ON DELETE CASCADE
+                )
+                """
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_run_events_run ON chat_run_events(run_id,sequence)"
+            )
             if self.recover_interrupted_runs:
                 self._recover_interrupted_runs(db)
             self._migrate_existing_projects(db)
@@ -421,7 +446,7 @@ class RuntimeConfigStore:
 
     def add_message(self, role: str, speaker: str, content: str, provider: str, model: str,
                     project_id: int = 1, reply_to_id: int | None = None,
-                    source_role: str = "", message_kind: str = "") -> dict[str, Any]:
+                    source_role: str = "", message_kind: str = "", run_id: str = "") -> dict[str, Any]:
         source_role = source_role.strip()
         message_kind = message_kind.strip().lower()
         if message_kind and message_kind not in INTER_AGENT_MESSAGE_KINDS:
@@ -433,10 +458,10 @@ class RuntimeConfigStore:
             cursor = db.execute(
                 """INSERT INTO conversation_messages(
                     role, speaker, content, provider, model, project_id, reply_to_id,
-                    source_role, message_kind, delivery_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    source_role, message_kind, delivery_status, run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (role, speaker, content, provider, model, project_id, reply_to_id,
-                 source_role, message_kind, delivery_status),
+                 source_role, message_kind, delivery_status, str(run_id or "")),
             )
             row = db.execute("SELECT * FROM conversation_messages WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return dict(row)
@@ -748,6 +773,10 @@ class RuntimeConfigStore:
             db.execute("DELETE FROM agent_context_summaries WHERE role = ? AND project_id = ?", (role, project_id))
             db.execute("DELETE FROM agent_context_usage WHERE role = ? AND project_id = ?", (role, project_id))
             db.execute("DELETE FROM chat_attachments WHERE role = ? AND project_id = ?", (role, project_id))
+            db.execute(
+                "DELETE FROM chat_runs WHERE role=? AND project_id=? AND status IN ('completed','error')",
+                (role, project_id),
+            )
 
     def codex_session(self, role: str, project_id: int = 1) -> dict[str, str] | None:
         with self._connect() as db:
@@ -872,7 +901,63 @@ class RuntimeConfigStore:
                 VALUES (?, ?, ?, 'queued', ?, ?, ?)""",
                 (run_id, project_id, role, json.dumps(request or {}, default=str), timestamp, timestamp),
             )
+            user_message_id = int((request or {}).get("user_message_id") or 0)
+            if user_message_id:
+                db.execute(
+                    "UPDATE conversation_messages SET run_id=? WHERE id=? AND role=? AND project_id=?",
+                    (run_id, user_message_id, role, project_id),
+                )
         return self.chat_run(run_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _event_record(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        raw = result.pop("payload_json", "")
+        try:
+            result["payload"] = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            result["payload"] = {}
+        return result
+
+    def add_run_event(self, run_id: str, project_id: int, role: str, event_type: str,
+                      status: str, title: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._connect() as db:
+            cursor = db.execute(
+                """INSERT INTO chat_run_events(run_id,project_id,role,sequence,event_type,status,title,payload_json,created_at)
+                SELECT ?,?,?,COALESCE(MAX(sequence),0)+1,?,?,?,?,? FROM chat_run_events WHERE run_id=?""",
+                (run_id, project_id, role, event_type, status, title[:240],
+                 json.dumps(payload or {}, default=str), timestamp, run_id),
+            )
+            row = db.execute("SELECT * FROM chat_run_events WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return self._event_record(row)
+
+    def update_run_event(self, event_id: int, status: str, payload: dict[str, Any] | None = None,
+                         title: str | None = None) -> dict[str, Any]:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._connect() as db:
+            current = db.execute("SELECT * FROM chat_run_events WHERE id=?", (event_id,)).fetchone()
+            if not current:
+                raise KeyError(f"Chat run event {event_id} not found")
+            merged = self._event_record(current)["payload"]
+            if payload:
+                merged.update(payload)
+            db.execute(
+                """UPDATE chat_run_events SET status=?,title=?,payload_json=?,
+                completed_at=CASE WHEN ? IN ('completed','error','warning') THEN ? ELSE completed_at END
+                WHERE id=?""",
+                (status, title if title is not None else current["title"], json.dumps(merged, default=str),
+                 status, timestamp, event_id),
+            )
+            row = db.execute("SELECT * FROM chat_run_events WHERE id=?", (event_id,)).fetchone()
+        return self._event_record(row)
+
+    def run_events(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM chat_run_events WHERE run_id=? ORDER BY sequence", (run_id,)
+            ).fetchall()
+        return [self._event_record(row) for row in rows]
 
     def claim_queued_chat_run(self, run_id: str) -> dict[str, Any] | None:
         """Atomically promote one durable queued request to a running task."""
@@ -902,7 +987,10 @@ class RuntimeConfigStore:
     def chat_run(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
             row = db.execute("SELECT * FROM chat_runs WHERE id=?", (run_id,)).fetchone()
-        return self._chat_run_record(row)
+        result = self._chat_run_record(row)
+        if result is not None:
+            result["events"] = self.run_events(run_id)
+        return result
 
     def queued_chat_runs(self) -> list[dict[str, Any]]:
         """Return durable user prompts waiting behind a provider run."""

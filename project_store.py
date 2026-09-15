@@ -19,8 +19,16 @@ class ProjectStore:
                 auto_approve_agent_actions INTEGER NOT NULL DEFAULT 0,
                 allow_full_system_access INTEGER NOT NULL DEFAULT 0,
                 active_workflow_memory_id INTEGER NOT NULL DEFAULT 0,
+                rag_enabled INTEGER NOT NULL DEFAULT 0,
+                rag_consent_at TEXT,
+                rag_consent_profile TEXT NOT NULL DEFAULT '',
+                rag_embedding_provider TEXT NOT NULL DEFAULT 'ollama',
+                rag_embedding_model TEXT NOT NULL DEFAULT 'nomic-embed-text:latest',
+                rag_embedding_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434',
+                rag_embedding_dimensions INTEGER NOT NULL DEFAULT 768,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
             project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
+            legacy_rag_profile = "rag_embedding_provider" not in project_columns
             if "enforce_relationships" not in project_columns:
                 db.execute("ALTER TABLE projects ADD COLUMN enforce_relationships INTEGER NOT NULL DEFAULT 0")
             if "auto_approve_agent_actions" not in project_columns:
@@ -29,6 +37,35 @@ class ProjectStore:
                 db.execute("ALTER TABLE projects ADD COLUMN allow_full_system_access INTEGER NOT NULL DEFAULT 0")
             if "active_workflow_memory_id" not in project_columns:
                 db.execute("ALTER TABLE projects ADD COLUMN active_workflow_memory_id INTEGER NOT NULL DEFAULT 0")
+            if "rag_enabled" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN rag_enabled INTEGER NOT NULL DEFAULT 0")
+            if "rag_consent_at" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN rag_consent_at TEXT")
+            if "rag_consent_profile" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN rag_consent_profile TEXT NOT NULL DEFAULT ''")
+            if "rag_embedding_provider" not in project_columns:
+                db.execute(
+                    "ALTER TABLE projects ADD COLUMN rag_embedding_provider TEXT NOT NULL DEFAULT 'ollama'"
+                )
+            if "rag_embedding_model" not in project_columns:
+                db.execute(
+                    "ALTER TABLE projects ADD COLUMN rag_embedding_model TEXT NOT NULL DEFAULT 'nomic-embed-text:latest'"
+                )
+            if "rag_embedding_base_url" not in project_columns:
+                db.execute(
+                    "ALTER TABLE projects ADD COLUMN rag_embedding_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434'"
+                )
+            if "rag_embedding_dimensions" not in project_columns:
+                db.execute(
+                    "ALTER TABLE projects ADD COLUMN rag_embedding_dimensions INTEGER NOT NULL DEFAULT 768"
+                )
+            if legacy_rag_profile:
+                # Preserve already-enabled cloud indexes and their prior consent.
+                db.execute(
+                    """UPDATE projects SET rag_embedding_provider='openai',
+                    rag_embedding_model='text-embedding-3-small',rag_embedding_base_url='',
+                    rag_embedding_dimensions=256 WHERE rag_enabled=1"""
+                )
             db.execute("""CREATE TABLE IF NOT EXISTS project_agent_layout (
                 project_id INTEGER NOT NULL, role TEXT NOT NULL, x REAL NOT NULL, y REAL NOT NULL,
                 parent_role TEXT NOT NULL DEFAULT '', PRIMARY KEY(project_id, role),
@@ -119,6 +156,57 @@ class ProjectStore:
             cursor = db.execute("DELETE FROM projects WHERE id=?", (project_id,))
         if not cursor.rowcount:
             raise KeyError(f"Project {project_id} not found")
+
+    def set_rag_enabled(
+        self, project_id: int, enabled: bool, consent_profile: str = "",
+    ) -> dict[str, Any]:
+        """Persist explicit permission to send eligible project text for embeddings."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE projects SET rag_enabled=?,
+                rag_consent_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
+                rag_consent_profile=CASE WHEN ? THEN ? ELSE '' END
+                WHERE id=?""",
+                (
+                    int(bool(enabled)), int(bool(enabled)), int(bool(enabled)),
+                    str(consent_profile or ""), project_id,
+                ),
+            )
+        if not cursor.rowcount:
+            raise KeyError(f"Project {project_id} not found")
+        return self.get(project_id)
+
+    def set_rag_embedding_settings(
+        self, project_id: int, provider: str, model: str, base_url: str, dimensions: int,
+    ) -> dict[str, Any]:
+        current = self.get(project_id)
+        provider = provider.strip().lower()
+        if provider not in {"ollama", "openai"}:
+            raise ValueError("Embedding provider must be ollama or openai")
+        model = model.strip()
+        if not model:
+            raise ValueError("Embedding model is required")
+        base_url = base_url.strip().rstrip("/") if provider == "ollama" else ""
+        dimensions = int(dimensions)
+        if dimensions < 1 or dimensions > 16_384:
+            raise ValueError("Embedding dimensions must be between 1 and 16384")
+        changed = any((
+            str(current.get("rag_embedding_provider") or "") != provider,
+            str(current.get("rag_embedding_model") or "") != model,
+            str(current.get("rag_embedding_base_url") or "").rstrip("/") != base_url,
+            int(current.get("rag_embedding_dimensions") or 0) != dimensions,
+        ))
+        if not changed:
+            return current
+        with self._connect() as db:
+            db.execute(
+                """UPDATE projects SET rag_embedding_provider=?,rag_embedding_model=?,
+                rag_embedding_base_url=?,rag_embedding_dimensions=?,rag_enabled=0,
+                rag_consent_at=NULL,rag_consent_profile='' WHERE id=?""",
+                (provider, model, base_url, dimensions, project_id),
+            )
+        return self.get(project_id)
 
     def set_relationship_enforcement(self, project_id: int, enabled: bool) -> dict[str, Any]:
         with self._connect() as db:

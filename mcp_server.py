@@ -10,8 +10,9 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-
+from embedding_providers import EmbeddingService, profile_from_project
 from graph_context import GraphContextError, GraphContextStore
+from rag import RagStore
 from project_store import ProjectStore
 from agent_definitions import AgentDefinitionStore
 from runtime_config import RuntimeConfigStore
@@ -22,6 +23,7 @@ from toolsets import ToolsetStore
 
 DB_PATH = Path(os.getenv("WORKSPACE_DB", Path(__file__).parent / "data" / "workspace.db"))
 store = GraphContextStore(DB_PATH)
+rag = RagStore(DB_PATH)
 projects = ProjectStore(DB_PATH)
 definitions = AgentDefinitionStore(DB_PATH)
 # This process is an auxiliary MCP tool host, not the application owner.  It
@@ -32,6 +34,9 @@ skills = SkillStore(DB_PATH)
 toolsets = ToolsetStore()
 credentials = LocalCredentialStore(Path(__file__).parent / ".env.local")
 skill_credentials = LocalCredentialStore(Path(__file__).parent / "data" / ".skill-secrets.local")
+embeddings = EmbeddingService(lambda: credentials.get("OPENAI_API_KEY"))
+
+
 # The application mounts this server below ``/mcp``.  Using ``/`` here keeps
 # the public endpoint at ``/mcp`` instead of producing the confusing
 # ``/mcp/mcp`` URL.  The stdio entry point at the bottom of this file remains
@@ -48,6 +53,13 @@ READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
+)
+RETRIEVAL_TOOL_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    # Query/chunk embeddings are created through the explicitly consented provider.
+    openWorldHint=True,
 )
 
 
@@ -146,10 +158,56 @@ def list_agent_messages(role: str, project_id: int = 1, include_delivered: bool 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_shared_context(role: str, project_id: int = 1) -> list[dict]:
-    """List project graph metadata available to every role in this project."""
+    """Compatibility alias listing the current project knowledge documents."""
     projects.get(project_id)
     definitions.get(role, project_id)
-    return store.list(project_id)
+    return rag.documents(project_id)
+
+
+@mcp.tool(annotations=RETRIEVAL_TOOL_ANNOTATIONS)
+async def search_project_context(query: str, role: str, project_id: int = 1,
+                                 run_id: str = "", path_prefix: str = "", limit: int = 8) -> dict:
+    """Search fresh, line-addressable project evidence using semantic and lexical retrieval."""
+
+    project = projects.get(project_id)
+    definitions.get(role, project_id)
+    if not bool(project.get("rag_enabled")):
+        return {"ok": False, "error": "Project Knowledge is not enabled for this workspace"}
+    root = Path(str(project.get("root_path") or Path(__file__).parent)).expanduser().resolve()
+    try:
+        configured = profile_from_project(project)
+        profile, _ = await embeddings.preflight(configured)
+        consented_profile = str(project.get("rag_consent_profile") or "")
+        if consented_profile and consented_profile != profile.fingerprint:
+            raise ValueError(
+                "The embedding model changed after consent. Disable and re-enable Project Knowledge."
+            )
+
+        async def embed_documents(texts: list[str]) -> list[list[float]]:
+            return await embeddings.embed(texts, "document", profile)
+
+        async def embed_query(texts: list[str]) -> list[list[float]]:
+            return await embeddings.embed(texts, "query", profile)
+
+        await rag.index_project(root, project_id, embed_documents, profile=profile)
+        results = await rag.search(
+            root, project_id, query, embed_query,
+            limit=limit, path_prefix=path_prefix, profile=profile,
+        )
+        if run_id and messages.chat_run(run_id):
+            messages.add_run_event(
+                run_id, project_id, role, "retrieval", "completed",
+                f"Focused project search · {len(results)} match{'es' if len(results) != 1 else ''}",
+                {"query": query, "path_prefix": path_prefix, "results": results, "count": len(results)},
+            )
+        return {"ok": True, "query": query, "results": results}
+    except Exception as exc:
+        if run_id and messages.chat_run(run_id):
+            messages.add_run_event(
+                run_id, project_id, role, "retrieval", "error", "Focused project search failed",
+                {"query": query, "detail": str(exc)},
+            )
+        return {"ok": False, "error": str(exc), "results": []}
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)

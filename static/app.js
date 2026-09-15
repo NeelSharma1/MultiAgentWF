@@ -106,6 +106,10 @@ const state={
    graphContext: [],
    selectedGraphNodeId: null,
    graphContextBusy: false,
+   ragStatus: null,
+   ragJob: null,
+   ragPollPromise: null,
+   runEvents: {},
   messages: {},
   pendingAttachments: {},
   replyTo: {},
@@ -1540,6 +1544,11 @@ async function selectProject(id){
   state.replyTo={};
   state.activities={};
   state.runs={};
+  state.runEvents={};
+  state.ragStatus=null;
+  state.ragJob=null;
+  state.ragPollPromise=null;
+  state.graphContextBusy=false;
   state.busy.clear();
   localStorage.setItem('multiagent-project', String(id));
   state.agents=await api(`/api/agents?project_id=${id}`);
@@ -1553,7 +1562,7 @@ async function selectProject(id){
   state.toolsets]=await Promise.all([api(`/api/projects/${id}/layout`), api(`/api/projects/${id}/edges`), api(`/api/skills?project_id=${id}`), api(`/api/toolsets?project_id=${id}`)]);
   renderAgents();
   // The Overview map depends only on agents, layout, and edges. Draw it now;
-  // an optional transcript or project-graph request must not leave Overview
+  // an optional transcript or project-knowledge request must not leave Overview
   // blank during the initial page load.
   renderFlowchart();
   if(state.active){
@@ -1562,7 +1571,7 @@ async function selectProject(id){
   else{
     selectAgent('')
   }
-  loadGraphContext().catch(err=>console.warn('Could not load project graph metadata', err));
+  loadGraphContext().catch(err=>console.warn('Could not load Project Knowledge', err));
   api(`/health?project_id=${id}`).then(health=>{
     if(state.project?.id===id)$('#status').textContent=`${health.agents} agents · MCP online`
   }).catch(()=>{})
@@ -2276,6 +2285,8 @@ function normalizeMessage(m, role=state.active){
     compiled_parts: compiledParts||[],
     permission_request: permissionRequest,
     delivery_status: m.delivery_status||'',
+    run_id: m.run_id||'',
+    events: m.events||[],
     by: sourceAgent?.name||(
       kind==='agent'?state.agents.find(a=>a.id===role)?.name:
       kind==='native'?'Codex': kind==='error'?'Provider error': 'Workspace'
@@ -3045,6 +3056,109 @@ function summarizeFileActionPermission(command){
   const bytes=typeof TextEncoder==='undefined'?content.length:new TextEncoder().encode(content).length;
   return {action:'Create', path, meta:`${formatFileActionBytes(bytes)} content hidden`}
 }
+function runEventIcon(type){
+  return ({index:'⌕',retrieval:'⌕',validation:'✓',warning:'!',command:'›_',file_read:'↗',file_change:'±',tool:'◇',git_summary:'⑂'})[type]||'·'
+}
+function appendRunEventText(parent, label, value, className=''){
+  if(value===undefined||value===null||value==='')return;
+  const row=document.createElement('div'), heading=document.createElement('strong'), content=document.createElement('span');
+  row.className=`run-event-field ${className}`.trim(); heading.textContent=label; content.textContent=typeof value==='object'?JSON.stringify(value,null,2):String(value);
+  row.append(heading,content); parent.append(row)
+}
+function renderRunEvents(events=[]){
+  if(!events.length)return null;
+  const timeline=document.createElement('section');
+  timeline.className='run-activity-timeline'; timeline.setAttribute('aria-label','Agent activity');
+  events.forEach(event=>{
+    const payload=event.payload||{}, details=document.createElement('details'), summary=document.createElement('summary');
+    details.className=`run-event event-${event.event_type||'activity'} status-${event.status||'completed'}`;
+    details.open=['running','error','warning'].includes(event.status);
+    const icon=document.createElement('span'), title=document.createElement('span'), status=document.createElement('span');
+    icon.className='run-event-icon'; icon.textContent=runEventIcon(event.event_type);
+    title.className='run-event-title'; title.textContent=event.title||'Agent activity';
+    status.className='run-event-status'; status.textContent=event.status||'completed';
+    summary.append(icon,title,status); details.append(summary);
+    const body=document.createElement('div'); body.className='run-event-body';
+    if(payload.query)appendRunEventText(body,'Query',payload.query,'run-event-query');
+    if(event.event_type==='index'){
+      const total=Number(payload.total||0), processed=Number(payload.processed||0);
+      if(total){
+        const progress=document.createElement('progress'); progress.max=total; progress.value=Math.min(processed,total); body.append(progress)
+      }
+      appendRunEventText(body,'Progress',total?`${processed} of ${total} files`:`${processed} files`);
+      appendRunEventText(body,'Updated',payload.changed!==undefined?`${payload.changed} files · ${payload.chunks??payload.embedded_chunks??0} chunks`:null)
+    }
+    if(event.event_type==='retrieval'){
+      const sources=document.createElement('div'); sources.className='run-event-sources';
+      (payload.results||[]).forEach(source=>{
+        const card=document.createElement('article'), head=document.createElement('div'), id=document.createElement('b'), path=document.createElement('code'), score=document.createElement('span'), excerpt=document.createElement('pre');
+        card.className='run-source-card'; card.dataset.sourceId=source.source_id||'';
+        head.className='run-source-head'; id.textContent=`[${source.source_id||'?'}]`; path.textContent=`${source.path||'unknown'}:${source.start_line||1}-${source.end_line||1}`;
+        score.textContent=source.scores?.fused!==undefined?`rank ${source.rank||'?'} · ${Number(source.scores.fused).toFixed(4)}`:`rank ${source.rank||'?'}`;
+        excerpt.textContent=source.excerpt||''; head.append(id,path,score); card.append(head,excerpt); sources.append(card)
+      });
+      if(sources.childElementCount)body.append(sources);
+      else appendRunEventText(body,'Result',payload.detail||'No matching current source was found.')
+    }
+    if(event.event_type==='command'){
+      appendRunEventText(body,'Command',payload.command||payload.requested_command,'run-event-code');
+      appendRunEventText(body,'Working directory',payload.cwd);
+      appendRunEventText(body,'Exit code',payload.exit_code);
+      appendRunEventText(body,'Output',payload.stdout||payload.stderr,'run-event-output')
+    }
+    if(['file_read','file_change'].includes(event.event_type)){
+      appendRunEventText(body,'File',payload.path,'run-event-code');
+      const added=payload.additions??payload.added_lines, removed=payload.deletions??payload.removed_lines;
+      appendRunEventText(body,'Change',added!==undefined?`+${added||0} / -${removed||0}`:payload.action);
+      appendRunEventText(body,'Lines',payload.line_ranges?.map(range=>range.join('-')).join(', '));
+      appendRunEventText(body,'Preview',payload.excerpt||payload.stderr,'run-event-output')
+    }
+    if(event.event_type==='git_summary'){
+      appendRunEventText(body,'Commit',payload.commit_hash);
+      appendRunEventText(body,'Branch',payload.agent_branch&&payload.main_branch?`${payload.agent_branch} → ${payload.main_branch}`:payload.agent_branch);
+      (payload.files||[]).forEach(file=>appendRunEventText(body,file.status||'Changed',file.path,'run-event-code'))
+    }
+    if(event.event_type==='tool'){
+      appendRunEventText(body,'Tool',[payload.toolset,payload.tool].filter(Boolean).join('/'));
+      appendRunEventText(body,'Result',payload.result||payload.error,'run-event-output')
+    }
+    if(['validation','warning'].includes(event.event_type)){
+      appendRunEventText(body,'Grounding',payload.grounded===true?'Validated against retrieved sources':payload.grounded===false?'Not validated':payload.detail);
+      appendRunEventText(body,'Citations',(payload.citations||[]).join(', '))
+    }
+    if(!body.childElementCount)appendRunEventText(body,'Details',payload.detail||'No additional details.');
+    details.append(body); timeline.append(details)
+  });
+  return timeline
+}
+function wireSourceCitations(container, events=[]){
+  const sources=new Map();
+  events.filter(event=>event.event_type==='retrieval').forEach(event=>(event.payload?.results||[]).forEach(source=>sources.set(String(source.source_id||'').toUpperCase(),source)));
+  if(!sources.size)return;
+  const walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT), nodes=[];
+  while(walker.nextNode())if(!walker.currentNode.parentElement?.closest('code,pre,a,button'))nodes.push(walker.currentNode);
+  nodes.forEach(node=>{
+    const value=node.nodeValue||'', matches=[...value.matchAll(/\[(S\d+)\]/gi)];
+    if(!matches.length)return;
+    const fragment=document.createDocumentFragment(); let cursor=0;
+    matches.forEach(match=>{
+      if(match.index>cursor)fragment.append(document.createTextNode(value.slice(cursor,match.index)));
+      const key=match[1].toUpperCase(), source=sources.get(key);
+      if(source){
+        const button=document.createElement('button'); button.type='button'; button.className='source-citation'; button.textContent=`[${key}]`; button.title=`${source.path}:${source.start_line}-${source.end_line}`;
+        button.onclick=()=>{
+          const scope=container.closest('.message-wrap')||document;
+          const card=[...scope.querySelectorAll('.run-source-card')].find(item=>item.dataset.sourceId?.toUpperCase()===key);
+          const event=card?.closest('details'); if(event)event.open=true; card?.scrollIntoView({behavior:'smooth',block:'center'}); card?.classList.add('highlight'); setTimeout(()=>card?.classList.remove('highlight'),1400)
+        };
+        fragment.append(button)
+      }else fragment.append(document.createTextNode(match[0]));
+      cursor=match.index+match[0].length
+    });
+    if(cursor<value.length)fragment.append(document.createTextNode(value.slice(cursor)));
+    node.replaceWith(fragment)
+  })
+}
 function renderMessages(){
   const box=$('#messages'),
   allItems=(state.messages[state.active]||[]).filter(m=>!m.internal),
@@ -3102,6 +3216,7 @@ function renderMessages(){
       text.className='message-markdown';
       text.innerHTML=renderMarkdown(m.text);
       wireCodeActions(text);
+      wireSourceCitations(text,m.events);
       bubble.append(text)
     }
     if(m.attachments?.length){
@@ -3188,9 +3303,15 @@ function renderMessages(){
       setTimeout(()=>copy.textContent='Copy', 1000)
     };
     actions.append(copy);
+    const activity=renderRunEvents(m.events);
+    if(activity)wrap.append(activity);
     wrap.append(bubble, actions);
     box.append(wrap)
   });
+  const liveEvents=state.runEvents[state.active]||[], liveRun=String(state.runs[state.active]||'');
+  if(!query&&liveEvents.length&&!items.some(item=>item.run_id&&String(item.run_id)===liveRun&&item.events?.length)){
+    const live=renderRunEvents(liveEvents); if(live){live.classList.add('live');box.append(live)}
+  }
   if(preserveScrollPosition){
     box.scrollTop=Math.min(previousScrollTop,Math.max(0,box.scrollHeight-box.clientHeight));
     messagesPinnedToLatest=false
@@ -3233,6 +3354,8 @@ function waitForChatRun(runId, role, projectId){
     console.info(`[chat-run] watching ${role} run ${currentRunId}`);
     while(true){
       const run=await api(`/api/chat-runs/${currentRunId}`);
+      state.runEvents[role]=run.events||[];
+      if(state.active===role)renderMessages();
       if(['completed', 'error'].includes(run.status)){
         console.info(`[chat-run] ${role} run ${currentRunId} ${run.status}`);
         await loadHistory(role);
@@ -3254,10 +3377,12 @@ function waitForChatRun(runId, role, projectId){
         if(next){
           currentRunId=next.id;
           state.runs[role]=currentRunId;
+          state.runEvents[role]=[];
           setChatActivity(role, 'running', `${state.agents.find(a=>a.id===role)?.name||role} has another queued prompt…`);
           continue
         }
         delete state.runs[role];
+        delete state.runEvents[role];
         state.busy.delete(role);
         setChatActivity(role, run.status==='error'?'error': 'complete', run.status==='error'?'The provider returned an error. Its full response is shown in the chat.': 'Response received and saved in this chat.');
         if(state.active===role){
@@ -3412,39 +3537,88 @@ async function loadTemplates(){
   box.innerHTML='<option value="">No template</option>'+state.templates.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')
 }
 function graphNodeById(id){return state.graphContext.find(node=>String(node.id)===String(id))||null}
+function ragSettingsPayload(){
+  const provider=$('#rag-provider').value||'ollama';
+  return {
+    provider,
+    model:($('#rag-model').value||'').trim()||(provider==='ollama'?'nomic-embed-text:latest':'text-embedding-3-small'),
+    base_url:provider==='ollama'?(($('#rag-base-url').value||'').trim()||'http://127.0.0.1:11434'):'',
+    dimensions:Number($('#rag-dimensions').value)||(provider==='ollama'?768:256),
+  }
+}
+function renderRagEmbeddingStatus(embedding){
+  const status=$('#rag-embedding-status'); if(!status)return;
+  const payload=embedding||{}, ready=Boolean(payload.ready), provider=payload.provider||$('#rag-provider').value||'ollama';
+  status.className=`rag-embedding-status ${ready?'ready':'error'}`;
+  status.replaceChildren();
+  const badge=document.createElement('span'); badge.className='rag-provider-badge'; badge.textContent=provider==='ollama'?(payload.locality==='remote'?'OLLAMA REMOTE':'OLLAMA LOCAL'):'OPENAI CLOUD';
+  const detail=document.createElement('div'), title=document.createElement('strong'), copy=document.createElement('small');
+  title.textContent=ready?'Embedding model ready':'Embedding model unavailable';
+  copy.textContent=ready?`${payload.model||''} · ${payload.dimensions||0} dimensions${payload.digest?` · ${String(payload.digest).slice(0,12)}`:''}`:(payload.error||'Test the selected model before enabling retrieval.');
+  detail.append(title,copy); status.append(badge,detail)
+}
+function configureRagDialog(status=state.ragStatus||{}){
+  const embedding=status.embedding||{};
+  $('#rag-provider').value=embedding.provider||status.provider||'ollama';
+  $('#rag-model').value=embedding.model||status.model||($('#rag-provider').value==='ollama'?'nomic-embed-text:latest':'text-embedding-3-small');
+  $('#rag-base-url').value=embedding.base_url||'http://127.0.0.1:11434';
+  $('#rag-dimensions').value=embedding.dimensions||status.dimensions||($('#rag-provider').value==='ollama'?768:256);
+  $('#rag-base-url-field').classList.toggle('hidden',$('#rag-provider').value!=='ollama');
+  const local=$('#rag-provider').value==='ollama';
+  $('#rag-consent-copy').textContent=local?'Eligible project text will be sent only to the configured Ollama service. Embeddings and source chunks remain in this workspace’s ignored local database.':'Eligible project text will be sent to the OpenAI Embeddings API. Embeddings and source chunks remain in this workspace’s ignored local database.';
+  $('#rag-consent-preview').textContent=`${status.eligible_file_count||0} eligible files found in ${state.project?.root_path||'this project'}.`;
+  renderRagEmbeddingStatus(embedding);
+  $('#confirm-rag-consent').disabled=!embedding.ready
+}
+async function testRagEmbedding(){
+  if(!state.project)return null;
+  const button=$('#test-rag-embedding'), confirm=$('#confirm-rag-consent'); button.disabled=true;confirm.disabled=true;
+  renderRagEmbeddingStatus({...ragSettingsPayload(),ready:false,error:'Testing the selected model…'});
+  try{
+    const result=await api(`/api/projects/${state.project.id}/rag/embedding-preflight`,{method:'POST',body:JSON.stringify(ragSettingsPayload())});
+    renderRagEmbeddingStatus(result); confirm.disabled=!result.ready; return result
+  }catch(err){renderRagEmbeddingStatus({...ragSettingsPayload(),ready:false,error:err.message});return null}
+  finally{button.disabled=false}
+}
 function renderGraphContext(){
   const box=$('#graph-context-list');
   if(!box)return;
-  $('#graph-context-count').textContent=state.graphContext.length;
-  const selected=graphNodeById(state.selectedGraphNodeId), summary=$('#graph-context-scope-summary');
-  if(summary)summary.textContent=selected
-    ? `Selected ${selected.node_type}: ${selected.path||'.'}`
-    : state.project?.root_path?'Scan the configured project folder to refresh this graph.':'Set a project folder, then scan its graph.';
+  const status=state.ragStatus||{}, selected=graphNodeById(state.selectedGraphNodeId), summary=$('#graph-context-scope-summary');
+  $('#graph-context-count').textContent=status.enabled?`${status.chunks||0}`:'Off';
+  $('#scan-graph-context').textContent=status.enabled?'Disable retrieval':'Enable retrieval';
+  $('#generate-project-graph').disabled=!status.enabled||!status.ready||state.graphContextBusy;
+  if(summary){
+    if(!state.project?.root_path)summary.textContent='Set a project folder before indexing project knowledge.';
+    else if(!status.enabled)summary.textContent=`Retrieval is off · ${status.eligible_file_count||0} eligible text files`;
+    else if(!status.ready)summary.textContent=status.embedding?.error||'The selected embedding model is unavailable.';
+    else if(state.graphContextBusy){
+      const job=state.ragJob||status.job||{}, total=Number(job.total_files||0), done=Number(job.processed_files||0);
+      summary.textContent=`Indexing ${done}${total?` of ${total}`:''} files · ${job.embedded_chunks||0} chunks embedded`;
+    }else summary.textContent=`${status.documents||0} files · ${status.chunks||0} searchable chunks${status.last_indexed?` · updated ${formatTime(status.last_indexed)}`:''}`;
+  }
   box.replaceChildren();
   if(!state.graphContext.length){
     const empty=document.createElement('p');
     empty.className='graph-context-empty';
-    empty.textContent='No graph metadata yet. Scan the project to index safe text files.';
+    empty.textContent=status.enabled?'No files have been indexed yet.':'Enable retrieval to build a private, searchable project index.';
     box.append(empty);
   }
   state.graphContext.forEach(node=>{
-    const card=document.createElement('article'), depth=node.path?node.path.split('/').length:0;
+    const card=document.createElement('article');
     card.className=`graph-context-card ${String(node.id)===String(state.selectedGraphNodeId)?'selected':''}`;
-    card.style.marginLeft=`${Math.min(depth,5)*10}px`;
-    card.setAttribute('role','treeitem');
+    card.setAttribute('role','listitem');
     card.setAttribute('aria-selected',String(String(node.id)===String(state.selectedGraphNodeId)));
     const heading=document.createElement('h3'), type=document.createElement('span'), detail=document.createElement('p');
-    heading.textContent=node.path||'.'; type.className='graph-context-type'; type.textContent=node.node_type;
-    detail.textContent=`${node.keywords?.join(', ')||'unclassified'} · ${String(node.vector_hash||'').slice(0,12)||'no vector'}`;
+    heading.textContent=node.path||'.'; type.className=`graph-context-type status-${node.status||'unknown'}`; type.textContent=node.status||'unknown';
+    detail.textContent=`${node.chunk_count||0} chunk${Number(node.chunk_count)===1?'':'s'} · ${Math.max(0,Number(node.size||0)/1024).toFixed(1)} KB${node.language?` · ${node.language}`:''}`;
     const tags=document.createElement('div'); tags.className='graph-context-tags';
-    (node.keywords||[]).slice(0,6).forEach(keyword=>{
-      const tag=document.createElement('span'); tag.className='graph-context-tag'; tag.textContent=keyword; tags.append(tag)
-    });
+    const indexed=document.createElement('span'); indexed.className='graph-context-tag'; indexed.textContent=node.indexed_at?`Indexed ${formatTime(node.indexed_at)}`:'Not indexed'; tags.append(indexed);
+    if(node.error){const error=document.createElement('span');error.className='graph-context-tag error';error.textContent=node.error;tags.append(error)}
     card.append(heading,type,detail,tags);
     card.onclick=()=>selectGraphNode(node,true);
     box.append(card)
   });
-  $('#generate-selected-graph').disabled=!selected||state.graphContextBusy;
+  $('#generate-selected-graph').disabled=true;
 }
 function selectGraphNode(node, open=false){
   state.selectedGraphNodeId=node?.id||null;
@@ -3455,42 +3629,74 @@ function openGraphContext(node){
   if(!node)return;
   $('#graph-context-id').value=node.id;
   $('#graph-context-path').value=node.path||'.';
-  $('#graph-context-type').value=node.node_type;
-  $('#graph-context-keywords').value=(node.keywords||[]).join(', ');
-  $('#graph-context-vector').value=JSON.stringify(node.vector||[]);
-  $('#graph-context-detail').textContent=`Source: ${node.source||'unknown'}${node.model?` · ${node.model}`:''} · Updated ${node.updated_at||'unknown'}`;
-  $('#delete-graph-context').style.visibility=node.node_type==='project'?'hidden':'visible';
+  $('#graph-context-type').value=node.status||'unknown';
+  $('#graph-context-keywords').value=String(node.chunk_count||0);
+  $('#graph-context-vector').value='[]';
+  $('#graph-context-detail').textContent=node.error||`Embedding: ${state.ragStatus?.embedding?.provider||state.ragStatus?.provider||'ollama'} / ${state.ragStatus?.model||'nomic-embed-text:latest'} · ${state.ragStatus?.dimensions||768} dimensions · Indexed ${node.indexed_at||'not yet'}`;
+  $('#delete-graph-context').style.visibility='hidden';
   $('#graph-context-dialog').showModal()
 }
 async function loadGraphContext(){
   if(!state.project){
-    state.graphContext=[]; state.selectedGraphNodeId=null; renderGraphContext(); return
+    state.graphContext=[]; state.ragStatus=null; state.selectedGraphNodeId=null; renderGraphContext(); return
   }
-  state.graphContext=await api(`/api/graph-context?project_id=${state.project.id}`);
+  state.ragStatus=await api(`/api/projects/${state.project.id}/rag/status`);
+  state.graphContext=state.ragStatus.documents_detail||[];
+  const job=state.ragStatus.job;
+  if(job&&['queued','running'].includes(job.status)){
+    state.ragJob=job;state.graphContextBusy=true;
+    watchRagIndex(state.project.id,job.id).catch(err=>console.warn('Could not follow project indexing',err))
+  }
   if(!graphNodeById(state.selectedGraphNodeId))state.selectedGraphNodeId=null;
   renderGraphContext()
 }
 async function scanGraphContext(){
-  if(!state.project||state.graphContextBusy)return;
-  state.graphContextBusy=true; renderGraphContext();
+  if(!state.project)return;
+  if(!state.ragStatus?.enabled){
+    if(state.graphContextBusy)return;
+    configureRagDialog();
+    $('#rag-consent-dialog').showModal();
+    return
+  }
+  if(!confirm('Disable grounded project retrieval and remove its local index?'))return;
   try{
-    const result=await api('/api/graph-context/scan',{method:'POST',body:JSON.stringify({project_id:state.project.id})});
-    state.graphContext=result.items||[];
-    state.selectedGraphNodeId=null;
-    renderGraphContext()
+    await api(`/api/projects/${state.project.id}/rag/consent`,{method:'PUT',body:JSON.stringify({enabled:false})});
+    state.ragJob=null; state.graphContextBusy=false; await loadGraphContext()
   }catch(err){alert(err.message)}
-  finally{state.graphContextBusy=false;renderGraphContext()}
 }
-async function generateGraphContext(path=''){
+function watchRagIndex(projectId,jobId){
+  if(state.ragPollPromise)return state.ragPollPromise;
+  let tracked;
+  tracked=(async()=>{
+    while(state.project?.id===projectId){
+      const out=await api(`/api/projects/${projectId}/rag/index/${encodeURIComponent(jobId)}`);
+      state.ragJob=out.job; renderGraphContext();
+      if(['completed','error'].includes(out.job.status)){
+        if(out.job.status==='error')alert(out.job.error||'Project indexing failed.');
+        break
+      }
+      await wait(500)
+    }
+  })().finally(async()=>{
+    if(state.ragPollPromise===tracked)state.ragPollPromise=null;
+    if(state.project?.id===projectId){
+      state.graphContextBusy=false;state.ragJob=null;
+      await loadGraphContext()
+    }
+  });
+  state.ragPollPromise=tracked;
+  return tracked
+}
+async function generateGraphContext(force=true){
   if(!state.project||state.graphContextBusy)return;
+  const projectId=state.project.id;
   state.graphContextBusy=true; renderGraphContext();
   try{
-    const result=await api('/api/graph-context/generate',{method:'POST',body:JSON.stringify({project_id:state.project.id,path})});
-    state.graphContext=result.items||[];
-    if(result.truncated)alert('Generated the first 100 graph nodes. Select a folder to continue in smaller batches.');
-    renderGraphContext()
+    const result=await api(`/api/projects/${projectId}/rag/index`,{method:'POST',body:JSON.stringify({force})});
+    state.ragJob=result.job;
+    await watchRagIndex(projectId,result.job.id)
   }catch(err){alert(err.message)}
-  finally{state.graphContextBusy=false;renderGraphContext()}
+  finally{if(state.project?.id===projectId&&!state.ragPollPromise){state.graphContextBusy=false;state.ragJob=null;await loadGraphContext()}}
 }
 function allCommands(){
   const provider=activeAgent()?.runtime?.provider||'*',
@@ -3897,7 +4103,7 @@ $('#chat-form').onsubmit=async e=>{
     });
     submitted=true;
     await waitForChatRun(out.run.id, role, projectId);
-    loadGraphContext().catch(err=>console.warn('Could not refresh project graph metadata', err))
+    loadGraphContext().catch(err=>console.warn('Could not refresh Project Knowledge', err))
     console.log("Posted successfully")
   }
   catch(err){
@@ -3926,21 +4132,7 @@ $('#chat-form').onsubmit=async e=>{
 };
 $('#graph-context-form').onsubmit=async e=>{
   e.preventDefault();
-  const id=$('#graph-context-id').value;
-  if(!id||!state.project)return;
-  let vector;
-  try{vector=JSON.parse($('#graph-context-vector').value)}
-  catch{return alert('Numeric vector must be valid JSON.')}
-  if(!Array.isArray(vector)||vector.length!==16||vector.some(value=>!Number.isFinite(value))){
-    return alert('Numeric vector must contain exactly 16 finite numbers.')
-  }
-  const keywords=$('#graph-context-keywords').value.split(',').map(value=>value.trim()).filter(Boolean);
-  try{
-    const saved=await api(`/api/graph-context/${encodeURIComponent(id)}`, {method:'PUT', body:JSON.stringify({project_id:state.project.id, keywords, vector, source:'manual'})});
-    state.graphContext=state.graphContext.map(node=>String(node.id)===String(saved.id)?saved:node);
-    $('#graph-context-dialog').close();
-    renderGraphContext()
-  }catch(err){alert(err.message)}
+  $('#graph-context-dialog').close()
 };
 $('#runtime-form').onsubmit=async e=>{
   e.preventDefault();
@@ -4020,15 +4212,7 @@ $('#clear-history').onclick=async()=>{
   }
 };
 $('#delete-graph-context').onclick=async()=>{
-  const id=$('#graph-context-id').value;
-  if(id&&state.project&&confirm('Delete this graph node metadata?')){
-    try{
-      await api(`/api/graph-context/${encodeURIComponent(id)}?project_id=${state.project.id}`, {method:'DELETE'});
-      $('#graph-context-dialog').close();
-      state.selectedGraphNodeId=null;
-      await loadGraphContext()
-    }catch(err){alert(err.message)}
-  }
+  $('#graph-context-dialog').close()
 };
 function openAgentDialog(){
   $('#agent-form').reset();
@@ -4042,16 +4226,39 @@ function selectedToolsetRoles(){
   return [...document.querySelectorAll('#toolset-agent-checks input:checked')].map(input=>input.value)
 }
 $('#scan-graph-context').onclick=()=>scanGraphContext();
-$('#generate-project-graph').onclick=()=>generateGraphContext();
-$('#generate-selected-graph').onclick=()=>{
-  const node=graphNodeById(state.selectedGraphNodeId);
-  if(node)generateGraphContext(node.path||'')
-};
-$('#generate-graph-context').onclick=()=>{
-  const node=graphNodeById($('#graph-context-id').value);
-  if(node)generateGraphContext(node.path||'')
-};
+$('#generate-project-graph').onclick=()=>generateGraphContext(true);
+$('#generate-selected-graph').onclick=()=>generateGraphContext(true);
+$('#generate-graph-context').onclick=()=>generateGraphContext(true);
 $('#close-graph-context-dialog').onclick=()=>$('#graph-context-dialog').close();
+$('#close-rag-consent').onclick=$('#cancel-rag-consent').onclick=()=>$('#rag-consent-dialog').close();
+$('#rag-provider').onchange=()=>{
+  const ollama=$('#rag-provider').value==='ollama';
+  $('#rag-model').value=ollama?'nomic-embed-text:latest':'text-embedding-3-small';
+  $('#rag-dimensions').value=ollama?768:256;
+  $('#rag-base-url-field').classList.toggle('hidden',!ollama);
+  $('#rag-consent-copy').textContent=ollama?'Eligible project text will be sent only to the configured Ollama service. Embeddings and source chunks remain in this workspace’s ignored local database.':'Eligible project text will be sent to the OpenAI Embeddings API. Embeddings and source chunks remain in this workspace’s ignored local database.';
+  renderRagEmbeddingStatus({...ragSettingsPayload(),ready:false,error:'Test the selected model before enabling retrieval.'});
+  $('#confirm-rag-consent').disabled=true
+};
+$('#rag-model').oninput=$('#rag-base-url').oninput=()=>{
+  renderRagEmbeddingStatus({...ragSettingsPayload(),ready:false,error:'Settings changed. Test the model again.'});
+  $('#confirm-rag-consent').disabled=true
+};
+$('#test-rag-embedding').onclick=()=>testRagEmbedding();
+$('#confirm-rag-consent').onclick=async()=>{
+  if(!state.project)return;
+  const button=$('#confirm-rag-consent'); button.disabled=true;
+  try{
+    const tested=await testRagEmbedding();
+    if(!tested?.ready)return;
+    await api(`/api/projects/${state.project.id}/rag/embedding-settings`,{method:'PUT',body:JSON.stringify(ragSettingsPayload())});
+    await api(`/api/projects/${state.project.id}/rag/consent`,{method:'PUT',body:JSON.stringify({enabled:true})});
+    $('#rag-consent-dialog').close();
+    await loadGraphContext();
+    await generateGraphContext(false)
+  }catch(err){alert(err.message)}
+  finally{button.disabled=false}
+};
 $('#new-agent').onclick=openAgentDialog;
 $('#new-chat').onclick=async()=>{
   if(!activeAgent()||!state.messages[state.active]?.length)return $('#message').focus();

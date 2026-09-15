@@ -199,6 +199,33 @@ def test_chat_runs_are_durable_and_recover_interrupted_work(tmp_path):
     assert reopened.chat_run(completed["id"])["result"]["response"] == "done"
 
 
+def test_chat_run_events_are_ordered_durable_and_attached_to_messages(tmp_path):
+    store = RuntimeConfigStore(tmp_path / "events.db")
+    user = store.add_message("researcher", "user", "Find auth", "openai", "test", project_id=2)
+    run = store.create_chat_run(
+        "researcher", 2, {"message": "Find auth", "user_message_id": user["id"]}
+    )
+    indexing = store.add_run_event(
+        run["id"], 2, "researcher", "index", "running", "Checking project index", {"processed": 0}
+    )
+    store.update_run_event(indexing["id"], "completed", {"processed": 3, "changed": 1})
+    store.add_run_event(
+        run["id"], 2, "researcher", "retrieval", "completed", "Searched project",
+        {"results": [{"source_id": "S1", "path": "auth.py"}]},
+    )
+    assistant = store.add_message(
+        "researcher", "assistant", "Auth is here [S1].", "openai", "test", 2, run_id=run["id"]
+    )
+
+    assert store.message(user["id"], "researcher", 2)["run_id"] == run["id"]
+    assert assistant["run_id"] == run["id"]
+    assert [event["sequence"] for event in store.chat_run(run["id"])["events"]] == [1, 2]
+    assert store.chat_run(run["id"])["events"][0]["payload"] == {"processed": 3, "changed": 1}
+
+    reopened = RuntimeConfigStore(tmp_path / "events.db", recover_interrupted_runs=False)
+    assert reopened.run_events(run["id"])[1]["payload"]["results"][0]["source_id"] == "S1"
+
+
 def test_auxiliary_runtime_store_does_not_recover_live_runs(tmp_path):
     db_path = tmp_path / "runtime-helper.db"
     store = RuntimeConfigStore(db_path)
