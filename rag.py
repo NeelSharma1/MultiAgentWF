@@ -8,6 +8,7 @@ ignored SQLite database as the rest of the workspace.
 from __future__ import annotations
 
 import asyncio
+import ast
 import fnmatch
 import hashlib
 import json
@@ -84,6 +85,8 @@ class SourceChunk:
     end_line: int
     content: str
     token_count: int
+    symbol: str = ""
+    metadata: dict[str, Any] | None = None
 
 
 def _sha256(value: bytes | str) -> str:
@@ -174,6 +177,63 @@ def chunk_text(text: str) -> list[SourceChunk]:
             overlap += segments[next_start][2]
         start = next_start if next_start > start else end
     return chunks
+
+
+def _chunk_line_range(text: str, start_line: int, symbol: str = "",
+                      metadata: dict[str, Any] | None = None) -> list[SourceChunk]:
+    chunks = chunk_text(text)
+    return [SourceChunk(
+        chunk.index, chunk.start_line + start_line - 1, chunk.end_line + start_line - 1,
+        chunk.content, chunk.token_count, symbol, metadata or {},
+    ) for chunk in chunks]
+
+
+def structured_chunk_text(text: str, path: str = "") -> list[SourceChunk]:
+    """Chunk supported source formats on semantic boundaries with a safe fallback."""
+    suffix = Path(path).suffix.lower()
+    lines = text.splitlines(keepends=True)
+    sections: list[tuple[int, int, str, dict[str, Any]]] = []
+    if suffix == ".py":
+        try:
+            tree = ast.parse(text)
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    start = max(1, int(getattr(node, "lineno", 1)))
+                    decorators = [int(getattr(item, "lineno", start)) for item in getattr(node, "decorator_list", [])]
+                    start = min([start, *decorators])
+                    end = max(start, int(getattr(node, "end_lineno", start)))
+                    sections.append((start, end, str(getattr(node, "name", "")), {
+                        "symbol_type": "class" if isinstance(node, ast.ClassDef) else "function",
+                    }))
+        except (SyntaxError, ValueError):
+            sections = []
+    elif suffix in {".md", ".markdown", ".mdx"}:
+        headings: list[tuple[int, str]] = []
+        for line_number, line in enumerate(lines, 1):
+            match = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
+            if match:
+                headings.append((line_number, match.group(1).strip()))
+        for index, (start, heading) in enumerate(headings):
+            end = headings[index + 1][0] - 1 if index + 1 < len(headings) else len(lines)
+            sections.append((start, max(start, end), heading, {"symbol_type": "section"}))
+    if not sections:
+        return chunk_text(text)
+
+    chunks: list[SourceChunk] = []
+    cursor = 1
+    for start, end, symbol, metadata in sorted(sections):
+        if start > cursor:
+            prefix = "".join(lines[cursor - 1:start - 1])
+            chunks.extend(_chunk_line_range(prefix, cursor, "", {"symbol_type": "preamble"}))
+        section_text = "".join(lines[start - 1:end])
+        chunks.extend(_chunk_line_range(section_text, start, symbol, metadata))
+        cursor = max(cursor, end + 1)
+    if cursor <= len(lines):
+        chunks.extend(_chunk_line_range("".join(lines[cursor - 1:]), cursor))
+    return [SourceChunk(
+        index, item.start_line, item.end_line, item.content, item.token_count,
+        item.symbol, item.metadata or {},
+    ) for index, item in enumerate(chunks)]
 
 
 def _sensitive(relative: str) -> bool:
@@ -275,6 +335,11 @@ class RagStore:
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
                     indexed_at TEXT,
+                    source_id TEXT NOT NULL DEFAULT 'local',
+                    uri TEXT NOT NULL DEFAULT '',
+                    revision TEXT NOT NULL DEFAULT '',
+                    branch TEXT NOT NULL DEFAULT '',
+                    acl_json TEXT NOT NULL DEFAULT '[]',
                     UNIQUE(project_id, path)
                 );
                 CREATE INDEX IF NOT EXISTS idx_rag_documents_project_path
@@ -296,6 +361,8 @@ class RagStore:
                     embedding_model TEXT NOT NULL,
                     embedding_dimensions INTEGER NOT NULL,
                     embedding_fingerprint TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(document_id, chunk_index),
                     FOREIGN KEY(document_id) REFERENCES rag_documents(id) ON DELETE CASCADE
@@ -310,6 +377,10 @@ class RagStore:
                     processed_files INTEGER NOT NULL DEFAULT 0,
                     changed_files INTEGER NOT NULL DEFAULT 0,
                     embedded_chunks INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL DEFAULT 'manual',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_expires_at TEXT,
                     error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -321,6 +392,25 @@ class RagStore:
                 db.execute("ALTER TABLE rag_chunks ADD COLUMN embedding_provider TEXT NOT NULL DEFAULT 'openai'")
             if "embedding_fingerprint" not in chunk_columns:
                 db.execute("ALTER TABLE rag_chunks ADD COLUMN embedding_fingerprint TEXT NOT NULL DEFAULT ''")
+            if "symbol" not in chunk_columns:
+                db.execute("ALTER TABLE rag_chunks ADD COLUMN symbol TEXT NOT NULL DEFAULT ''")
+            if "metadata_json" not in chunk_columns:
+                db.execute("ALTER TABLE rag_chunks ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+            document_columns = {row["name"] for row in db.execute("PRAGMA table_info(rag_documents)")}
+            for name, declaration in (
+                ("source_id", "TEXT NOT NULL DEFAULT 'local'"), ("uri", "TEXT NOT NULL DEFAULT ''"),
+                ("revision", "TEXT NOT NULL DEFAULT ''"), ("branch", "TEXT NOT NULL DEFAULT ''"),
+                ("acl_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if name not in document_columns:
+                    db.execute(f"ALTER TABLE rag_documents ADD COLUMN {name} {declaration}")
+            job_columns = {row["name"] for row in db.execute("PRAGMA table_info(rag_index_jobs)")}
+            for name, declaration in (
+                ("reason", "TEXT NOT NULL DEFAULT 'manual'"), ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("lease_owner", "TEXT NOT NULL DEFAULT ''"), ("lease_expires_at", "TEXT"),
+            ):
+                if name not in job_columns:
+                    db.execute(f"ALTER TABLE rag_index_jobs ADD COLUMN {name} {declaration}")
             try:
                 db.execute(
                     """CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
@@ -342,11 +432,29 @@ class RagStore:
     def _chunk_id(document_id: str, index: int, chunk_hash: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"rag-chunk:{document_id}:{index}:{chunk_hash}"))
 
-    def create_job(self, project_id: int) -> dict[str, Any]:
+    def create_job(self, project_id: int, reason: str = "manual") -> dict[str, Any]:
         job_id = uuid.uuid4().hex
         with self._connect() as db:
-            db.execute("INSERT INTO rag_index_jobs(id,project_id,status) VALUES(?,?,'queued')", (job_id, project_id))
+            db.execute(
+                "INSERT INTO rag_index_jobs(id,project_id,status,reason) VALUES(?,?,'queued',?)",
+                (job_id, project_id, reason[:80]),
+            )
         return self.job(job_id) or {}
+
+    def latest_active_job(self, project_id: int) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM rag_index_jobs WHERE project_id=? AND status IN ('queued','running')
+                ORDER BY created_at DESC LIMIT 1""", (project_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def queued_jobs(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM rag_index_jobs WHERE status='queued' ORDER BY created_at,id"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def job(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -405,6 +513,7 @@ class RagStore:
         force: bool = False,
         job_id: str | None = None,
         progress: Callable[[dict[str, Any]], None] | None = None,
+        content_policy: Callable[[str], tuple[str, list[Any]]] | None = None,
         profile: EmbeddingProfile = DEFAULT_EMBEDDING_PROFILE,
     ) -> dict[str, Any]:
         root = root.expanduser().resolve()
@@ -415,6 +524,7 @@ class RagStore:
         present: set[str] = set()
         changed = embedded = processed = 0
         errors: list[dict[str, str]] = []
+        policy_findings: list[dict[str, str]] = []
         for path in files:
             relative = path.relative_to(root).as_posix()
             present.add(relative)
@@ -430,6 +540,22 @@ class RagStore:
                     continue
                 text = data.decode("utf-8", "replace")
                 content_hash = _sha256(data)
+                if content_policy is not None:
+                    text, findings = content_policy(text)
+                    for finding in findings:
+                        policy_findings.append({
+                            "path": relative,
+                            "category": str(getattr(finding, "category", "policy")),
+                            "action": str(getattr(finding, "action", "exclude")),
+                            "detail": str(getattr(finding, "detail", "Content policy matched")),
+                        })
+                    if findings and not text:
+                        detail = ", ".join(sorted({str(getattr(item, "category", "policy")) for item in findings}))
+                        self._set_document(
+                            project_id, relative, content_hash, len(data), stat.st_mtime,
+                            "skipped", 0, f"Content policy excluded: {detail}",
+                        )
+                        continue
                 previous = known.get(relative)
                 profile_matches = bool(previous) and self._document_profile_matches(
                     str(previous["id"]), profile.fingerprint,
@@ -437,7 +563,7 @@ class RagStore:
                 if (not force and previous and previous["content_hash"] == content_hash
                         and previous["status"] == "indexed" and profile_matches):
                     continue
-                chunks = chunk_text(text)
+                chunks = structured_chunk_text(text, relative)
                 document_id = self._document_id(project_id, relative)
                 self._set_document(project_id, relative, content_hash, len(data), stat.st_mtime, "indexing", 0, "")
                 inputs = [f"File: {relative}\nLines: {chunk.start_line}-{chunk.end_line}\n{chunk.content}" for chunk in chunks]
@@ -484,10 +610,93 @@ class RagStore:
                         chunk_marks = ",".join("?" for _ in chunk_ids)
                         db.execute(f"DELETE FROM rag_chunks_fts WHERE chunk_id IN ({chunk_marks})", chunk_ids)
                     db.execute(f"DELETE FROM rag_documents WHERE id IN ({id_marks})", ids)
-        result = {"ok": not errors, "processed": processed, "total": len(files), "changed": changed, "embedded_chunks": embedded, "removed": len(removed), "errors": errors}
+        result = {"ok": not errors, "processed": processed, "total": len(files), "changed": changed,
+                  "embedded_chunks": embedded, "removed": len(removed), "errors": errors,
+                  "policy_findings": policy_findings}
         if job_id:
             self._update_job(job_id, status="completed" if not errors else "error", error=json.dumps(errors[:5]))
         return result
+
+    async def index_source_documents(
+        self,
+        project_id: int,
+        source_id: str,
+        documents: Iterable[Any],
+        embed: Callable[[list[str]], Awaitable[list[list[float]]]],
+        *,
+        profile: EmbeddingProfile = DEFAULT_EMBEDDING_PROFILE,
+    ) -> dict[str, Any]:
+        """Atomically replace the searchable snapshot for one connector source."""
+        source_id = str(source_id or "").strip()
+        if not source_id or source_id == "local":
+            raise RagError("A non-local connector source id is required")
+        normalized = [item.normalized() if hasattr(item, "normalized") else item for item in documents]
+        staged: list[tuple[Any, str, list[SourceChunk], list[list[float]]]] = []
+        for item in normalized:
+            content = str(getattr(item, "content", ""))
+            path = str(getattr(item, "path", "")).strip().lstrip("/")
+            if not path or not content:
+                continue
+            stored_path = f"@{source_id}/{path}"
+            chunks = structured_chunk_text(content, path)
+            inputs = [
+                f"Source: {source_id}\nFile: {path}\nRevision: {getattr(item, 'revision', '')}\n"
+                f"Lines: {chunk.start_line}-{chunk.end_line}\n{chunk.content}"
+                for chunk in chunks
+            ]
+            vectors: list[list[float]] = []
+            batch_size = min(BATCH_SIZE, 16) if profile.provider == "ollama" else BATCH_SIZE
+            for offset in range(0, len(inputs), batch_size):
+                vectors.extend(await embed(inputs[offset:offset + batch_size]))
+            if len(vectors) != len(chunks):
+                raise RagError("Embedding provider returned an unexpected result count")
+            staged.append((item, stored_path, chunks, vectors))
+
+        with self._connect() as db:
+            old_chunk_ids = [row[0] for row in db.execute(
+                """SELECT c.id FROM rag_chunks c JOIN rag_documents d ON d.id=c.document_id
+                WHERE d.project_id=? AND d.source_id=?""", (project_id, source_id),
+            ).fetchall()]
+            if old_chunk_ids:
+                marks = ",".join("?" for _ in old_chunk_ids)
+                db.execute(f"DELETE FROM rag_chunks_fts WHERE chunk_id IN ({marks})", old_chunk_ids)
+            db.execute("DELETE FROM rag_documents WHERE project_id=? AND source_id=?", (project_id, source_id))
+            embedded = 0
+            for item, stored_path, chunks, vectors in staged:
+                document_id = self._document_id(project_id, stored_path)
+                content = str(getattr(item, "content", ""))
+                content_hash = str(getattr(item, "content_hash", "")) or _sha256(content)
+                acl = list(getattr(item, "acl_subjects", ()) or ())
+                db.execute(
+                    """INSERT INTO rag_documents(
+                    id,project_id,path,content_hash,size,language,status,chunk_count,indexed_at,
+                    source_id,uri,revision,branch,acl_json) VALUES(?,?,?,?,?,?, 'indexed',?,CURRENT_TIMESTAMP,?,?,?,?,?)""",
+                    (document_id, project_id, stored_path, content_hash, len(content.encode("utf-8")),
+                     str(getattr(item, "language", "")), len(chunks), source_id,
+                     str(getattr(item, "uri", "")), str(getattr(item, "revision", "")),
+                     str(getattr(item, "branch", "")), json.dumps(acl)),
+                )
+                for chunk, vector in zip(chunks, vectors):
+                    chunk_hash = _sha256(chunk.content)
+                    chunk_id = self._chunk_id(document_id, chunk.index, chunk_hash)
+                    metadata = {**dict(getattr(item, "metadata", {}) or {}), **(chunk.metadata or {})}
+                    db.execute(
+                        """INSERT INTO rag_chunks(id,document_id,project_id,path,chunk_index,start_line,end_line,
+                        content,content_hash,chunk_hash,token_count,embedding,embedding_provider,embedding_model,
+                        embedding_dimensions,embedding_fingerprint,symbol,metadata_json)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (chunk_id, document_id, project_id, stored_path, chunk.index, chunk.start_line,
+                         chunk.end_line, chunk.content, content_hash, chunk_hash, chunk.token_count,
+                         _pack_vector(vector, profile.dimensions), profile.provider, profile.model,
+                         profile.dimensions, profile.fingerprint, chunk.symbol,
+                         json.dumps(metadata, default=str)),
+                    )
+                    db.execute(
+                        "INSERT INTO rag_chunks_fts(chunk_id,project_id,path,content) VALUES(?,?,?,?)",
+                        (chunk_id, project_id, stored_path, chunk.content),
+                    )
+                    embedded += 1
+        return {"ok": True, "source_id": source_id, "documents": len(staged), "embedded_chunks": embedded}
 
     def _document_profile_matches(self, document_id: str, fingerprint: str) -> bool:
         with self._connect() as db:
@@ -527,12 +736,13 @@ class RagStore:
                 db.execute(
                     """INSERT INTO rag_chunks(id,document_id,project_id,path,chunk_index,start_line,end_line,content,
                     content_hash,chunk_hash,token_count,embedding,embedding_provider,embedding_model,
-                    embedding_dimensions,embedding_fingerprint)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    embedding_dimensions,embedding_fingerprint,symbol,metadata_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (chunk_id, document_id, project_id, path, chunk.index, chunk.start_line, chunk.end_line,
                      chunk.content, content_hash, chunk_hash, chunk.token_count,
                      _pack_vector(vector, profile.dimensions), profile.provider, profile.model,
-                     profile.dimensions, profile.fingerprint),
+                     profile.dimensions, profile.fingerprint, chunk.symbol,
+                     json.dumps(chunk.metadata or {}, default=str)),
                 )
                 db.execute(
                     "INSERT INTO rag_chunks_fts(chunk_id,project_id,path,content) VALUES(?,?,?,?)",
@@ -548,6 +758,10 @@ class RagStore:
         *,
         limit: int = DEFAULT_RESULTS,
         path_prefix: str = "",
+        source_ids: Iterable[str] = (),
+        branch: str = "",
+        revision: str = "",
+        allowed_subjects: Iterable[str] = (),
         profile: EmbeddingProfile = DEFAULT_EMBEDDING_PROFILE,
     ) -> list[dict[str, Any]]:
         query = str(query or "").strip()
@@ -568,11 +782,25 @@ class RagStore:
             if prefix:
                 path_clause = " AND c.path LIKE ?"
                 params.append(prefix + "%")
+            source_values = tuple(str(item) for item in source_ids if str(item))
+            source_clause = ""
+            if source_values:
+                source_clause = f" AND d.source_id IN ({','.join('?' for _ in source_values)})"
+                params.extend(source_values)
+            branch_clause = ""
+            if branch:
+                branch_clause = " AND d.branch=?"
+                params.append(branch)
+            revision_clause = ""
+            if revision:
+                revision_clause = " AND d.revision=?"
+                params.append(revision)
             rows = db.execute(
-                """SELECT c.* FROM rag_chunks c JOIN rag_documents d ON d.id=c.document_id
+                """SELECT c.*,d.source_id document_source_id,d.uri,d.revision,d.branch,d.acl_json
+                FROM rag_chunks c JOIN rag_documents d ON d.id=c.document_id
                 WHERE c.project_id=? AND d.status='indexed' AND c.content_hash=d.content_hash
                 AND c.embedding_provider=? AND c.embedding_model=? AND c.embedding_dimensions=?
-                AND c.embedding_fingerprint=?""" + path_clause,
+                AND c.embedding_fingerprint=?""" + path_clause + source_clause + branch_clause + revision_clause,
                 params,
             ).fetchall()
             lexical: list[sqlite3.Row] = []
@@ -620,19 +848,29 @@ class RagStore:
         results: list[dict[str, Any]] = []
         used_tokens = 0
         root = root.expanduser().resolve()
+        subject_set = {str(item) for item in allowed_subjects if str(item)}
         for chunk_id in ranked:
             row = row_map.get(chunk_id)
             if row is None:
                 continue
-            target = (root / str(row["path"])).resolve()
-            try:
-                if not target.is_relative_to(root) or target.is_symlink() or not target.is_file():
+            document_source_id = str(row["document_source_id"] or "local")
+            if document_source_id == "local":
+                target = (root / str(row["path"])).resolve()
+                try:
+                    if not target.is_relative_to(root) or target.is_symlink() or not target.is_file():
+                        continue
+                    current_hash = _sha256(target.read_bytes())
+                except OSError:
                     continue
-                current_hash = _sha256(target.read_bytes())
-            except OSError:
-                continue
-            if current_hash != row["content_hash"]:
-                continue
+                if current_hash != row["content_hash"]:
+                    continue
+            elif subject_set:
+                try:
+                    acl = {str(item) for item in json.loads(str(row["acl_json"] or "[]"))}
+                except (TypeError, ValueError):
+                    acl = set()
+                if not acl.intersection(subject_set):
+                    continue
             if results and any(
                 item["path"] == row["path"] and not (
                     int(row["end_line"]) < item["start_line"] or int(row["start_line"]) > item["end_line"]
@@ -647,6 +885,11 @@ class RagStore:
                 "id": chunk_id,
                 "source_id": f"S{len(results) + 1}",
                 "path": str(row["path"]),
+                "connector_source_id": document_source_id,
+                "uri": str(row["uri"] or ""),
+                "revision": str(row["revision"] or ""),
+                "branch": str(row["branch"] or ""),
+                "symbol": str(row["symbol"] or ""),
                 "start_line": int(row["start_line"]),
                 "end_line": int(row["end_line"]),
                 "excerpt": str(row["content"]),
@@ -659,6 +902,53 @@ class RagStore:
             if len(results) >= limit:
                 break
         return results
+
+    def delete_source(self, project_id: int, source_id: str) -> dict[str, int]:
+        with self._connect() as db:
+            chunk_ids = [row[0] for row in db.execute(
+                """SELECT c.id FROM rag_chunks c JOIN rag_documents d ON d.id=c.document_id
+                WHERE d.project_id=? AND d.source_id=?""", (project_id, source_id),
+            ).fetchall()]
+            if chunk_ids:
+                marks = ",".join("?" for _ in chunk_ids)
+                db.execute(f"DELETE FROM rag_chunks_fts WHERE chunk_id IN ({marks})", chunk_ids)
+            cursor = db.execute(
+                "DELETE FROM rag_documents WHERE project_id=? AND source_id=?", (project_id, source_id),
+            )
+        return {"documents": max(0, cursor.rowcount), "chunks": len(chunk_ids)}
+
+    def export_generation(self, project_id: int, source_id: str,
+                          profile: EmbeddingProfile) -> list[dict[str, Any]]:
+        """Export one fully indexed source for transactional backend publication."""
+        with self._connect() as db:
+            documents = db.execute(
+                """SELECT * FROM rag_documents WHERE project_id=? AND source_id=?
+                AND status='indexed' ORDER BY path""", (project_id, source_id),
+            ).fetchall()
+            output: list[dict[str, Any]] = []
+            for document in documents:
+                chunks = db.execute(
+                    """SELECT * FROM rag_chunks WHERE document_id=? AND embedding_fingerprint=?
+                    ORDER BY chunk_index""", (document["id"], profile.fingerprint),
+                ).fetchall()
+                try:
+                    acl = json.loads(str(document["acl_json"] or "[]"))
+                except (TypeError, ValueError):
+                    acl = []
+                output.append({
+                    "uri": str(document["uri"] or ""), "path": str(document["path"]),
+                    "branch": str(document["branch"] or ""), "revision": str(document["revision"] or ""),
+                    "content_hash": str(document["content_hash"]), "acl_subjects": acl,
+                    "metadata": {"language": str(document["language"] or "")},
+                    "chunks": [{
+                        "start_line": int(chunk["start_line"]), "end_line": int(chunk["end_line"]),
+                        "symbol": str(chunk["symbol"] or ""), "content": str(chunk["content"]),
+                        "content_hash": str(chunk["chunk_hash"]), "token_count": int(chunk["token_count"]),
+                        "embedding": list(_unpack_vector(chunk["embedding"], profile.dimensions)),
+                        "metadata": json.loads(str(chunk["metadata_json"] or "{}")),
+                    } for chunk in chunks],
+                })
+        return output
 
     def delete_project(self, project_id: int) -> None:
         with self._connect() as db:

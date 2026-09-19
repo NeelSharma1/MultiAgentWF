@@ -46,6 +46,8 @@ def bind_available_port(host: str = "127.0.0.1", start_port: int = 8000) -> tupl
 from graph_context import GraphContextError, GraphContextStore, ROLES  # noqa: E402
 from embedding_providers import EmbeddingProviderError, profile_from_project  # noqa: E402
 from rag import RagError, eligible_files  # noqa: E402
+from rag_enterprise import PrincipalResolver, RequestPrincipal  # noqa: E402
+from rag_runtime import LocalRagIndexCoordinator  # noqa: E402
 from team import AgentTeam, ROLE_BRIEFS, project_python_executable  # noqa: E402
 from mcp_server import mcp as workspace_mcp  # noqa: E402
 from credentials import LocalCredentialStore  # noqa: E402
@@ -54,11 +56,11 @@ from github_status import GitReportError, collect_git_report, format_git_report 
 from skills import normalize_skill_secret_refs, run_skill_script_async, skill_secret_names  # noqa: E402
 from git_workflow import GitWorkflowError  # noqa: E402
 
-graph_store = GraphContextStore(ROOT / "data" / "workspace.db")
+graph_store = GraphContextStore(ROOT / "maw" / "workspace.db")
 team = AgentTeam(ROOT)
 credentials = LocalCredentialStore(ROOT / ".env.local")
-skill_credentials = LocalCredentialStore(ROOT / "data" / ".skill-secrets.local")
-projects = ProjectStore(ROOT / "data" / "workspace.db")
+skill_credentials = LocalCredentialStore(ROOT / "maw" / ".skill-secrets.local")
+projects = ProjectStore(ROOT / "maw" / "workspace.db")
 chat_tasks: set[asyncio.Task] = set()
 rag_tasks: dict[tuple[int, str], asyncio.Task] = {}
 git_run_locks: dict[int, asyncio.Lock] = {}
@@ -69,9 +71,21 @@ workspace_mcp_http_app = workspace_mcp.streamable_http_app()
 def graph_project_root(project: dict[str, Any]) -> Path:
     """Resolve only the configured project root, never an arbitrary request path."""
     return GraphContextStore.resolve_project_root(project.get("root_path") or ROOT)
+
+
+rag_coordinator = LocalRagIndexCoordinator(
+    team.rag, team.index_project_knowledge, projects.list, graph_project_root,
+    reconcile_seconds=float(os.getenv("RAG_RECONCILE_SECONDS", "60")),
+)
+principal_resolver = PrincipalResolver()
 AUTOMATIC_AGENT_PROMPT = (
-    "Process the queued team messages now. Follow each command, use reports as context, "
-    "and send a concise report to the requesting agent when the work is complete."
+    "Process the queued team messages now. Follow each command and use reports as context. "
+    "For a report-only handoff, first decide whether it creates a concrete next action: additional work, "
+    "a decision, verification, synthesis, or a necessary escalation. Do not send an acknowledgement or a "
+    "routine completion report just to continue the report cycle. If no further action is needed, reply with "
+    "exactly TERMINATE (uppercase, with no other text and no tool calls). The workspace will show the most "
+    "recent reporting agent's message in this agent's transcript and end this handoff. If work is needed, "
+    "perform only that work and send a report only when the next agent genuinely needs the new result."
 )
 
 
@@ -79,6 +93,8 @@ AUTOMATIC_AGENT_PROMPT = (
 async def lifespan(_: FastAPI):
     global agent_dispatch_task
     await team.start()
+    team.rag_scheduler = rag_coordinator.schedule
+    await rag_coordinator.start()
     async with workspace_mcp.session_manager.run():
         agent_dispatch_task = asyncio.create_task(
             dispatch_pending_agent_messages(), name="agent-message-dispatcher"
@@ -86,6 +102,8 @@ async def lifespan(_: FastAPI):
         try:
             yield
         finally:
+            await rag_coordinator.stop()
+            team.rag_scheduler = None
             if agent_dispatch_task:
                 agent_dispatch_task.cancel()
                 await asyncio.gather(agent_dispatch_task, return_exceptions=True)
@@ -131,6 +149,9 @@ class ChatInput(BaseModel):
     # Internal automatic handoff prompts are sent to the provider but should
     # not become a synthetic user bubble in the recipient's transcript.
     record_user_message: bool = True
+    # Set only by the dispatcher for an idle recipient of an inter-agent
+    # message. It enables the exact TERMINATE completion control signal.
+    automatic_handoff: bool = False
     user_message_id: int | None = None
     # One-turn sandbox authorization set solely by the in-chat approval UI.
     temporary_access: Literal["", "workspace", "external"] = ""
@@ -190,6 +211,27 @@ class RagSearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
     path_prefix: str = Field(default="", max_length=2000)
     limit: int = Field(default=8, ge=1, le=20)
+    source_ids: list[str] = Field(default_factory=list, max_length=50)
+    branch: str = Field(default="", max_length=255)
+    revision: str = Field(default="", max_length=255)
+
+
+class RagPolicyInput(BaseModel):
+    policy: Literal["advisory", "grounded", "strict"] = "grounded"
+
+
+class RagSourceInput(BaseModel):
+    kind: Literal["git"] = "git"
+    name: str = Field(min_length=1, max_length=200)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class RagRetentionInput(BaseModel):
+    source_days: int = Field(default=30, ge=1, le=3650)
+    trace_days: int = Field(default=30, ge=1, le=3650)
+    audit_days: int = Field(default=365, ge=1, le=3650)
+    rollback_days: int = Field(default=7, ge=1, le=3650)
+    legal_hold: bool = False
 
 
 class RuntimeInput(BaseModel):
@@ -198,8 +240,10 @@ class RuntimeInput(BaseModel):
     base_url: str = ""
     api_key_env: str = ""
     reasoning_effort: str = ""
-    context_window_tokens: int = Field(default=128_000, ge=1_000, le=10_000_000)
-    context_compaction_threshold: int = Field(default=0, ge=0, le=95)
+    # API-backed runtimes do not retain a conversation server-side.  This is
+    # the locally counted input-token limit at which their history is replaced
+    # by a durable summary.  Codex manages its own context automatically.
+    context_compaction_tokens: int = Field(default=256_000, ge=1_000, le=10_000_000)
     project_id: int = 1
 
 class AgentInput(BaseModel):
@@ -610,13 +654,16 @@ async def create_project(payload: ProjectInput):
 @app.delete("/api/projects/{project_id}", status_code=204)
 async def delete_project(project_id: int):
     try:
-        projects.get(project_id)
+        project = projects.get(project_id)
         for agent in team.definitions.list(project_id):
             for attachment in team.configs.attachments_for(agent["role"], project_id):
                 Path(attachment["path"]).unlink(missing_ok=True)
         team.configs.remove_project(project_id)
         team.context.delete_project(project_id)
         team.rag.delete_project(project_id)
+        team.rag_enterprise.delete_project(str(project.get("tenant_id") or "local"), project_id)
+        if team.rag_backend is not None:
+            await team.rag_backend.delete_project(str(project.get("tenant_id") or "local"), project_id)
         team.definitions.delete_project(project_id)
         team.git.remove_project(project_id)
         projects.delete(project_id)
@@ -1488,7 +1535,7 @@ async def update_runtime(role: str, payload: RuntimeInput):
         return team.configs.save(
             role, payload.provider, payload.model, payload.base_url, payload.api_key_env,
             payload.reasoning_effort, payload.project_id,
-            payload.context_window_tokens, payload.context_compaction_threshold,
+            payload.context_compaction_tokens,
         )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -1610,7 +1657,7 @@ async def upload_attachment(role: str, project_id: int, attachment: UploadFile =
     )
     if not allowed:
         raise HTTPException(415, f"{mime_type} attachments are not supported by this runtime")
-    uploads = ROOT / "data" / "uploads"
+    uploads = ROOT / "maw" / "uploads"
     uploads.mkdir(parents=True, exist_ok=True)
     stored_path = uploads / f"{uuid.uuid4().hex}{Path(name).suffix[:12]}"
     stored_path.write_bytes(content)
@@ -1753,6 +1800,7 @@ async def dispatch_pending_agent_messages() -> None:
                     message=AUTOMATIC_AGENT_PROMPT,
                     project_id=project_id,
                     record_user_message=False,
+                    automatic_handoff=True,
                 )
                 _schedule_chat_run(role, payload)
         except asyncio.CancelledError:
@@ -1788,7 +1836,7 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
             return await team.chat(
                 role, payload.message.strip(), payload.model, payload.reasoning_effort, payload.project_id,
                 payload.reply_to_id, payload.attachment_ids, payload.record_user_message,
-                payload.user_message_id, payload.temporary_access, run_id,
+                payload.user_message_id, payload.temporary_access, run_id, payload.automatic_handoff,
             )
 
         if team.git.agent_enabled(payload.project_id, role):
@@ -1857,6 +1905,7 @@ async def chat(role: str, payload: ChatInput, request: Request):
         # Human/API-submitted prompts always remain visible. Only the internal
         # dispatcher is allowed to suppress its continuation prompt bubble.
         payload.record_user_message = True
+        payload.automatic_handoff = False
         run = _schedule_chat_run(role, payload)
         return {"run": run}
     except KeyError as exc:
@@ -1997,6 +2046,13 @@ async def rag_status(project_id: int):
             "eligible_file_count": len(await asyncio.to_thread(
                 eligible_files, graph_project_root(project)
             )),
+            "indexing": rag_coordinator.status(project_id),
+            "grounding_policy": str(project.get("rag_grounding_policy") or "grounded"),
+            "tenant_id": str(project.get("tenant_id") or "local"),
+            "backend": "postgres-pgvector" if team.rag_backend is not None else "sqlite-local",
+            "sources": team.rag_enterprise.sources(
+                str(project.get("tenant_id") or "local"), project_id,
+            ),
         })
         return status
     except KeyError as exc:
@@ -2070,7 +2126,11 @@ async def update_rag_consent(project_id: int, payload: RagConsentInput):
                 raise HTTPException(409, str(readiness.get("error") or "Embedding model is not ready"))
             consent_profile = str(readiness.get("fingerprint") or "")
         project = projects.set_rag_enabled(project_id, payload.enabled, consent_profile)
+        await rag_coordinator.refresh_watchers()
+        if payload.enabled:
+            await rag_coordinator.schedule(project_id, reason="enabled")
         if not payload.enabled:
+            rag_coordinator.cancel_project(project_id)
             active = [task for (owner, _), task in rag_tasks.items() if owner == project_id]
             for task in active:
                 task.cancel()
@@ -2086,16 +2146,6 @@ async def update_rag_consent(project_id: int, payload: RagConsentInput):
         raise HTTPException(404, str(exc)) from exc
 
 
-async def _run_rag_index_job(project_id: int, job_id: str, force: bool) -> None:
-    try:
-        await team.index_project_knowledge(project_id, force=force, job_id=job_id)
-    except asyncio.CancelledError:
-        team.rag._update_job(job_id, status="error", error="Server stopped during indexing")
-        raise
-    except Exception as exc:
-        team.rag._update_job(job_id, status="error", error=str(exc)[:1000])
-
-
 @app.post("/api/projects/{project_id}/rag/index", status_code=202)
 async def start_rag_index(project_id: int, payload: RagIndexInput):
     try:
@@ -2105,14 +2155,7 @@ async def start_rag_index(project_id: int, payload: RagIndexInput):
         readiness = await team.embedding_preflight(project_id)
         if not readiness.get("ready"):
             raise HTTPException(409, str(readiness.get("error") or "Embedding model is not ready"))
-        job = team.rag.create_job(project_id)
-        task = asyncio.create_task(
-            _run_rag_index_job(project_id, str(job["id"]), payload.force),
-            name=f"rag-index-{project_id}-{job['id']}",
-        )
-        task_key = (project_id, str(job["id"]))
-        rag_tasks[task_key] = task
-        task.add_done_callback(lambda _task, key=task_key: rag_tasks.pop(key, None))
+        job = await rag_coordinator.schedule(project_id, force=payload.force, reason="manual")
         return {"job": job}
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -2131,20 +2174,245 @@ async def rag_index_job(project_id: int, job_id: str):
 
 
 @app.post("/api/projects/{project_id}/rag/search")
-async def search_project_knowledge(project_id: int, payload: RagSearchInput):
+async def search_project_knowledge(project_id: int, payload: RagSearchInput, request: Request):
     try:
         project = projects.get(project_id)
         if not bool(project.get("rag_enabled")):
             raise HTTPException(409, "Project Knowledge is not enabled")
-        await team.index_project_knowledge(project_id)
+        tenant_id = str(project.get("tenant_id") or "local")
+        try:
+            principal = principal_resolver.resolve(dict(request.headers), tenant_id)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        trace_id = team.rag_enterprise.start_trace(
+            tenant_id, project_id, "api", principal, payload.query, payload.model_dump(),
+        )
+        started = asyncio.get_running_loop().time()
         results = await team.search_project_knowledge(
             project_id, payload.query, limit=payload.limit, path_prefix=payload.path_prefix,
+            source_ids=tuple(payload.source_ids), branch=payload.branch, revision=payload.revision,
+            principal=principal,
         )
-        return {"query": payload.query, "results": results}
+        latency_ms = round((asyncio.get_running_loop().time() - started) * 1000, 2)
+        team.rag_enterprise.finish_trace(
+            trace_id, tenant_id, status="retrieved", candidates=results, results=results,
+            timings={"retrieval_ms": latency_ms},
+        )
+        return {"query": payload.query, "results": results, "trace_id": trace_id,
+                "latency_ms": latency_ms}
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except RagError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/rag/policy")
+async def update_rag_policy(project_id: int, payload: RagPolicyInput):
+    try:
+        return projects.set_rag_policy(project_id, payload.policy)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _rag_scope(project_id: int, request: Request) -> tuple[dict[str, Any], RequestPrincipal]:
+    project = projects.get(project_id)
+    tenant_id = str(project.get("tenant_id") or "local")
+    try:
+        principal = principal_resolver.resolve(dict(request.headers), tenant_id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    return project, principal
+
+
+@app.get("/api/projects/{project_id}/rag/traces")
+async def list_rag_traces(project_id: int, request: Request, limit: int = 50):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        return {"traces": team.rag_enterprise.traces(
+            str(project.get("tenant_id") or "local"), project_id, limit,
+        )}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/rag/metrics")
+async def get_rag_metrics(project_id: int, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        return team.rag_enterprise.metrics(str(project.get("tenant_id") or "local"), project_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/rag/traces/{trace_id}")
+async def get_rag_trace(project_id: int, trace_id: str, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        trace = team.rag_enterprise.trace(trace_id, str(project.get("tenant_id") or "local"))
+        if not trace or int(trace["project_id"]) != project_id:
+            raise HTTPException(404, "Retrieval trace not found")
+        return trace
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/rag/sources")
+async def list_rag_sources(project_id: int, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        return {"sources": team.rag_enterprise.sources(
+            str(project.get("tenant_id") or "local"), project_id,
+        )}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/rag/sources", status_code=201)
+async def create_rag_source(project_id: int, payload: RagSourceInput, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        if payload.kind == "git":
+            repository = str(payload.config.get("repository") or "").strip()
+            if not repository:
+                raise HTTPException(422, "Git source config requires repository")
+            # Credentials are referenced by environment variable name only; raw secrets are rejected.
+            if any(key.lower() in {"token", "password", "secret", "api_key"} for key in payload.config):
+                raise HTTPException(422, "Store connector credentials externally and provide only an environment reference")
+        return team.rag_enterprise.create_source(
+            str(project.get("tenant_id") or "local"), project_id, payload.kind, payload.name, payload.config,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/rag/sources/{source_id}")
+async def update_rag_source(project_id: int, source_id: str, payload: RagSourceInput, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        tenant_id = str(project.get("tenant_id") or "local")
+        existing = team.rag_enterprise.source(source_id, tenant_id)
+        if not existing or int(existing["project_id"]) != project_id:
+            raise HTTPException(404, "RAG source not found")
+        if payload.kind != existing["kind"]:
+            raise HTTPException(422, "Connector kind cannot be changed")
+        if any(key.lower() in {"token", "password", "secret", "api_key"} for key in payload.config):
+            raise HTTPException(422, "Store connector credentials externally and provide only an environment reference")
+        return team.rag_enterprise.update_source(
+            source_id, tenant_id, name=payload.name, config=payload.config,
+            checkpoint="", last_error="", status="active",
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+async def _run_git_source_sync(project_id: int, tenant_id: str, source_id: str, job_id: str) -> None:
+    try:
+        source = team.rag_enterprise.source(source_id, tenant_id)
+        if not source or int(source["project_id"]) != project_id:
+            raise ValueError("RAG source not found")
+        team.rag._update_job(job_id, status="running")
+        result = await team.sync_git_source(project_id, source)
+        team.rag._update_job(
+            job_id, status="completed", total_files=int(result.get("documents", 0)),
+            processed_files=int(result.get("documents", 0)),
+            embedded_chunks=int(result.get("embedded_chunks", 0)),
+        )
+    except Exception as exc:
+        team.rag_enterprise.update_source(source_id, tenant_id, status="error", last_error=str(exc)[:1000])
+        team.rag._update_job(job_id, status="error", error=str(exc)[:1000])
+
+
+@app.post("/api/projects/{project_id}/rag/sources/{source_id}/sync", status_code=202)
+async def sync_rag_source(project_id: int, source_id: str, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        tenant_id = str(project.get("tenant_id") or "local")
+        source = team.rag_enterprise.source(source_id, tenant_id)
+        if not source or int(source["project_id"]) != project_id:
+            raise HTTPException(404, "RAG source not found")
+        job = team.rag.create_job(project_id, reason=f"source:{source_id}")
+        task = asyncio.create_task(
+            _run_git_source_sync(project_id, tenant_id, source_id, str(job["id"])),
+            name=f"rag-source-{project_id}-{source_id}",
+        )
+        key = (project_id, str(job["id"]))
+        rag_tasks[key] = task
+        task.add_done_callback(lambda _task, item=key: rag_tasks.pop(item, None))
+        return {"job": job, "source": source}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/rag/sources/{source_id}/test")
+async def test_rag_source(project_id: int, source_id: str, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        tenant_id = str(project.get("tenant_id") or "local")
+        source = team.rag_enterprise.source(source_id, tenant_id)
+        if not source or int(source["project_id"]) != project_id:
+            raise HTTPException(404, "RAG source not found")
+        return await team.validate_git_source(project_id, source)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/rag/sources/{source_id}")
+async def delete_rag_source(project_id: int, source_id: str, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        tenant_id = str(project.get("tenant_id") or "local")
+        source = team.rag_enterprise.source(source_id, tenant_id)
+        if not source or int(source["project_id"]) != project_id:
+            raise HTTPException(404, "RAG source not found")
+        removed = team.rag.delete_source(project_id, source_id)
+        if team.rag_backend is not None:
+            await team.rag_backend.delete_source(tenant_id, project_id, source_id)
+        team.rag_enterprise.delete_source(source_id, tenant_id)
+        return team.rag_enterprise.deletion_receipt(
+            tenant_id, project_id, source_id, "completed", removed,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/rag/retention")
+async def get_rag_retention(project_id: int, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        return team.rag_enterprise.retention(str(project.get("tenant_id") or "local"), project_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/rag/retention")
+async def update_rag_retention(project_id: int, payload: RagRetentionInput, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        return team.rag_enterprise.set_retention(
+            str(project.get("tenant_id") or "local"), project_id, **payload.model_dump(),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/rag/retention/apply")
+async def apply_rag_retention(project_id: int, request: Request):
+    try:
+        project, _ = _rag_scope(project_id, request)
+        tenant_id = str(project.get("tenant_id") or "local")
+        policy = team.rag_enterprise.retention(tenant_id, project_id)
+        result = team.rag_enterprise.apply_retention(tenant_id, project_id)
+        if team.rag_backend is not None and not bool(policy.get("legal_hold")):
+            result["generations_deleted"] = await team.rag_backend.apply_retention(
+                tenant_id, project_id, int(policy["rollback_days"]),
+            )
+        return result
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/graph-context/scan")

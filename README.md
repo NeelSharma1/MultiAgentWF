@@ -7,7 +7,7 @@ A local web workspace whose original workspace is seeded with six specialist age
 - Talk to each team member in an independent, persistent conversation.
 - Let agents send durable **command** or **report** messages directly into any other agent's project-scoped chat. Messages retain their sender and relationship type, appear in the recipient's groupchat transcript, and automatically start an idle recipient run; messages sent while a run is active remain queued and are synthesized into its next prompt.
 - Multiple unsent commands from the same sender to the same recipient are coalesced into one compiled command request. The transcript renders that bundle as a numbered command card, while every provider receives it as ordinary `[COMMAND from …]` text (never the storage envelope). Once a command has entered a provider prompt, later commands remain separate and are delivered on the following prompt.
-- Opt in to **Project Knowledge** to build a local SQLite index over safe project text. Each agent turn refreshes changed files, combines provider-selected semantic embeddings with SQLite FTS5 lexical search, verifies source hashes, and supplies line-addressable evidence with `[S#]` citations.
+- Opt in to **Project Knowledge** to build a local SQLite index over safe project text. A background watcher and periodic reconciler publish changed files without blocking agent turns; retrieval combines provider-selected semantic embeddings with SQLite FTS5 lexical search, reranks and diversifies evidence, verifies source hashes, and supplies line-addressable citations.
 - Let agents run focused follow-up retrieval through the local `search_project_context` MCP tool. Retrieved source, indexing, validation, command, file-change, tool, and Git events are persisted and rendered as collapsible IDE-style chat cards.
 - Let the Orchestrator hand a request to the most appropriate specialist.
 - Choose a provider and model independently for every role: OpenAI, Codex, Google Gemini, or an OpenAI-compatible server.
@@ -24,7 +24,7 @@ A local web workspace whose original workspace is seeded with six specialist age
 - Use messenger-style chat bubbles with timestamps, persisted reply threads, copy actions, and a queue-aware composer. You can submit another human command while an agent is working; it is persisted as its own transcript bubble and runs on the next turn, where it can be synthesized with any pending team commands or reports.
 - Render fenced Markdown code with a PyCharm-inspired palette. Every block can be copied; Python, JavaScript/Node, POSIX shell, and Ruby blocks can be run after confirmation in the selected project's local terminal pane, with stdout, stderr, exit status, timeout, and runtime errors shown.
 - Preserve failed provider calls in the chat with their HTTP status, error code/type, request ID, message, and provider response body for troubleshooting.
-- Attach up to six 10 MB images or supported documents per message. Files remain local under the ignored `data/uploads/` directory and are sent using each provider's supported input format.
+- Attach up to six 10 MB images or supported documents per message. Files remain local under the ignored `maw/uploads/` directory and are sent using each provider's supported input format.
 - Create and switch between Codex-style project workspaces with optional local folder references.
 - Arrange agents on a persistent flowchart and change their reporting relationships visually.
 - Type `/` in any agent chat for command autocomplete. The menu combines the active provider's native catalog (Codex commands are included), app-only commands, and provider commands you have previously used. App commands are namespaced as `/app …` so provider-native slash commands are never intercepted; `/gh` is the one explicit repository-report command.
@@ -71,13 +71,36 @@ Open **Settings → Accounts** in the app header to connect Codex with ChatGPT d
 
 Project Knowledge is disabled separately for every workspace. New workspaces default to local Ollama with `nomic-embed-text:latest` at its native 768 dimensions and `http://127.0.0.1:11434`; OpenAI `text-embedding-3-small` at 256 dimensions remains available as an explicit per-project choice. The enable dialog performs a real test embedding and identifies the exact destination before consent. Ollama document and query inputs receive Nomic's `search_document:` and `search_query:` prefixes, and no local failure silently falls back to a cloud provider.
 
-Install Ollama and run `ollama pull nomic-embed-text`. When a project is configured for a loopback Ollama endpoint, the app detects an already-running server or starts `ollama serve` from the installed CLI, then performs a project-text-free warmup embedding so Ollama loads the configured model. A server started by the app is stopped during application shutdown; an independently running Ollama service is left alone. The app diagnoses a missing model, invalid vector response, or inference failure but never downloads or upgrades Ollama itself. Changing provider, model, endpoint, dimensions, or resolved model digest invalidates the semantic index and requires fresh consent. Chunks and vectors remain in the ignored local `data/workspace.db`; `.env*`, private keys, Git internals, dependencies, caches, ignored paths, symlinks, binaries, files larger than 128 KB, and content beyond the 5,000-file project limit are not indexed. Disabling Project Knowledge cancels active indexing and removes that workspace's local index.
+Install Ollama and run `ollama pull nomic-embed-text`. When a project is configured for a loopback Ollama endpoint, the app detects an already-running server or starts `ollama serve` from the installed CLI, then performs a project-text-free warmup embedding so Ollama loads the configured model. A server started by the app is stopped during application shutdown; an independently running Ollama service is left alone. The app diagnoses a missing model, invalid vector response, or inference failure but never downloads or upgrades Ollama itself. Changing provider, model, endpoint, dimensions, or resolved model digest invalidates the semantic index and requires fresh consent. Chunks and vectors remain in the ignored local `maw/workspace.db`; `.env*`, private keys, Git internals, dependencies, caches, ignored paths, symlinks, binaries, files larger than 128 KB, and content beyond the 5,000-file project limit are not indexed. Disabling Project Knowledge cancels active indexing and removes that workspace's local index.
 
-The retrieval path ranks up to 40 semantic and 40 lexical candidates with reciprocal-rank fusion, returns at most eight non-overlapping excerpts within a 10,000-token evidence budget, and rechecks the current file hash before returning a source. Agent answers use `[S#]` source IDs; unknown citations are rejected by validation and trigger at most one correction pass.
+The retrieval path ranks semantic and lexical candidates with reciprocal-rank fusion, then applies deterministic query-aware reranking and file/chunk diversity. It returns at most eight non-overlapping excerpts within a 10,000-token evidence budget and rechecks local file hashes before returning a source. Agent answers use `[S#]` source IDs. Choose an **advisory**, **grounded**, or **strict** claim policy; grounded mode performs one correction pass, while strict mode withholds an answer that still contains unsupported project claims.
+
+Index refresh no longer runs inside chat or MCP request latency. Enabling retrieval, filesystem changes, manual refreshes, and periodic reconciliation enqueue durable jobs. The status API reports the queue and watcher state, and searches continue using the last successfully published data while a refresh runs.
+
+### Enterprise RAG mode
+
+The local defaults remain unchanged, but the repository now includes a production adapter and control-plane contracts:
+
+- `rag_enterprise.py` defines tenant principals, fail-closed ACL checks, content-based secret/PII policy, retrieval traces, metrics, retention/legal-hold settings, deletion receipts, connector contracts, a read-only Git connector, and PostgreSQL/pgvector generations and leased jobs.
+- Git sources may point to a local repository or a remote URL. Remote repositories are maintained as read-only mirrors under `maw/rag-connectors/` and use the host Git credential helper or SSH agent; connector configuration rejects raw token/password fields.
+- Connector content is scanned before embedding. Excluded or quarantined documents are counted in the sync result, and connector chunks retain source, URI, branch, revision, ACL, symbol, and metadata fields.
+- PostgreSQL publication builds a complete generation and switches it active transactionally, so readers never see a partially built index. Jobs use idempotency keys plus `FOR UPDATE SKIP LOCKED` leasing.
+
+Install the optional data-plane dependencies with `pip install -e '.[enterprise]'`. Configure `RAG_VECTOR_DIMENSIONS` before initializing an empty PostgreSQL schema to enable a dimensioned HNSW cosine index. `RAG_ENTERPRISE_MODE=1` enables trusted-gateway identity enforcement; the gateway must sign `X-RAG-Tenant`, `X-RAG-User`, `X-RAG-Groups`, and `X-RAG-Timestamp` with `RAG_TRUSTED_AUTH_SECRET` into `X-RAG-Signature`. Do not expose the app directly when this mode is enabled.
+
+Operational APIs live below `/api/projects/{project_id}/rag`: `/sources` manages connectors, `/traces` exposes retrieval decisions, `/metrics` reports error/empty-result/grounding/latency aggregates, `/policy` selects grounding enforcement, and `/retention` manages cleanup and legal hold. Source deletion removes indexed chunks and returns a hashed deletion receipt.
+
+For offline evaluation, create a JSONL file with `query`, `expected_paths`, and optional `answer`, then run:
+
+```bash
+python rag_eval.py evals/project_knowledge.jsonl --project-id 1 --limit 8
+```
+
+The report includes recall@k, mean reciprocal rank, grounded-claim rate, p95 latency, and per-case results.
 
 Executable skill helpers receive one JSON object on stdin and in `SKILL_INPUT_JSON`; they should print one JSON value to stdout. The runner selects the current OS variant (`macos`, `linux`, `windows`, then `any`), enforces a 30-second timeout and output cap, and returns both structured output and terminal diagnostics. Instruction-only skills are valid and are loaded from `SKILL.md` rather than executed. Assignments are checked before either a human or an agent can run a skill. ACP packages assigned to a project are materialized under `.agents/skills/<skill-name>` so compatible Codex/agent clients can discover them natively.
 
-Skills may declare `required_secrets` as a JSON array of environment-variable references, for example `[{"name":"WEATHER_API_KEY","label":"Weather API key","required":true}]`. Add or edit those declarations in the Skills editor, then save each value in the same editor. Skill values are stored only in the ignored, owner-readable `data/.skill-secrets.local` file, while provider account keys remain in `.env.local`; the browser sees only configured/missing status. The runner injects only declared values into that skill's child process and redacts them from returned stdout/stderr. Marketplace packages are never allowed to provision or request a value automatically; review a package before assigning it. For production deployments, replace the local credential store with an OS keychain or secret manager.
+Skills may declare `required_secrets` as a JSON array of environment-variable references, for example `[{"name":"WEATHER_API_KEY","label":"Weather API key","required":true}]`. Add or edit those declarations in the Skills editor, then save each value in the same editor. Skill values are stored only in the ignored, owner-readable `maw/.skill-secrets.local` file, while provider account keys remain in `.env.local`; the browser sees only configured/missing status. The runner injects only declared values into that skill's child process and redacts them from returned stdout/stderr. Marketplace packages are never allowed to provision or request a value automatically; review a package before assigning it. For production deployments, replace the local credential store with an OS keychain or secret manager.
 
 Tool arguments use a JSON list and are passed directly as positional process arguments rather than interpolated into a shell command. Python, JavaScript, PowerShell, POSIX shell, and native executable files are supported when their runtime is installed. Tool processes run in the selected project directory with a 60-second timeout and output cap. They receive a small safe environment plus only the additional environment-variable names explicitly declared while creating that tool; declared values are redacted from returned stdout and stderr. Result templates may use `{stdout}`, `{stderr}`, `{exit_code}`, `{toolset}`, and `{tool}`, and can render as text, Markdown, JSON, or a code block.
 
@@ -102,9 +125,12 @@ pytest
 - `git_workflow.py`: shared-branch Git configuration, run commits, file summaries/diffs, editor launch, revert/rollback, and remote push operations.
 - `embedding_providers.py`: shared OpenAI/Ollama embedding profiles, model readiness checks, Nomic task prefixes, and vector validation.
 - `rag.py`: consent-compatible project scanning, token-aware provider-scoped vector storage, FTS5/cosine hybrid ranking, freshness checks, and citation evidence envelopes.
+- `rag_runtime.py`: background file watching, reconciliation, queue deduplication, and restart recovery for local indexing.
+- `rag_enterprise.py`: connector/security/grounding contracts, audit and lifecycle control plane, and optional PostgreSQL/pgvector backend.
+- `rag_eval.py`: JSONL retrieval and grounding evaluation harness.
 - `mcp_server.py`: stdio MCP server exposing project retrieval, reusable-skill, and inter-agent messaging tools.
 - `static/`: dependency-free browser interface.
-- `data/`: ignored local SQLite state.
+- `maw/`: ignored local SQLite state and other application-managed stores.
 
 The skill package contract is the open Agent Skills `SKILL.md` format (the
 portable package format used by ACP-aware clients), while the local MCP tools

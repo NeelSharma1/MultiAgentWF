@@ -21,7 +21,7 @@ from skills import SkillStore, run_skill_script, skill_secret_names
 from toolsets import ToolsetStore
 
 
-DB_PATH = Path(os.getenv("WORKSPACE_DB", Path(__file__).parent / "data" / "workspace.db"))
+DB_PATH = Path(os.getenv("WORKSPACE_DB", Path(__file__).parent / "maw" / "workspace.db"))
 store = GraphContextStore(DB_PATH)
 rag = RagStore(DB_PATH)
 projects = ProjectStore(DB_PATH)
@@ -33,7 +33,7 @@ messages = RuntimeConfigStore(DB_PATH, recover_interrupted_runs=False)
 skills = SkillStore(DB_PATH)
 toolsets = ToolsetStore()
 credentials = LocalCredentialStore(Path(__file__).parent / ".env.local")
-skill_credentials = LocalCredentialStore(Path(__file__).parent / "data" / ".skill-secrets.local")
+skill_credentials = LocalCredentialStore(Path(__file__).parent / "maw" / ".skill-secrets.local")
 embeddings = EmbeddingService(lambda: credentials.get("OPENAI_API_KEY"))
 
 
@@ -167,7 +167,7 @@ def list_shared_context(role: str, project_id: int = 1) -> list[dict]:
 @mcp.tool(annotations=RETRIEVAL_TOOL_ANNOTATIONS)
 async def search_project_context(query: str, role: str, project_id: int = 1,
                                  run_id: str = "", path_prefix: str = "", limit: int = 8) -> dict:
-    """Search fresh, line-addressable project evidence using semantic and lexical retrieval."""
+    """Search the latest published, line-addressable project index without blocking on refresh."""
 
     project = projects.get(project_id)
     definitions.get(role, project_id)
@@ -183,13 +183,9 @@ async def search_project_context(query: str, role: str, project_id: int = 1,
                 "The embedding model changed after consent. Disable and re-enable Project Knowledge."
             )
 
-        async def embed_documents(texts: list[str]) -> list[list[float]]:
-            return await embeddings.embed(texts, "document", profile)
-
         async def embed_query(texts: list[str]) -> list[list[float]]:
             return await embeddings.embed(texts, "query", profile)
 
-        await rag.index_project(root, project_id, embed_documents, profile=profile)
         results = await rag.search(
             root, project_id, query, embed_query,
             limit=limit, path_prefix=path_prefix, profile=profile,

@@ -9,12 +9,11 @@ def test_runtime_defaults_save_and_history(tmp_path):
     assert store.get("programmer")["provider"] == "codex"
     saved = store.save(
         "researcher", "compatible", "qwen3", "http://model-box:11434/v1", "LOCAL_API_KEY", "high",
-        context_window_tokens=200_000, context_compaction_threshold=80,
+        context_compaction_tokens=200_000,
     )
     assert saved["model"] == "qwen3"
     assert saved["reasoning_effort"] == "high"
-    assert saved["context_window_tokens"] == 200_000
-    assert saved["context_compaction_threshold"] == 80
+    assert saved["context_compaction_tokens"] == 200_000
     store.add_message("researcher", "user", "hello", "compatible", "qwen3")
     assert store.history("researcher")[0]["content"] == "hello"
     store.add_message("researcher", "user", "other project", "compatible", "qwen3", project_id=2)

@@ -537,17 +537,15 @@ def test_codex_temporary_external_approval_uses_unrestricted_sandbox(tmp_path, m
     assert result["response"] == "Codex unrestricted response"
 
 
-def test_context_usage_and_automatic_compaction_watermark(tmp_path, monkeypatch):
+def test_codex_auto_compaction_is_not_sent_as_a_host_command(tmp_path, monkeypatch):
     team = AgentTeam(tmp_path)
     config = team.configs.save(
-        "researcher", "codex", "gpt-test", "", "", context_window_tokens=1_000,
-        context_compaction_threshold=50,
+        "researcher", "codex", "gpt-test", "", "",
     )
     team.configs.add_message("researcher", "user", "x" * 4_000, "codex", "gpt-test")
     team.configs.save_codex_session("researcher", 1, "session-context", "gpt-test", "")
     session = team.configs.codex_session("researcher", 1)
     assert session is not None
-    assert team.context_usage("researcher", 1)["remaining_percent"] == 0
     calls = []
     monkeypatch.setattr(team, "_codex_tui_command", lambda *args: calls.append(args) or "Compacted")
 
@@ -555,8 +553,14 @@ def test_context_usage_and_automatic_compaction_watermark(tmp_path, monkeypatch)
         "researcher", config, 1, session, "/usr/bin/codex", tmp_path,
     ))
 
-    assert calls[0][1] == "/compact"
-    assert team.configs.codex_session("researcher", 1)["compacted_message_id"] > 0
+    assert calls == []
+    events = [{"type": "thread.context_compacted"}]
+    team.configs.record_codex_auto_compaction(
+        "researcher", 1, team._codex_auto_compaction_count(events),
+    )
+    session = team.configs.codex_session("researcher", 1)
+    assert session["auto_compaction_count"] == 1
+    assert session["last_auto_compaction_at"]
 
 
 def test_codex_json_usage_includes_effective_context_window(tmp_path):
@@ -584,7 +588,7 @@ def test_api_and_compatible_providers_compact_to_saved_summary(tmp_path, monkeyp
     team = AgentTeam(tmp_path)
     config = team.configs.save(
         "researcher", "compatible", "local-model", "http://localhost:1234/v1", "",
-        context_window_tokens=1_000, context_compaction_threshold=50,
+        context_compaction_tokens=1_000,
     )
     team.configs.add_message("researcher", "user", "x" * 4_000, "compatible", "local-model")
     calls = []
@@ -606,11 +610,11 @@ def test_api_and_compatible_providers_compact_to_saved_summary(tmp_path, monkeyp
     assert "x" * 100 not in prompt
 
 
-def test_api_provider_can_request_agent_directed_compaction(tmp_path, monkeypatch):
+def test_api_provider_compacts_automatically_from_local_input_tokens(tmp_path, monkeypatch):
     team = AgentTeam(tmp_path)
     team.configs.save(
         "researcher", "compatible", "local-model", "http://localhost:1234/v1", "",
-        context_window_tokens=1_000, context_compaction_threshold=0,
+        context_compaction_tokens=1_000,
     )
     team.configs.add_message("researcher", "user", "x" * 4_000, "compatible", "local-model")
 
@@ -664,6 +668,60 @@ def test_inter_agent_message_is_synthesized_into_the_next_prompt(tmp_path):
     incoming = incoming_messages[0]
     assert incoming["delivery_status"] == "delivered"
     assert incoming["id"] in captured["excluded"]
+
+
+def test_automatic_report_handoff_terminates_on_the_latest_report_without_a_followup(tmp_path):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    run = team.configs.create_chat_run("researcher", 1)
+    team.send_agent_message(
+        "orchestrator", "researcher", "The investigation is complete; no follow-up is needed.", "report",
+    )
+    calls = []
+
+    async def fake_chat(*args, **_kwargs):
+        calls.append(args[1])
+        return {"response": "TERMINATE", "answered_by": "Researcher"}
+
+    async def unexpected_retrieval(*_args, **_kwargs):
+        raise AssertionError("report-only termination should not prepare retrieval evidence")
+
+    team._agents_chat = fake_chat
+    team.prepare_rag_evidence = unexpected_retrieval
+    result = asyncio.run(team.chat(
+        "researcher", "Process queued team messages.", project_id=1,
+        record_user_message=False, run_id=run["id"], automatic_handoff=True,
+    ))
+
+    assert len(calls) == 1
+    assert result["terminated"] is True
+    assert result["termination"]["source_role"] == "orchestrator"
+    assert result["response"] == (
+        "TERMINATED on this report from orchestrator:\n\n"
+        "The investigation is complete; no follow-up is needed."
+    )
+    history = team.configs.history("researcher")
+    assert history[-1]["speaker"] == "assistant"
+    assert history[-1]["content"] == result["response"]
+    assert team.configs.run_events(run["id"])[0]["event_type"] == "handoff"
+
+
+def test_terminate_signal_does_not_bypass_an_automatic_command_handoff(tmp_path):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "compatible", "local-model", "http://localhost:1234/v1", "")
+    team.send_agent_message("orchestrator", "researcher", "Investigate the failure.", "command")
+
+    async def fake_chat(*_args, **_kwargs):
+        return {"response": "TERMINATE", "answered_by": "Researcher"}
+
+    team._agents_chat = fake_chat
+    result = asyncio.run(team.chat(
+        "researcher", "Process queued team messages.", project_id=1,
+        record_user_message=False, automatic_handoff=True,
+    ))
+
+    assert "terminated" not in result
+    assert result["response"] == "TERMINATE"
 
 
 def test_historical_compiled_command_is_flattened_for_provider_history(tmp_path):

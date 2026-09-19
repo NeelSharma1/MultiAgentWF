@@ -3,11 +3,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.egg-info/
-data/*.db
-data/*.db-*
-data/uploads/
-data/skills/
-data/.skill-secrets.local
+maw/*.db
+maw/*.db-*
+maw/uploads/
+maw/skills/
+maw/.skill-secrets.local
 
 .idea
 .venv

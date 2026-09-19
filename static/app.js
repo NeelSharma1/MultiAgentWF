@@ -1685,11 +1685,17 @@ function renderContextMeter(){
   const remaining=Math.max(0,Math.min(100,Number(usage.remaining_percent)||0));
   $('#context-remaining').textContent=`${remaining}%`;
   $('#context-progress').style.width=`${remaining}%`;
-  const countPrefix=usage.is_estimate?'~':'';
-  const sourceLabel=usage.is_estimate?'estimated':'provider reported';
-  $('#context-detail').textContent=`${countPrefix}${formatTokenCount(usage.used_tokens ?? usage.estimated_tokens)} used of ${formatTokenCount(usage.context_window_tokens)} tokens · ${sourceLabel}`;
-  meter.classList.toggle('warning',remaining<=25&&remaining>10);
-  meter.classList.toggle('critical',remaining<=10)
+  const used=formatTokenCount(usage.used_tokens ?? usage.estimated_tokens);
+  if(agent.runtime?.provider==='codex'){
+    const window=Number(usage.context_window_tokens)||0;
+    const compacted=Number(usage.auto_compaction_count)||0;
+    const last=usage.last_auto_compaction_at?` · auto-compacted ${new Date(usage.last_auto_compaction_at).toLocaleString()}`:compacted?` · auto-compacted ${compacted}×`:'';
+    $('#context-detail').textContent=window?`${used} of ${formatTokenCount(window)} tokens · Codex reported${last}`:`Codex reports its active context after a run${last}`;
+  }else{
+    $('#context-detail').textContent=`${used} input tokens · compacts at ${formatTokenCount(usage.context_window_tokens)} · locally counted`;
+  }
+  meter.classList.toggle('warning',Boolean(Number(usage.context_window_tokens))&&remaining<=25&&remaining>10);
+  meter.classList.toggle('critical',Boolean(Number(usage.context_window_tokens))&&remaining<=10)
 }
 function formatTokenCount(value){
   const tokens=Math.max(0,Number(value)||0);
@@ -3563,6 +3569,7 @@ function configureRagDialog(status=state.ragStatus||{}){
   $('#rag-model').value=embedding.model||status.model||($('#rag-provider').value==='ollama'?'nomic-embed-text:latest':'text-embedding-3-small');
   $('#rag-base-url').value=embedding.base_url||'http://127.0.0.1:11434';
   $('#rag-dimensions').value=embedding.dimensions||status.dimensions||($('#rag-provider').value==='ollama'?768:256);
+  $('#rag-grounding-policy').value=status.grounding_policy||'grounded';
   $('#rag-base-url-field').classList.toggle('hidden',$('#rag-provider').value!=='ollama');
   const local=$('#rag-provider').value==='ollama';
   $('#rag-consent-copy').textContent=local?'Eligible project text will be sent only to the configured Ollama service. Embeddings and source chunks remain in this workspace’s ignored local database.':'Eligible project text will be sent to the OpenAI Embeddings API. Embeddings and source chunks remain in this workspace’s ignored local database.';
@@ -3594,7 +3601,7 @@ function renderGraphContext(){
     else if(state.graphContextBusy){
       const job=state.ragJob||status.job||{}, total=Number(job.total_files||0), done=Number(job.processed_files||0);
       summary.textContent=`Indexing ${done}${total?` of ${total}`:''} files · ${job.embedded_chunks||0} chunks embedded`;
-    }else summary.textContent=`${status.documents||0} files · ${status.chunks||0} searchable chunks${status.last_indexed?` · updated ${formatTime(status.last_indexed)}`:''}`;
+    }else summary.textContent=`${status.documents||0} files · ${status.chunks||0} searchable chunks · ${status.grounding_policy||'grounded'} policy${status.indexing?.watching?' · watching':''}${status.last_indexed?` · updated ${formatTime(status.last_indexed)}`:''}`;
   }
   box.replaceChildren();
   if(!state.graphContext.length){
@@ -3958,10 +3965,7 @@ async function openRuntime(){
   $('#provider-select').value=r.provider;
   $('#base-url-input').value=r.base_url;
   $('#key-env-input').value=r.api_key_env;
-  $('#context-window-input').value=Number(r.context_window_tokens)||128000;
-  $('#context-compaction-input').value=String(Number(r.context_compaction_threshold)||0);
-  $('#context-window-input').nextElementSibling.textContent='Fallback window when the provider does not report one; Codex uses its runtime-reported effective window when available.';
-  $('#context-compaction-input').nextElementSibling.textContent='Codex uses reported token counts before native /compact; other providers use reported usage when available and saved summaries otherwise.';
+  $('#context-compaction-tokens-input').value=Number(r.context_compaction_tokens)||256000;
   updateRuntimeFields();
   $('#runtime-dialog').showModal();
   await loadModels(r.model, r.reasoning_effort)
@@ -3971,6 +3975,7 @@ function updateRuntimeFields(){
   p=state.providers.find(x=>x.id===id);
   $('#provider-help').textContent=p?.description||'';
   $('#base-url-field').style.display=id==='compatible'?'flex': 'none';
+  $('#context-compaction-limit-field').style.display=id==='codex'?'none':'flex';
   $('#base-url-input').required=id==='compatible';
   $('#key-env-field').style.display=['google',
   'compatible'].includes(id)?'flex': 'none';
@@ -4143,8 +4148,7 @@ $('#runtime-form').onsubmit=async e=>{
     base_url: $('#base-url-input').value,
     api_key_env: $('#key-env-input').value,
     reasoning_effort: $('#effort-input').value,
-    context_window_tokens: Number($('#context-window-input').value),
-    context_compaction_threshold: Number($('#context-compaction-input').value),
+    context_compaction_tokens: Number($('#context-compaction-tokens-input').value),
     project_id: state.project.id
   };
   await api(`/api/agents/${role}/runtime`, {
@@ -4252,10 +4256,10 @@ $('#confirm-rag-consent').onclick=async()=>{
     const tested=await testRagEmbedding();
     if(!tested?.ready)return;
     await api(`/api/projects/${state.project.id}/rag/embedding-settings`,{method:'PUT',body:JSON.stringify(ragSettingsPayload())});
+    await api(`/api/projects/${state.project.id}/rag/policy`,{method:'PUT',body:JSON.stringify({policy:$('#rag-grounding-policy').value||'grounded'})});
     await api(`/api/projects/${state.project.id}/rag/consent`,{method:'PUT',body:JSON.stringify({enabled:true})});
     $('#rag-consent-dialog').close();
     await loadGraphContext();
-    await generateGraphContext(false)
   }catch(err){alert(err.message)}
   finally{button.disabled=false}
 };

@@ -26,6 +26,8 @@ class ProjectStore:
                 rag_embedding_model TEXT NOT NULL DEFAULT 'nomic-embed-text:latest',
                 rag_embedding_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434',
                 rag_embedding_dimensions INTEGER NOT NULL DEFAULT 768,
+                tenant_id TEXT NOT NULL DEFAULT 'local',
+                rag_grounding_policy TEXT NOT NULL DEFAULT 'grounded',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
             project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
             legacy_rag_profile = "rag_embedding_provider" not in project_columns
@@ -58,6 +60,12 @@ class ProjectStore:
             if "rag_embedding_dimensions" not in project_columns:
                 db.execute(
                     "ALTER TABLE projects ADD COLUMN rag_embedding_dimensions INTEGER NOT NULL DEFAULT 768"
+                )
+            if "tenant_id" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            if "rag_grounding_policy" not in project_columns:
+                db.execute(
+                    "ALTER TABLE projects ADD COLUMN rag_grounding_policy TEXT NOT NULL DEFAULT 'grounded'"
                 )
             if legacy_rag_profile:
                 # Preserve already-enabled cloud indexes and their prior consent.
@@ -206,6 +214,18 @@ class ProjectStore:
                 rag_consent_at=NULL,rag_consent_profile='' WHERE id=?""",
                 (provider, model, base_url, dimensions, project_id),
             )
+        return self.get(project_id)
+
+    def set_rag_policy(self, project_id: int, policy: str) -> dict[str, Any]:
+        policy = str(policy or "").strip().lower()
+        if policy not in {"advisory", "grounded", "strict"}:
+            raise ValueError("Grounding policy must be advisory, grounded, or strict")
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE projects SET rag_grounding_policy=? WHERE id=?", (policy, project_id),
+            )
+        if not cursor.rowcount:
+            raise KeyError(f"Project {project_id} not found")
         return self.get(project_id)
 
     def set_relationship_enforcement(self, project_id: int, enabled: bool) -> dict[str, Any]:

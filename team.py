@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import os
 import shutil
 import tempfile
@@ -10,6 +11,7 @@ import re
 import uuid
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from agents.mcp import MCPServerStdio
 from openai import AsyncOpenAI
 import httpx
 import pyte
+import tiktoken
 
 from terminal import create_terminal
 from runtime_config import PROVIDERS, RuntimeConfigStore
@@ -25,6 +28,10 @@ from agent_definitions import AgentDefinitionStore
 from graph_context import GraphContextStore, ROLES
 from embedding_providers import EmbeddingProfile, EmbeddingProviderError, EmbeddingService, profile_from_project
 from rag import RagError, RagStore, evidence_prompt
+from rag_enterprise import (
+    GitConnector, GroundingVerifier, PostgresVectorBackend, RagEnterpriseStore, RagSecurityPolicy,
+    RequestPrincipal, deterministic_rerank, diversify_results,
+)
 from credentials import LocalCredentialStore
 from project_store import ProjectStore
 from skills import (
@@ -481,7 +488,7 @@ def _codex_auth_failure(diagnostic: str) -> bool:
 class AgentTeam:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.db_path = root / "data" / "workspace.db"
+        self.db_path = root / "maw" / "workspace.db"
         # Create workspaces before the project-scoped agent/config stores so
         # their migrations can copy legacy global records into existing projects.
         self.projects = ProjectStore(self.db_path)
@@ -493,6 +500,12 @@ class AgentTeam:
         self.definitions = AgentDefinitionStore(self.db_path)
         self.context = GraphContextStore(self.db_path)
         self.rag = RagStore(self.db_path)
+        self.rag_enterprise = RagEnterpriseStore(self.db_path)
+        self.rag_security = RagSecurityPolicy()
+        postgres_dsn = os.getenv("RAG_POSTGRES_DSN", "").strip()
+        self.rag_backend = PostgresVectorBackend(postgres_dsn) if postgres_dsn else None
+        self.rag_scheduler: Any = None
+        self._rag_trace_ids: dict[str, tuple[str, str]] = {}
         self.credentials = LocalCredentialStore(self.root / ".env.local")
         self._ollama_process: asyncio.subprocess.Process | None = None
         self._ollama_start_lock = asyncio.Lock()
@@ -529,16 +542,109 @@ class AgentTeam:
 
     async def search_project_knowledge(
         self, project_id: int, query: str, *, limit: int = 8, path_prefix: str = "",
+        source_ids: tuple[str, ...] = (), branch: str = "", revision: str = "",
+        principal: RequestPrincipal | None = None,
     ) -> list[dict[str, Any]]:
         profile = await self._resolved_embedding_profile(project_id, test=False)
+        project = self.projects.get(project_id)
+        principal = principal or RequestPrincipal(
+            str(project.get("tenant_id") or "local"), "local-user", ("project-members",), is_admin=True,
+        )
 
         async def embed_query(texts: list[str]) -> list[list[float]]:
             return await self.embeddings.embed(texts, "query", profile)
 
-        return await self.rag.search(
+        if self.rag_backend is not None:
+            vectors = await embed_query([query])
+            if len(vectors) != 1:
+                raise RagError("Embedding provider did not return the query embedding")
+            backend_results = await self.rag_backend.search(
+                principal, project_id, vectors[0], query, limit=min(20, max(limit * 3, limit)),
+                source_ids=source_ids, branch=branch, revision=revision,
+            )
+            candidates = [{
+                **item, "id": str(item.get("id") or ""),
+                "connector_source_id": str(item.get("source_id") or ""),
+                "excerpt": str(item.get("content") or ""),
+                "fresh": True,
+                "scores": {
+                    "semantic": float(item.get("semantic_score") or 0),
+                    "lexical": float(item.get("lexical_score") or 0),
+                    "fused": float(item.get("semantic_score") or 0) + float(item.get("lexical_score") or 0),
+                },
+            } for item in backend_results]
+            return diversify_results(deterministic_rerank(query, candidates), limit)
+
+        candidates = await self.rag.search(
             self._project_root(project_id), project_id, query, embed_query,
-            limit=limit, path_prefix=path_prefix, profile=profile,
+            limit=min(20, max(limit * 3, limit)), path_prefix=path_prefix, source_ids=source_ids,
+            branch=branch, revision=revision,
+            allowed_subjects=() if principal.is_admin else principal.subjects, profile=profile,
         )
+        return diversify_results(deterministic_rerank(query, candidates), limit)
+
+    async def _git_source_connector(self, project_id: int, source: dict[str, Any]) -> GitConnector:
+        config = dict(source.get("config") or {})
+        connector_options = {
+            "revision": str(config.get("revision") or "HEAD"),
+            "branch": str(config.get("branch") or ""),
+            "acl_subjects": tuple(config.get("acl_subjects") or ("group:project-members",)),
+        }
+        repository = str(config.get("repository") or self._project_root(project_id))
+        if "://" in repository or repository.startswith("git@"):
+            connector = await asyncio.to_thread(
+                GitConnector.materialize_remote, str(source["id"]), repository,
+                self.root / "maw" / "rag-connectors", **connector_options,
+            )
+        else:
+            connector = GitConnector(str(source["id"]), repository, **connector_options)
+        return connector
+
+    async def validate_git_source(self, project_id: int, source: dict[str, Any]) -> dict[str, Any]:
+        connector = await self._git_source_connector(project_id, source)
+        return await asyncio.to_thread(connector.validate)
+
+    async def sync_git_source(self, project_id: int, source: dict[str, Any]) -> dict[str, Any]:
+        """Read, policy-check, and publish one immutable Git revision snapshot."""
+        project = self.projects.get(project_id)
+        connector = await self._git_source_connector(project_id, source)
+        validation = await asyncio.to_thread(connector.validate)
+        documents = await asyncio.to_thread(lambda: list(connector.documents(str(source.get("checkpoint") or ""))))
+        safe_documents = []
+        findings: list[dict[str, Any]] = []
+        for document in documents:
+            content, detected = self.rag_security.apply(document.content)
+            findings.extend({"path": document.path, **item.__dict__} for item in detected)
+            if not content:
+                continue
+            safe_documents.append(type(document)(**{**document.__dict__, "content": content, "content_hash": ""}).normalized())
+        profile = await self._resolved_embedding_profile(project_id, test=True)
+
+        async def embed_documents(texts: list[str]) -> list[list[float]]:
+            return await self.embeddings.embed(texts, "document", profile)
+
+        result = await self.rag.index_source_documents(
+            project_id, str(source["id"]), safe_documents, embed_documents, profile=profile,
+        )
+        if self.rag_backend is not None:
+            tenant_id = str(project.get("tenant_id") or "local")
+            principal = RequestPrincipal(
+                tenant_id, "connector-indexer", ("project-members",),
+                service_id="connector-indexer", is_admin=True,
+            )
+            exported = self.rag.export_generation(project_id, str(source["id"]), profile)
+            result["generation_id"] = await self.rag_backend.publish_generation(
+                principal, project_id, str(source["id"]), validation["revision"],
+                profile.fingerprint, exported,
+            )
+        result.update({"revision": validation["revision"], "findings": findings,
+                       "excluded_documents": len(documents) - len(safe_documents)})
+        self.rag_enterprise.update_source(
+            str(source["id"]), str(project.get("tenant_id") or "local"),
+            checkpoint=validation["revision"], last_success_at=datetime.now(timezone.utc).isoformat(),
+            last_error="", status="active",
+        )
+        return result
 
     async def index_project_knowledge(self, project_id: int, *, force: bool = False,
                                       job_id: str | None = None,
@@ -561,14 +667,27 @@ class AgentTeam:
 
             result = await self.rag.index_project(
                 self._project_root(project_id), project_id, embed_documents,
-                force=force, job_id=job_id, progress=progress, profile=profile,
+                force=force, job_id=job_id, progress=progress,
+                content_policy=self.rag_security.apply, profile=profile,
             )
             result["embedding"] = profile.public()
+            if self.rag_backend is not None and result.get("ok"):
+                documents = self.rag.export_generation(project_id, "local", profile)
+                revision = hashlib.sha256(
+                    "".join(item["content_hash"] for item in documents).encode()
+                ).hexdigest()
+                principal = RequestPrincipal(
+                    str(project.get("tenant_id") or "local"), "indexer", ("project-members",),
+                    service_id="local-indexer", is_admin=True,
+                )
+                result["generation_id"] = await self.rag_backend.publish_generation(
+                    principal, project_id, "local", revision, profile.fingerprint, documents,
+                )
             return result
 
     async def prepare_rag_evidence(self, role: str, project_id: int, run_id: str,
                                    query: str) -> tuple[str, list[dict[str, Any]]]:
-        """Refresh the local index, retrieve current evidence, and audit the work."""
+        """Retrieve the latest published index while refresh runs in the background."""
 
         project = self.projects.get(project_id)
         if not bool(project.get("rag_enabled")):
@@ -577,41 +696,46 @@ class AgentTeam:
                 {"detail": "Enable Project Knowledge to ground project-specific answers."},
             )
             return evidence_prompt([]), []
-        index_event = self.configs.add_run_event(
-            run_id, project_id, role, "index", "running", "Checking project index", {}
+        tenant_id = str(project.get("tenant_id") or "local")
+        principal = RequestPrincipal(tenant_id, "local-user", ("project-members",), is_admin=True)
+        trace_id = self.rag_enterprise.start_trace(
+            tenant_id, project_id, role, principal, query, {"limit": 8, "policy": project.get("rag_grounding_policy")},
         )
-        try:
-            result = await self.index_project_knowledge(
-                project_id,
-                progress=lambda payload: self.configs.update_run_event(index_event["id"], "running", payload),
-            )
-            self.configs.update_run_event(
-                index_event["id"], "completed" if result["ok"] else "warning", result,
-                f"Indexed {result['changed']} changed file{'s' if result['changed'] != 1 else ''}",
-            )
-        except Exception as exc:
-            self.configs.update_run_event(
-                index_event["id"], "error", {"detail": str(exc)}, "Project indexing failed",
-            )
-            self.configs.add_run_event(
-                run_id, project_id, role, "validation", "warning", "Project claims are unverified",
-                {"detail": "No current project evidence could be prepared."},
-            )
-            return evidence_prompt([]), []
+        self._rag_trace_ids[run_id] = (tenant_id, trace_id)
+        if self.rag_scheduler is not None:
+            try:
+                job = await self.rag_scheduler(project_id, reason="chat_refresh")
+                self.configs.add_run_event(
+                    run_id, project_id, role, "index", "completed", "Index refresh queued",
+                    {"job_id": job.get("id"), "non_blocking": True},
+                )
+            except Exception as exc:
+                self.configs.add_run_event(
+                    run_id, project_id, role, "index", "warning", "Index refresh could not be queued",
+                    {"detail": str(exc)},
+                )
         retrieval = self.configs.add_run_event(
             run_id, project_id, role, "retrieval", "running", "Searching project", {"query": query}
         )
         try:
-            hits = await self.search_project_knowledge(project_id, query)
+            started = time.perf_counter()
+            hits = await self.search_project_knowledge(project_id, query, principal=principal)
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
             self.configs.update_run_event(
-                retrieval["id"], "completed", {"query": query, "results": hits, "count": len(hits)},
+                retrieval["id"], "completed", {"query": query, "results": hits, "count": len(hits),
+                                                       "latency_ms": elapsed_ms, "trace_id": trace_id},
                 f"Searched project · {len(hits)} match{'es' if len(hits) != 1 else ''}",
+            )
+            self.rag_enterprise.finish_trace(
+                trace_id, tenant_id, status="retrieved", candidates=hits, results=hits,
+                timings={"retrieval_ms": elapsed_ms},
             )
             return evidence_prompt(hits), hits
         except Exception as exc:
             self.configs.update_run_event(
                 retrieval["id"], "error", {"query": query, "detail": str(exc)}, "Project search failed",
             )
+            self.rag_enterprise.finish_trace(trace_id, tenant_id, status="error", error=str(exc))
             return evidence_prompt([]), []
 
     def _codex_command(self) -> str | None:
@@ -627,6 +751,8 @@ class AgentTeam:
             return self.root.resolve()
 
     async def start(self) -> None:
+        if self.rag_backend is not None:
+            await self.rag_backend.initialize()
         local_ollama_profiles: list[EmbeddingProfile] = []
         for project in self.projects.list():
             try:
@@ -1091,26 +1217,40 @@ class AgentTeam:
         except Exception:
             return fallback
 
-    def context_usage(self, role: str, project_id: int = 1) -> dict[str, Any]:
-        """Return provider-reported context usage, falling back to a visible-text estimate.
+    def _count_input_tokens(self, value: Any, model: str = "") -> int:
+        """Count the input the workspace sends, without mixing in output tokens."""
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        try:
+            encoding = tiktoken.encoding_for_model(model) if model else tiktoken.get_encoding("o200k_base")
+        except KeyError:
+            encoding = tiktoken.get_encoding("o200k_base")
+        return len(encoding.encode(text, disallowed_special=()))
 
-        Codex reports both the effective model context window and current token usage in
-        its JSON event stream. Agents SDK providers report exact per-request usage. A
-        provider that omits either value cannot be made exact locally, so the fallback is
-        explicitly marked as an estimate instead of being presented as a token count.
-        """
+    def _local_context_input_tokens(self, role: str, project_id: int = 1) -> int:
+        """Count the current API context locally; output usage never inflates it."""
+        compacted_message_id, summary = self._context_summary_text(role, project_id)
+        transcript = self.configs.context_messages(role, project_id, compacted_message_id)
+        text = "\n\n".join(str(item.get("content") or "") for item in transcript)
+        if summary:
+            text = f"{summary}\n\n{text}"
+        text = f"{self._instructions(role, project_id)}\n\n{self._shared_context_text(role, project_id)}\n\n{text}"
+        return self._count_input_tokens(text, self.configs.get(role, project_id).get("model", ""))
+
+    def context_usage(self, role: str, project_id: int = 1) -> dict[str, Any]:
+        """Return Codex's context telemetry or the local API input-token count."""
         config = self.configs.get(role, project_id)
-        window = max(1_000, int(config.get("context_window_tokens") or 128_000))
+        is_codex = config["provider"] == "codex"
+        window = max(1_000, int(config.get("context_compaction_tokens") or 256_000))
         reported = self.configs.context_usage(role, project_id)
-        if reported and bool(reported.get("exact")) and int(reported.get("context_tokens") or 0) > 0:
+        if is_codex and reported and bool(reported.get("exact")) and int(reported.get("context_tokens") or 0) > 0:
             reported_window = int(reported.get("context_window_tokens") or 0)
             if reported_window > 0:
                 window = reported_window
             used_tokens = int(reported.get("context_tokens") or 0)
             remaining_tokens = max(0, window - used_tokens)
             window_exact = bool(reported.get("context_window_exact"))
-            session = self.configs.codex_session(role, project_id) if config["provider"] == "codex" else None
-            summary = self.configs.context_summary(role, project_id) if config["provider"] != "codex" else None
+            session = self.configs.codex_session(role, project_id)
+            summary = None
             compacted_message_id = (
                 int(session.get("compacted_message_id") or 0) if session else
                 int(summary.get("compacted_message_id") or 0) if summary else 0
@@ -1122,7 +1262,9 @@ class AgentTeam:
                 "remaining_tokens": remaining_tokens,
                 "remaining_percent": max(0, min(100, round(remaining_tokens * 100 / window))),
                 "compacted_message_id": compacted_message_id,
-                "compaction_threshold": int(config.get("context_compaction_threshold") or 0),
+                "compaction_limit_tokens": 0,
+                "auto_compaction_count": int(session.get("auto_compaction_count") or 0) if session else 0,
+                "last_auto_compaction_at": str(session.get("last_auto_compaction_at") or "") if session else "",
                 "is_estimate": not window_exact,
                 "is_exact": window_exact,
                 "context_window_exact": window_exact,
@@ -1132,20 +1274,25 @@ class AgentTeam:
                 "cached_input_tokens": int(reported.get("cached_input_tokens") or 0),
                 "reasoning_output_tokens": int(reported.get("reasoning_output_tokens") or 0),
             }
-        session = self.configs.codex_session(role, project_id) if config["provider"] == "codex" else None
-        summary = self.configs.context_summary(role, project_id) if config["provider"] != "codex" else None
+        session = self.configs.codex_session(role, project_id) if is_codex else None
+        summary = self.configs.context_summary(role, project_id) if not is_codex else None
         compacted_message_id = (
             int(session.get("compacted_message_id") or 0) if session else
             int(summary.get("compacted_message_id") or 0) if summary else 0
         )
-        transcript = self.configs.context_messages(role, project_id, compacted_message_id)
-        characters = sum(len(str(message.get("content") or "")) for message in transcript)
-        characters += len(str(summary.get("summary") or "")) if summary else 0
-        characters += len(self._shared_context_text(role, project_id))
-        # Prompt scaffolding, role instructions, tool descriptions, and attachments are not
-        # represented in transcript rows. Reserve a small baseline for them.
-        baseline_tokens = min(1_200, max(200, window // 10))
-        estimated_tokens = max(baseline_tokens, (characters + 3) // 4 + baseline_tokens)
+        if is_codex:
+            # Until Codex emits usage telemetry there is no truthful local
+            # equivalent of its hidden harness context.
+            return {
+                "estimated_tokens": 0, "used_tokens": 0, "context_window_tokens": 0,
+                "remaining_tokens": 0, "remaining_percent": 0,
+                "compacted_message_id": compacted_message_id, "compaction_limit_tokens": 0,
+                "auto_compaction_count": int(session.get("auto_compaction_count") or 0) if session else 0,
+                "last_auto_compaction_at": str(session.get("last_auto_compaction_at") or "") if session else "",
+                "is_estimate": False, "is_exact": False, "context_window_exact": False,
+                "usage_source": "awaiting_codex_telemetry",
+            }
+        estimated_tokens = self._local_context_input_tokens(role, project_id)
         remaining_tokens = max(0, window - estimated_tokens)
         return {
             "estimated_tokens": estimated_tokens,
@@ -1154,42 +1301,26 @@ class AgentTeam:
             "remaining_tokens": remaining_tokens,
             "remaining_percent": max(0, min(100, round(remaining_tokens * 100 / window))),
             "compacted_message_id": compacted_message_id,
-            "compaction_threshold": int(config.get("context_compaction_threshold") or 0),
-            "is_estimate": True,
-            "is_exact": False,
+            "compaction_limit_tokens": window,
+            "is_estimate": False,
+            "is_exact": True,
             "context_window_exact": False,
-            "usage_source": "visible_text_estimate",
+            "usage_source": "local_input_token_count",
         }
 
     async def _compact_context_if_needed(
         self, role: str, config: dict[str, Any], project_id: int, session: dict[str, Any] | None = None,
         executable: str = "", working_root: Path | None = None,
         exclude_message_ids: set[int] | None = None, force: bool = False,
+        input_tokens: int | None = None,
     ) -> None:
         """Compact visible history for every provider without blocking the actual turn on failure."""
-        threshold = int(config.get("context_compaction_threshold") or 0)
-        if not threshold and not force:
+        if config["provider"] == "codex":
             return
         usage = self.context_usage(role, project_id)
-        if not force and usage["used_tokens"] * 100 < usage["context_window_tokens"] * threshold:
-            return
-        if config["provider"] == "codex":
-            if not session or not executable or working_root is None:
-                return
-            latest_messages = self.configs.context_messages(role, project_id)
-            latest_message_id = max((int(message["id"]) for message in latest_messages), default=0)
-            if latest_message_id <= int(session.get("compacted_message_id") or 0):
-                return
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._codex_tui_command, executable, "/compact", config, session["session_id"], working_root,
-                    ), timeout=45,
-                )
-            except Exception:
-                return
-            self.configs.mark_codex_context_compacted(role, project_id, latest_message_id)
-            self.configs.clear_context_usage(role, project_id)
+        limit = max(1_000, int(config.get("context_compaction_tokens") or 256_000))
+        used_tokens = max(0, int(input_tokens)) if input_tokens is not None else int(usage["used_tokens"])
+        if not force and used_tokens < limit:
             return
 
         existing_summary = self.configs.context_summary(role, project_id)
@@ -1217,8 +1348,8 @@ class AgentTeam:
         self, config: dict[str, Any], previous_summary: str, messages: list[dict[str, Any]],
     ) -> str:
         """Use the selected API/compatible model to create durable, provider-neutral memory."""
-        window = max(1_000, int(config.get("context_window_tokens") or 128_000))
-        target_tokens = min(8_000, max(250, window // 8))
+        limit = max(1_000, int(config.get("context_compaction_tokens") or 256_000))
+        target_tokens = min(8_000, max(250, limit // 8))
         transcript = "\n\n".join(
             f"Message {item['id']}:\n{item.get('content') or ''}" for item in messages
         )
@@ -1248,18 +1379,8 @@ class AgentTeam:
         return int(summary.get("compacted_message_id") or 0), str(summary.get("summary") or "")
 
     def _agent_directed_compaction_guidance(self, role: str, project_id: int = 1) -> str:
-        """Give stateless API models a safe way to decide when to replace old turns with memory."""
-        config = self.configs.get(role, project_id)
-        if config["provider"] == "codex" or int(config.get("context_compaction_threshold") or 0):
-            return ""
-        usage = self.context_usage(role, project_id)
-        return (
-            "\n\n<context_management>Context compaction is agent-directed for this conversation. "
-            f"The app estimates {usage['remaining_percent']}% of the configured context window remains. "
-            "When preserving a concise memory would help a later turn, include the standalone marker "
-            "<context_compaction_request/> anywhere in your final response. The marker is removed before the user "
-            "sees it, and the app will save a summary for future turns. Keep your normal answer as well.</context_management>"
-        )
+        """Automatic input-token compaction needs no provider-side prompt marker."""
+        return ""
 
     def _workspace_team_guidance(self, role: str, project_id: int = 1) -> str:
         """Describe the app-managed team separately from provider-native subagents."""
@@ -1361,6 +1482,11 @@ class AgentTeam:
             "status, or decisions. Messages are durable, automatically start an idle recipient run, and are "
             "synthesized into its next prompt. Always use send_agent_message for delegation so the recipient has "
             "its own chat transcript and run history. "
+            "AUTOMATIC REPORT-HANDOFF RULE: when an automatic queued-message prompt contains only reports, decide "
+            "whether a concrete next action is necessary before replying. Do not create an acknowledgement loop. "
+            "If no new work, decision, verification, synthesis, or escalation is needed, reply with exactly TERMINATE "
+            "in uppercase, with no other text and no tool calls. The application will display the latest report and "
+            "end that handoff. Never use TERMINATE for a command or for a prompt from the user. "
             f"{coordination_policy}Available recipient role IDs: {roster}. "
             f"{'Your direct relationships' if enforce_relationships else 'Current graph relationships'}: {graph}. "
             f"This conversation belongs to workspace {project_id}. Always pass project_id={project_id} to shared context tools. "
@@ -1490,9 +1616,29 @@ class AgentTeam:
             )
         lines.append(
             "Synthesize these commands and reports into your next action. "
-            "Do not claim a command was completed until you actually complete it."
+            "Do not claim a command was completed until you actually complete it. A report alone does not require "
+            "an acknowledgement or a return report."
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _automatic_handoff_termination(
+        automatic_handoff: bool, inbound_messages: list[dict[str, Any]], response: str,
+    ) -> dict[str, Any] | None:
+        """Accept an exact completion signal only for a report-only automatic handoff."""
+        if not automatic_handoff or str(response).strip() != "TERMINATE":
+            return None
+        if any(item.get("message_kind") == "command" for item in inbound_messages):
+            return None
+        reports = [item for item in inbound_messages if item.get("message_kind") == "report"]
+        return reports[-1] if reports else None
+
+    @staticmethod
+    def _terminated_handoff_display(report: dict[str, Any]) -> str:
+        """Render the reporter's final message instead of an unnecessary model acknowledgement."""
+        source = str(report.get("source_role") or "reporting agent")
+        content = str(report.get("content") or "").strip()
+        return f"TERMINATED on this report from {source}:\n\n{content}".strip()
 
     def send_agent_message(self, sender_role: str, recipient_role: str, content: str,
                            relationship: str, project_id: int = 1) -> dict[str, Any]:
@@ -1557,7 +1703,7 @@ class AgentTeam:
 
     @classmethod
     def _provider_usage_record(
-        cls, usage: Any, context_window_tokens: int, source: str,
+        cls, usage: Any, context_compaction_tokens: int, source: str, local_input_tokens: int = 0,
     ) -> dict[str, int | bool | str] | None:
         """Normalize Agents SDK, Responses, and Chat Completions usage shapes."""
         if usage is None:
@@ -1592,16 +1738,28 @@ class AgentTeam:
         if not input_tokens and not output_tokens and not total_tokens:
             return None
         return {
-            "input_tokens": input_tokens,
+            "input_tokens": max(0, int(local_input_tokens or input_tokens)),
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
             "cached_input_tokens": cached_input_tokens,
             "reasoning_output_tokens": reasoning_output_tokens,
-            "context_tokens": total_tokens,
-            "context_window_tokens": max(0, int(context_window_tokens or 0)),
+            # Context management is based solely on the locally counted input
+            # sent to the model; output and reasoning tokens are not context.
+            "context_tokens": max(0, int(local_input_tokens or input_tokens)),
+            "context_window_tokens": max(0, int(context_compaction_tokens or 0)),
             "source": source,
             "exact": True,
             "context_window_exact": False,
+        }
+
+    @staticmethod
+    def _local_input_usage_record(input_tokens: int, context_compaction_tokens: int) -> dict[str, int | bool | str]:
+        return {
+            "input_tokens": max(0, int(input_tokens)), "output_tokens": 0,
+            "total_tokens": max(0, int(input_tokens)), "cached_input_tokens": 0,
+            "reasoning_output_tokens": 0, "context_tokens": max(0, int(input_tokens)),
+            "context_window_tokens": max(0, int(context_compaction_tokens)),
+            "source": "local_input_token_count", "exact": True, "context_window_exact": False,
         }
 
     @classmethod
@@ -1632,18 +1790,35 @@ class AgentTeam:
                     "cached_input_tokens": cls._usage_value(last_usage, "cached_input_tokens"),
                     "reasoning_output_tokens": cls._usage_value(last_usage, "reasoning_output_tokens"),
                     "context_tokens": total_tokens,
-                    "context_window_tokens": context_window or int(config.get("context_window_tokens") or 0),
+                    "context_window_tokens": context_window,
                     "source": "codex_token_count",
                     "exact": True,
                     "context_window_exact": bool(context_window),
                 }
         if turn_usage:
             record = cls._provider_usage_record(
-                turn_usage, int(config.get("context_window_tokens") or 0), "codex_turn_completed",
+                turn_usage, 0, "codex_turn_completed",
             )
             if record:
                 return record
         return None
+
+    @staticmethod
+    def _codex_auto_compaction_count(events: list[dict[str, Any]]) -> int:
+        """Recognize Codex lifecycle events without guessing from token totals."""
+        count = 0
+        for event in events:
+            labels = [str(event.get("type") or "")]
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                labels.extend(str(payload.get(key) or "") for key in ("type", "event_type", "name", "status"))
+            label = " ".join(labels).lower().replace("_", "-")
+            event_text = json.dumps(event, ensure_ascii=False, default=str).lower().replace("_", "-")
+            if (
+                "compact" in label and ("context" in label or "thread" in label or "auto" in label)
+            ) or any(phrase in event_text for phrase in ("context compact", "thread compact", "auto compact")):
+                count += 1
+        return count
 
     def _attachment_text(self, attachments: list[dict[str, Any]]) -> str:
         parts = []
@@ -1684,18 +1859,21 @@ class AgentTeam:
         # researcher appear not to have run. The dispatcher in main.py starts
         # the recipient's own provider task as soon as that durable message is
         # written, preserving the group-chat and run history for every agent.
+        provider_input = self._agents_input(
+            role, message, project_id, reply_to_id, attachments or [], config["provider"],
+            exclude_message_ids,
+        )
+        local_input_tokens = self._count_input_tokens(provider_input, config.get("model", ""))
         result = await Runner.run(
-            agent,
-            self._agents_input(
-                role, message, project_id, reply_to_id, attachments or [], config["provider"],
-                exclude_message_ids,
-            ),
+            agent, provider_input,
             run_config=RunConfig(tracing_disabled=config["provider"] != "openai"),
         )
         usage = self._provider_usage_record(
             result.raw_responses[-1].usage if result.raw_responses else None,
-            int(config.get("context_window_tokens") or 0),
-            "agents_sdk_response",
+            int(config.get("context_compaction_tokens") or 256_000), "agents_sdk_response", local_input_tokens,
+        )
+        usage = usage or self._local_input_usage_record(
+            local_input_tokens, int(config.get("context_compaction_tokens") or 256_000),
         )
         response = {"response": str(result.final_output), "answered_by": result.last_agent.name}
         if usage:
@@ -1762,10 +1940,13 @@ class AgentTeam:
         # Google's model listing uses `models/…`; its OpenAI-compatible chat API expects the bare ID.
         model = config["model"].removeprefix("models/")
         tool_history_start = len(messages)
+        last_local_input_tokens = 0
         async def create_completion(client: AsyncOpenAI, use_tools: bool):
+            nonlocal last_local_input_tokens
             kwargs: dict[str, Any] = {"model": model, "messages": messages}
             if use_tools:
                 kwargs["tools"] = GOOGLE_INTER_AGENT_TOOLS
+            last_local_input_tokens = self._count_input_tokens(kwargs, config.get("model", ""))
             return await client.chat.completions.create(**kwargs)
 
         def call_value(call: Any, key: str, default: Any = "") -> Any:
@@ -1888,10 +2069,12 @@ class AgentTeam:
                 if response.strip():
                     result = {"response": response.strip(), "answered_by": self.definitions.get(role, project_id)["name"]}
                     usage = self._provider_usage_record(
-                        last_usage, int(config.get("context_window_tokens") or 0), "google_chat_completion",
+                        last_usage, int(config.get("context_compaction_tokens") or 256_000),
+                        "google_chat_completion", last_local_input_tokens,
                     )
-                    if usage:
-                        result["context_usage"] = usage
+                    result["context_usage"] = usage or self._local_input_usage_record(
+                        last_local_input_tokens, int(config.get("context_compaction_tokens") or 256_000),
+                    )
                     return result
                 tool_names = [str(call_value(call_value(call, "function", {}), "name", "unknown")) for call in calls]
                 if calls:
@@ -1936,9 +2119,6 @@ class AgentTeam:
         working_root = self._project_root(project_id)
         context_text = self._shared_context_text(role, project_id)
         existing = self.configs.codex_session(role, project_id)
-        if existing and not temporary_access:
-            await self._compact_context_if_needed(role, config, project_id, existing, command, working_root)
-            existing = self.configs.codex_session(role, project_id)
         shared_prompt = f"<current_shared_context>\n{context_text}\n</current_shared_context>"
         workspace_team_prompt = self._workspace_team_guidance(role, project_id)
         reply = self.configs.message(reply_to_id, role, project_id) if reply_to_id else None
@@ -2032,6 +2212,9 @@ class AgentTeam:
             self.configs.save_codex_session(
                 role, project_id, session_id, config.get("model", ""), config.get("reasoning_effort", "")
             )
+            auto_compactions = self._codex_auto_compaction_count(events)
+            if auto_compactions:
+                self.configs.record_codex_auto_compaction(role, project_id, auto_compactions)
             provider_usage = self._codex_usage_record(events, config)
             if provider_usage:
                 self.configs.save_context_usage(
@@ -2474,7 +2657,8 @@ class AgentTeam:
                    attachment_ids: list[str] | None = None,
                    record_user_message: bool = True,
                    user_message_id: int | None = None,
-                   temporary_access: str = "", run_id: str = "") -> dict[str, Any]:
+                   temporary_access: str = "", run_id: str = "",
+                   automatic_handoff: bool = False) -> dict[str, Any]:
         config = self.configs.get(role, project_id).copy()
         attachments = self.configs.pending_attachments(attachment_ids or [], role, project_id)
         existing_user_message = None
@@ -2506,7 +2690,10 @@ class AgentTeam:
             rag_text = ""
             rag_hits: list[dict[str, Any]] = []
             permission_continuation = bool(temporary_access) or message.startswith("The user denied your ")
-            if run_id and not permission_continuation:
+            report_only_handoff = bool(inbound_messages) and all(
+                item.get("message_kind") == "report" for item in inbound_messages
+            )
+            if run_id and not permission_continuation and not (automatic_handoff and report_only_handoff):
                 rag_text, rag_hits = await self.prepare_rag_evidence(
                     role, project_id, run_id, provider_message
                 )
@@ -2528,8 +2715,12 @@ class AgentTeam:
                 )
 
             if config["provider"] != "codex":
+                pending_input_tokens = self._local_context_input_tokens(role, project_id) + self._count_input_tokens(
+                    f"{provider_message}\n\n{self._attachment_text(attachments)}", config.get("model", ""),
+                )
                 await self._compact_context_if_needed(
                     role, config, project_id, exclude_message_ids=excluded_history_ids,
+                    input_tokens=pending_input_tokens,
                 )
             result = await call_provider_turn(provider_message)
         except Exception as exc:
@@ -2586,6 +2777,44 @@ class AgentTeam:
                     [int(item["id"]) for item in inbound_messages], delivery_run_id,
                 )
                 raise
+            termination_report = self._automatic_handoff_termination(
+                automatic_handoff, inbound_messages, str(result.get("response") or ""),
+            )
+            if termination_report is not None:
+                result["response"] = self._terminated_handoff_display(termination_report)
+                result["terminated"] = True
+                result["termination"] = {
+                    "source_role": termination_report.get("source_role") or "",
+                    "message_id": int(termination_report["id"]),
+                }
+                if run_id:
+                    self.configs.add_run_event(
+                        run_id, project_id, role, "handoff", "completed",
+                        f"Terminated on report from {termination_report.get('source_role') or 'agent'}",
+                        result["termination"],
+                    )
+                user_message = existing_user_message
+                if user_message is None and record_user_message:
+                    user_message = self.configs.add_message(
+                        role, "user", message, config["provider"], config["model"], project_id, reply_to_id,
+                    )
+                if user_message is not None:
+                    self.configs.attach_to_message(attachment_ids or [], user_message["id"])
+                    user_message["attachments"] = [
+                        {key: item[key] for key in ("id", "name", "mime_type", "size")} for item in attachments
+                    ]
+                assistant_message = self.configs.add_message(
+                    role, "assistant", result["response"], config["provider"], config["model"], project_id,
+                    run_id=run_id,
+                )
+                assistant_message["attachments"] = []
+                print(result, flush=True)
+                return {
+                    **result, "ok": True, "user_message": user_message, "assistant_message": assistant_message,
+                    "provider": config["provider"], "model": config["model"] or "Codex default",
+                    "reasoning_effort": config.get("reasoning_effort", ""),
+                    "inter_agent_message_ids": [int(item["id"]) for item in inbound_messages],
+                }
             action_permissions = self._action_permissions(role, project_id)
             command_access_granted = (
                 temporary_access in {"workspace", "external"}
@@ -2672,13 +2901,20 @@ class AgentTeam:
                 continuation_attempts += 1
                 result = await call_provider_turn(continuation_prompt)
 
+            grounding_policy = str(
+                self.projects.get(project_id).get("rag_grounding_policy") or "grounded"
+            ).lower()
             cited_sources = {
                 match.upper() for match in re.findall(r"\[(S\d+)\]", resolved_response, flags=re.IGNORECASE)
             }
             retrieved_sources = {str(item["source_id"]).upper() for item in rag_hits}
             valid_citations = cited_sources & retrieved_sources
             invalid_citations = cited_sources - retrieved_sources
-            if rag_hits and (not valid_citations or invalid_citations) and not re.search(
+            initial_claims = GroundingVerifier.verify(resolved_response, rag_hits) if rag_hits else []
+            needs_grounding_revision = any(
+                item.status != "supported" for item in initial_claims
+            ) or bool(invalid_citations) or (bool(rag_hits) and not valid_citations)
+            if rag_hits and grounding_policy in {"grounded", "strict"} and needs_grounding_revision and not re.search(
                 r'<permission_request\s+scope="(workspace|external)">', resolved_response, flags=re.IGNORECASE,
             ):
                 correction = await call_provider_turn(
@@ -2695,15 +2931,32 @@ class AgentTeam:
                     }
                     valid_citations = cited_sources & retrieved_sources
                     invalid_citations = cited_sources - retrieved_sources
+            grounding_claims = GroundingVerifier.verify(resolved_response, rag_hits) if rag_hits else []
+            unsupported_claims = [item for item in grounding_claims if item.status != "supported"]
+            if grounding_policy == "strict" and rag_hits and unsupported_claims and not re.search(
+                r'<permission_request\s+scope="(workspace|external)">', resolved_response, flags=re.IGNORECASE,
+            ):
+                resolved_response = (
+                    "I couldn’t produce an answer that satisfied this project’s strict grounding policy. "
+                    "Review the retrieved sources or broaden the indexed knowledge, then try again."
+                )
             if run_id and not permission_continuation:
-                grounded = bool(valid_citations) and not invalid_citations
+                grounded = bool(valid_citations) and not invalid_citations and not unsupported_claims
                 self.configs.add_run_event(
                     run_id, project_id, role, "validation",
                     "completed" if grounded else "warning",
                     f"Grounding {'validated' if grounded else 'could not be validated'}",
                     {"citations": sorted(valid_citations), "retrieved_sources": len(rag_hits),
-                     "invalid_citations": sorted(invalid_citations), "grounded": grounded},
+                     "invalid_citations": sorted(invalid_citations), "grounded": grounded,
+                     "policy": grounding_policy,
+                     "claims": [item.__dict__ for item in grounding_claims]},
                 )
+                trace = self._rag_trace_ids.pop(run_id, None)
+                if trace:
+                    self.rag_enterprise.finish_trace(
+                        trace[1], trace[0], status="validated" if grounded else "warning",
+                        results=rag_hits, claims=grounding_claims,
+                    )
             elif not run_id and (all_file_actions or all_local_commands):
                 # Preserve the direct AgentTeam.chat() return contract used by
                 # non-run callers. Durable browser runs render these results as
@@ -2714,14 +2967,11 @@ class AgentTeam:
                 )
                 resolved_response = f"{resolved_response}\n\n{action_notice}".strip()
             result["response"] = resolved_response
-            agent_requested_compaction = False
-            agent_requested_compaction = bool(re.search(
-                r"<context_compaction_request\s*/>", result["response"], flags=re.IGNORECASE,
-            ))
-            if agent_requested_compaction:
-                result["response"] = re.sub(
-                    r"\s*<context_compaction_request\s*/>\s*", "\n", result["response"], flags=re.IGNORECASE,
-                ).strip()
+            # Older API agents may still emit the retired opt-in marker.  It
+            # is no longer a command, but it also should not leak into chat.
+            result["response"] = re.sub(
+                r"\s*<context_compaction_request\s*/>\s*", "\n", result["response"], flags=re.IGNORECASE,
+            ).strip()
             if all_tool_calls:
                 result["tool_calls"] = all_tool_calls
             if all_local_commands:
@@ -2756,23 +3006,10 @@ class AgentTeam:
                     exact=bool(provider_usage.get("exact")),
                     context_window_exact=bool(provider_usage.get("context_window_exact")),
                 )
-                threshold = int(config.get("context_compaction_threshold") or 0)
-                usage_reached = bool(
-                    int(provider_usage.get("context_tokens") or 0) * 100
-                    >= int(provider_usage.get("context_window_tokens") or 0) * threshold
-                    if threshold and int(provider_usage.get("context_window_tokens") or 0) else False
-                )
-                if config["provider"] != "codex" and (agent_requested_compaction or usage_reached):
+                if config["provider"] != "codex":
                     await self._compact_context_if_needed(
                         role, config, project_id, exclude_message_ids=excluded_history_ids,
-                        force=agent_requested_compaction,
                     )
-            elif config["provider"] != "codex" and agent_requested_compaction:
-                # Some compatible endpoints omit usage entirely; the agent's
-                # explicit request still has to create a durable summary.
-                await self._compact_context_if_needed(
-                    role, config, project_id, exclude_message_ids=excluded_history_ids, force=True,
-                )
             permission_match = re.search(
                 r'<permission_request\s+scope="(workspace|external)">\s*(.*?)\s*</permission_request>',
                 result["response"], flags=re.IGNORECASE | re.DOTALL,

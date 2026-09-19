@@ -351,7 +351,7 @@ class SkillStore:
     """ACP/Agent-Skills package library plus project-scoped assignments.
 
     The SQLite database is now an index and assignment graph.  The portable
-    skill itself lives at ``data/skills/<slug>/<version>/<platform>/SKILL.md``
+    skill itself lives at ``maw/skills/<slug>/<version>/<platform>/SKILL.md``
     with optional resources and scripts beside it.  Legacy database-only
     skills are migrated into that package shape on first open.
     """

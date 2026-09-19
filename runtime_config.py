@@ -92,8 +92,7 @@ class RuntimeConfigStore:
                     base_url TEXT NOT NULL,
                     api_key_env TEXT NOT NULL,
                     reasoning_effort TEXT NOT NULL DEFAULT '',
-                    context_window_tokens INTEGER NOT NULL DEFAULT 128000,
-                    context_compaction_threshold INTEGER NOT NULL DEFAULT 0
+                    context_compaction_tokens INTEGER NOT NULL DEFAULT 256000
                 )
                 """
             )
@@ -107,8 +106,7 @@ class RuntimeConfigStore:
                     base_url TEXT NOT NULL,
                     api_key_env TEXT NOT NULL,
                     reasoning_effort TEXT NOT NULL DEFAULT '',
-                    context_window_tokens INTEGER NOT NULL DEFAULT 128000,
-                    context_compaction_threshold INTEGER NOT NULL DEFAULT 0,
+                    context_compaction_tokens INTEGER NOT NULL DEFAULT 256000,
                     PRIMARY KEY (project_id, role),
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                 )
@@ -128,10 +126,16 @@ class RuntimeConfigStore:
                 columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
                 if "reasoning_effort" not in columns:
                     db.execute(f"ALTER TABLE {table} ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''")
-                if "context_window_tokens" not in columns:
-                    db.execute(f"ALTER TABLE {table} ADD COLUMN context_window_tokens INTEGER NOT NULL DEFAULT 128000")
-                if "context_compaction_threshold" not in columns:
-                    db.execute(f"ALTER TABLE {table} ADD COLUMN context_compaction_threshold INTEGER NOT NULL DEFAULT 0")
+                if "context_compaction_tokens" not in columns:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN context_compaction_tokens INTEGER NOT NULL DEFAULT 256000")
+                    # Preserve an explicit legacy percentage as a one-time
+                    # migration; the UI no longer exposes either legacy field.
+                    if {"context_window_tokens", "context_compaction_threshold"} <= columns:
+                        db.execute(
+                            f"""UPDATE {table} SET context_compaction_tokens=
+                            MAX(1000, context_window_tokens * context_compaction_threshold / 100)
+                            WHERE context_compaction_threshold > 0"""
+                        )
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -199,6 +203,8 @@ class RuntimeConfigStore:
                     model TEXT NOT NULL DEFAULT '',
                     reasoning_effort TEXT NOT NULL DEFAULT '',
                     compacted_message_id INTEGER NOT NULL DEFAULT 0,
+                    auto_compaction_count INTEGER NOT NULL DEFAULT 0,
+                    last_auto_compaction_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (project_id, role)
                 )
@@ -207,6 +213,10 @@ class RuntimeConfigStore:
             session_columns = {row[1] for row in db.execute("PRAGMA table_info(codex_chat_sessions)")}
             if "compacted_message_id" not in session_columns:
                 db.execute("ALTER TABLE codex_chat_sessions ADD COLUMN compacted_message_id INTEGER NOT NULL DEFAULT 0")
+            if "auto_compaction_count" not in session_columns:
+                db.execute("ALTER TABLE codex_chat_sessions ADD COLUMN auto_compaction_count INTEGER NOT NULL DEFAULT 0")
+            if "last_auto_compaction_at" not in session_columns:
+                db.execute("ALTER TABLE codex_chat_sessions ADD COLUMN last_auto_compaction_at TEXT NOT NULL DEFAULT ''")
             # API-backed providers do not retain a server-side conversation in the
             # same way as Codex.  Keep their compacted memory separately so the
             # next request can send a concise summary plus only newer turns.
@@ -342,15 +352,15 @@ class RuntimeConfigStore:
             tuple(row)
             for row in db.execute(
                 """SELECT role,provider,model,base_url,api_key_env,reasoning_effort,
-                context_window_tokens,context_compaction_threshold FROM agent_runtime_config"""
+                context_compaction_tokens FROM agent_runtime_config"""
             )
         ]
         for project_id, in db.execute("SELECT id FROM projects"):
             db.executemany(
                 """INSERT OR IGNORE INTO project_agent_runtime_config
                     (project_id,role,provider,model,base_url,api_key_env,reasoning_effort,
-                    context_window_tokens,context_compaction_threshold)
-                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    context_compaction_tokens)
+                    VALUES(?,?,?,?,?,?,?,?)""",
                 [(project_id, *config) for config in configs],
             )
 
@@ -383,24 +393,25 @@ class RuntimeConfigStore:
         with self._connect() as db:
             if self._projects_available(db):
                 row = db.execute(
-                    "SELECT role,provider,model,base_url,api_key_env,reasoning_effort,context_window_tokens,context_compaction_threshold "
+                    "SELECT role,provider,model,base_url,api_key_env,reasoning_effort,context_compaction_tokens "
                     "FROM project_agent_runtime_config WHERE project_id=? AND role=?",
                     (project_id, role),
                 ).fetchone()
             else:
-                row = db.execute("SELECT * FROM agent_runtime_config WHERE role = ?", (role,)).fetchone()
+                row = db.execute(
+                    "SELECT role,provider,model,base_url,api_key_env,reasoning_effort,context_compaction_tokens "
+                    "FROM agent_runtime_config WHERE role=?", (role,),
+                ).fetchone()
         result = dict(row) if row else DEFAULTS.get(role, {"role": role, "provider": "codex", "model": "gpt-5.6-terra", "base_url": "", "api_key_env": ""}).copy()
         result.setdefault("reasoning_effort", "")
-        result.setdefault("context_window_tokens", 128000)
-        result.setdefault("context_compaction_threshold", 0)
+        result.setdefault("context_compaction_tokens", 256000)
         return result
 
     def list(self, roles: list[str] | None = None, project_id: int = 1) -> list[dict[str, str]]:
         return [self.get(role, project_id) for role in (roles or list(ROLES))]
 
     def save(self, role: str, provider: str, model: str, base_url: str, api_key_env: str,
-             reasoning_effort: str = "", project_id: int = 1, context_window_tokens: int = 128000,
-             context_compaction_threshold: int = 0) -> dict[str, str]:
+             reasoning_effort: str = "", project_id: int = 1, context_compaction_tokens: int = 256000) -> dict[str, str]:
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown provider: {provider}")
         model = model.strip()
@@ -408,38 +419,33 @@ class RuntimeConfigStore:
             raise ValueError("A model name is required")
         if provider == "compatible" and not base_url.strip():
             raise ValueError("A base URL is required for an OpenAI-compatible provider")
-        context_window_tokens = max(1_000, min(int(context_window_tokens), 10_000_000))
-        context_compaction_threshold = int(context_compaction_threshold)
-        if context_compaction_threshold not in {0, 50, 60, 70, 80, 90, 95}:
-            raise ValueError("Unsupported context compaction threshold")
+        context_compaction_tokens = max(1_000, min(int(context_compaction_tokens), 10_000_000))
         with self._connect() as db:
             values = (
                 provider, model, base_url.strip(), api_key_env.strip(), reasoning_effort.strip(),
-                context_window_tokens, context_compaction_threshold,
+                context_compaction_tokens,
             )
             if self._projects_available(db):
                 db.execute(
                     """INSERT INTO project_agent_runtime_config
                         (project_id,role,provider,model,base_url,api_key_env,reasoning_effort,
-                        context_window_tokens,context_compaction_threshold)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        context_compaction_tokens)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(project_id,role) DO UPDATE SET provider=excluded.provider,
                         model=excluded.model, base_url=excluded.base_url, api_key_env=excluded.api_key_env,
                         reasoning_effort=excluded.reasoning_effort,
-                        context_window_tokens=excluded.context_window_tokens,
-                        context_compaction_threshold=excluded.context_compaction_threshold""",
+                        context_compaction_tokens=excluded.context_compaction_tokens""",
                     (project_id, role, *values),
                 )
             else:
                 db.execute(
                     """INSERT INTO agent_runtime_config(
                     role, provider, model, base_url, api_key_env, reasoning_effort,
-                    context_window_tokens,context_compaction_threshold)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    context_compaction_tokens)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(role) DO UPDATE SET provider=excluded.provider, model=excluded.model,
                     base_url=excluded.base_url, api_key_env=excluded.api_key_env, reasoning_effort=excluded.reasoning_effort,
-                    context_window_tokens=excluded.context_window_tokens,
-                    context_compaction_threshold=excluded.context_compaction_threshold""",
+                    context_compaction_tokens=excluded.context_compaction_tokens""",
                     (role, *values),
                 )
         return self.get(role, project_id)
@@ -804,6 +810,19 @@ class RuntimeConfigStore:
                 """UPDATE codex_chat_sessions SET compacted_message_id=?,updated_at=CURRENT_TIMESTAMP
                 WHERE project_id=? AND role=?""",
                 (max(0, int(message_id)), project_id, role),
+            )
+
+    def record_codex_auto_compaction(self, role: str, project_id: int, count: int = 1) -> None:
+        """Persist Codex's own compaction lifecycle event for the chat UI."""
+        if count <= 0:
+            return
+        with self._connect() as db:
+            db.execute(
+                """UPDATE codex_chat_sessions
+                SET auto_compaction_count=auto_compaction_count+?,
+                    last_auto_compaction_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                WHERE project_id=? AND role=?""",
+                (int(count), project_id, role),
             )
 
     def context_summary(self, role: str, project_id: int = 1) -> dict[str, Any] | None:
