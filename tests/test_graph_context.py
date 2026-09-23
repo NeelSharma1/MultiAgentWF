@@ -31,6 +31,30 @@ def test_scan_builds_persisted_project_folder_file_graph(tmp_path):
     assert reopened.get_by_path("src/app.py", project_id=7)["content_hash"] == file_node["content_hash"]
 
 
+def test_project_tree_reveals_non_rag_files_without_traversing_generated_folders(tmp_path):
+    root = tmp_path / "workspace"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("print('hello')\n")
+    (root / ".env.local").write_text("SECRET=local-only\n")
+    (root / "assets").mkdir()
+    (root / "assets" / "logo.bin").write_bytes(b"\x00\x01")
+    (root / "node_modules" / "package").mkdir(parents=True)
+    (root / "node_modules" / "package" / "index.js").write_text("generated")
+    (root / "maw").mkdir()
+    (root / "maw" / "workspace.db").write_text("runtime")
+
+    result = GraphContextStore.project_tree(root)
+    nodes = {node["path"]: node for node in result["items"]}
+
+    assert not result["truncated"]
+    assert "src/app.py" in nodes
+    assert "assets/logo.bin" in nodes
+    assert nodes[".env.local"]["tree_excluded"] is True
+    assert nodes["node_modules"]["children_omitted"] is True
+    assert "node_modules/package" not in nodes
+    assert not any(path == "maw" or path.startswith("maw/") for path in nodes)
+
+
 def test_scan_rejects_unsafe_paths_and_skips_symlink_escape(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()

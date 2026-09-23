@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import subprocess
+from pathlib import Path
 
 from embedding_providers import EmbeddingProfile
 from rag import RagStore, structured_chunk_text
@@ -128,6 +129,78 @@ def test_background_coordinator_deduplicates_and_runs_jobs(tmp_path):
     first, second = asyncio.run(run())
     assert first["id"] == second["id"]
     assert len(calls) == 1
+
+
+def test_background_coordinator_reconciles_enabled_projects_on_startup(tmp_path, monkeypatch):
+    store = RagStore(tmp_path / "rag.db")
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    calls = []
+
+    async def indexer(project_id, **kwargs):
+        calls.append(project_id)
+        store._update_job(kwargs["job_id"], status="completed")
+        return {"ok": True}
+
+    monkeypatch.setattr("rag_runtime.awatch", None)
+    coordinator = LocalRagIndexCoordinator(
+        store, indexer,
+        lambda: [
+            {"id": 1, "rag_enabled": True, "root_path": str(source_root)},
+            {"id": 2, "rag_enabled": False, "root_path": str(source_root)},
+        ],
+        lambda project: Path(project["root_path"]),
+    )
+
+    async def run():
+        await coordinator.start()
+        await asyncio.wait_for(coordinator.queue.join(), 2)
+        await coordinator.stop()
+
+    asyncio.run(run())
+
+    assert calls == [1]
+
+
+def test_background_watcher_filters_only_maw_state(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    coordinator = LocalRagIndexCoordinator(RagStore(tmp_path / "rag.db"), lambda *_args, **_kwargs: None,
+                                           lambda: [], lambda _project: root)
+    accepts = coordinator._watch_filter(root)
+
+    assert accepts(None, str(root / "app.py"))
+    assert accepts(None, str(root / ".git" / "HEAD"))
+    assert not accepts(None, str(root / "maw" / "workspace.db-wal"))
+
+
+def test_background_coordinator_recovers_a_stopped_watcher_once(tmp_path, monkeypatch):
+    store = RagStore(tmp_path / "rag.db")
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+
+    async def idle_watch(*_args, **_kwargs):
+        while True:
+            await asyncio.sleep(60)
+            yield set()
+
+    monkeypatch.setattr("rag_runtime.awatch", idle_watch)
+    coordinator = LocalRagIndexCoordinator(
+        store, lambda *_args, **_kwargs: None,
+        lambda: [{"id": 1, "rag_enabled": True, "root_path": str(source_root)}],
+        lambda project: Path(project["root_path"]),
+    )
+
+    async def run():
+        assert await coordinator.refresh_watchers() == set()
+        watcher = coordinator._watchers[1]
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        recovered = await coordinator.refresh_watchers()
+        await coordinator.stop()
+        return recovered
+
+    assert asyncio.run(run()) == {1}
 
 
 def test_eval_harness_reports_recall_and_mrr():

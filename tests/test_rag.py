@@ -36,6 +36,8 @@ def test_eligible_files_excludes_secrets_ignored_binary_large_and_symlinks(tmp_p
     (root / "large.txt").write_bytes(b"x" * 128_001)
     (root / "node_modules").mkdir()
     (root / "node_modules" / "package.js").write_text("ignored\n", encoding="utf-8")
+    (root / "maw").mkdir()
+    (root / "maw" / "workspace-notes.md").write_text("internal state\n", encoding="utf-8")
     try:
         (root / "escape.txt").symlink_to(tmp_path / "outside.txt")
     except OSError:

@@ -65,6 +65,18 @@ class LocalRagIndexCoordinator:
                 project_id, str(job["id"]), False, str(job.get("reason") or "restart_recovery"),
             ))
         await self.refresh_watchers()
+        # A server restart must reconcile every enabled source tree.  The
+        # indexer hashes documents and skips unchanged chunks, so this is safe
+        # to run on every boot without re-embedding the whole project.
+        for project in self.list_projects():
+            if not bool(project.get("rag_enabled")):
+                continue
+            try:
+                if not self.resolve_root(project).is_dir():
+                    continue
+            except Exception:
+                continue
+            await self.schedule(int(project["id"]), reason="startup_reconcile")
 
     async def stop(self) -> None:
         self._closed = True
@@ -77,7 +89,8 @@ class LocalRagIndexCoordinator:
         self._reconciler = None
         self._watchers.clear()
 
-    async def refresh_watchers(self) -> None:
+    async def refresh_watchers(self) -> set[int]:
+        """Refresh project watchers and report watchers recovered after failure."""
         enabled: dict[int, Path] = {}
         for project in self.list_projects():
             if not bool(project.get("rag_enabled")):
@@ -93,12 +106,17 @@ class LocalRagIndexCoordinator:
                 task.cancel()
                 self._watchers.pop(project_id, None)
         if awatch is None:
-            return
+            return set()
+        recovered: set[int] = set()
         for project_id, root in enabled.items():
-            if project_id not in self._watchers or self._watchers[project_id].done():
+            previous = self._watchers.get(project_id)
+            if previous is None or previous.done():
                 self._watchers[project_id] = asyncio.create_task(
                     self._watch(project_id, root), name=f"rag-watch-{project_id}",
                 )
+                if previous is not None:
+                    recovered.add(project_id)
+        return recovered
 
     async def schedule(self, project_id: int, *, force: bool = False,
                        reason: str = "source_change") -> dict[str, Any]:
@@ -132,7 +150,10 @@ class LocalRagIndexCoordinator:
     async def _watch(self, project_id: int, root: Path) -> None:
         assert awatch is not None
         try:
-            async for changes in awatch(root, debounce=2000, step=500, recursive=True):
+            async for changes in awatch(
+                root, debounce=2000, step=500, recursive=True,
+                watch_filter=self._watch_filter(root),
+            ):
                 if self._closed:
                     return
                 if not changes:
@@ -145,14 +166,30 @@ class LocalRagIndexCoordinator:
             # Reconciliation remains active if native file watching fails.
             return
 
+    @staticmethod
+    def _watch_filter(root: Path) -> Callable[[Any, str], bool]:
+        """Ignore MAW's local state without excluding project source files."""
+        resolved_root = root.expanduser().resolve()
+
+        def accepts(_change: Any, changed_path: str) -> bool:
+            try:
+                relative = Path(changed_path).resolve(strict=False).relative_to(resolved_root)
+            except (OSError, ValueError):
+                return False
+            return not relative.parts or relative.parts[0].casefold() != "maw"
+
+        return accepts
+
     async def _run_reconciler(self) -> None:
         while True:
             try:
                 await asyncio.sleep(self.reconcile_seconds)
-                await self.refresh_watchers()
-                for project in self.list_projects():
-                    if bool(project.get("rag_enabled")):
-                        await self.schedule(int(project["id"]), reason="periodic_reconcile")
+                recovered = await self.refresh_watchers()
+                # A restarted watcher may have missed a source update while it
+                # was unavailable. Reconcile once, but do not periodically
+                # probe/embed a stable project just to keep the watcher alive.
+                for project_id in recovered:
+                    await self.schedule(project_id, reason="watch_recovery")
             except asyncio.CancelledError:
                 raise
             except Exception:

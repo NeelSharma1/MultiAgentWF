@@ -991,20 +991,23 @@ class AgentTeam:
             )
         )
 
-    def _git_guidance(self, role: str, project_id: int = 1) -> str:
+    def _git_guidance(self, role: str, project_id: int = 1, change_id: str = "") -> str:
         if not self.git.agent_enabled(project_id, role):
             return ""
         configuration = self.git.configuration(project_id)
         if not configuration:
             return ""
-        main_branch = configuration.get("main_branch") or configuration["branch"]
+        branch_note = "the branch checked out by the user when this run began"
         return (
-            f"\n\nThis is a Git-enabled agent workflow. The app checks out your dedicated '{role}' branch from "
-            f"the main branch '{main_branch}' before you work, then commits and merges it into '{main_branch}' "
-            "after your response. "
-            "Work only in the current working tree. Never create, switch, merge, rebase, reset, or delete Git branches, "
-            "and do not run git commit, git add, git push, git pull, git revert, or git reset. The workspace captures "
-            "the completed series of file changes as one commit and handles the merge automatically."
+            "\n\nThis is a shared-branch Git workflow. You are working in an isolated disposable workspace based on "
+            f"{branch_note}; the user's checkout is never switched or edited by your run. "
+            "Never create, switch, merge, rebase, reset, delete, stage, commit, or push Git branches. The app captures "
+            "your completed patch, adopts it only if every changed file is still safe, then commits and pushes it using "
+            "the user's configured Git identity. "
+            + (f"This run's collaboration change ID is {change_id}. " if change_id else "")
+            + "If review is warranted, append [[GIT_REVIEW supervisor=<role_id>]] to your final response. "
+            "A selected reviewer may respond with [[GIT_REVIEW_APPROVE change=<id>]] or "
+            "[[GIT_REVIEW_REJECT change=<id>]]."
         )
 
     def _action_permissions(self, role: str, project_id: int = 1) -> dict[str, Any]:
@@ -1242,11 +1245,37 @@ class AgentTeam:
         is_codex = config["provider"] == "codex"
         window = max(1_000, int(config.get("context_compaction_tokens") or 256_000))
         reported = self.configs.context_usage(role, project_id)
-        if is_codex and reported and bool(reported.get("exact")) and int(reported.get("context_tokens") or 0) > 0:
+        if is_codex and not self._is_codex_prompt_usage(reported):
+            # Earlier versions persisted Codex's cumulative total_token_usage.
+            # Recover the prompt-level value from the matching local session log
+            # once, then replace that invalid aggregate cache entry.
+            recovered = self._codex_session_usage_record(role, project_id, config)
+            if recovered:
+                self.configs.save_context_usage(
+                    role, project_id, "codex", config.get("model", ""),
+                    input_tokens=int(recovered["input_tokens"]),
+                    output_tokens=int(recovered["output_tokens"]),
+                    total_tokens=int(recovered["total_tokens"]),
+                    cached_input_tokens=int(recovered["cached_input_tokens"]),
+                    reasoning_output_tokens=int(recovered["reasoning_output_tokens"]),
+                    context_tokens=int(recovered["context_tokens"]),
+                    context_window_tokens=int(recovered["context_window_tokens"]),
+                    source=str(recovered["source"]), exact=bool(recovered["exact"]),
+                    context_window_exact=bool(recovered.get("context_window_exact")),
+                )
+                reported = recovered
+        if (
+            is_codex and reported
+            and self._is_codex_prompt_usage(reported)
+            and bool(reported.get("exact"))
+            and int(reported.get("input_tokens") or 0) > 0
+        ):
             reported_window = int(reported.get("context_window_tokens") or 0)
             if reported_window > 0:
                 window = reported_window
-            used_tokens = int(reported.get("context_tokens") or 0)
+            # This is the input for the latest prompt Codex completed. Cached
+            # input is included in that amount and shown separately for clarity.
+            used_tokens = int(reported.get("input_tokens") or 0)
             remaining_tokens = max(0, window - used_tokens)
             window_exact = bool(reported.get("context_window_exact"))
             session = self.configs.codex_session(role, project_id)
@@ -1766,7 +1795,7 @@ class AgentTeam:
     def _codex_usage_record(
         cls, events: list[dict[str, Any]], config: dict[str, Any],
     ) -> dict[str, int | bool | str] | None:
-        """Read Codex's JSON usage events, including the effective context window."""
+        """Read the latest completed Codex prompt's input usage, never totals."""
         token_info = None
         turn_usage = None
         for event in events:
@@ -1778,27 +1807,76 @@ class AgentTeam:
                 token_info = payload.get("info") or {}
             elif event_type == "turn.completed" and isinstance(event.get("usage"), dict):
                 turn_usage = event["usage"]
-        if token_info:
-            last_usage = token_info.get("last_token_usage") or token_info.get("total_token_usage") or {}
-            context_window = cls._usage_value(token_info, "model_context_window")
-            total_tokens = cls._usage_value(last_usage, "total_tokens")
-            if total_tokens:
+        usage = turn_usage
+        source = "codex_turn_completed_input"
+        if usage is None and token_info:
+            # Codex session rollouts use token_count events. last_token_usage is
+            # the current prompt; total_token_usage is a lifetime aggregate and
+            # must never be used for the context meter.
+            candidate = token_info.get("last_token_usage")
+            if isinstance(candidate, dict):
+                usage = candidate
+                source = "codex_last_prompt_input"
+        if usage:
+            input_tokens = cls._usage_value(usage, "input_tokens")
+            if input_tokens:
+                context_window = cls._usage_value(token_info or {}, "model_context_window")
+                cached_input_tokens = cls._usage_value(usage, "cached_input_tokens")
+                output_tokens = cls._usage_value(usage, "output_tokens")
                 return {
-                    "input_tokens": cls._usage_value(last_usage, "input_tokens"),
-                    "output_tokens": cls._usage_value(last_usage, "output_tokens"),
-                    "total_tokens": total_tokens,
-                    "cached_input_tokens": cls._usage_value(last_usage, "cached_input_tokens"),
-                    "reasoning_output_tokens": cls._usage_value(last_usage, "reasoning_output_tokens"),
-                    "context_tokens": total_tokens,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": cls._usage_value(usage, "total_tokens") or input_tokens + output_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "reasoning_output_tokens": cls._usage_value(usage, "reasoning_output_tokens"),
+                    "context_tokens": input_tokens,
                     "context_window_tokens": context_window,
-                    "source": "codex_token_count",
+                    "source": source,
                     "exact": True,
                     "context_window_exact": bool(context_window),
                 }
-        if turn_usage:
-            record = cls._provider_usage_record(
-                turn_usage, 0, "codex_turn_completed",
+        return None
+
+    @staticmethod
+    def _is_codex_prompt_usage(usage: dict[str, Any] | None) -> bool:
+        """Return whether a saved record is a prompt-level Codex measurement."""
+        return bool(usage) and str(usage.get("source") or "") in {
+            "codex_turn_completed_input", "codex_last_prompt_input",
+        }
+
+    @staticmethod
+    def _codex_sessions_root() -> Path:
+        return Path.home() / ".codex" / "sessions"
+
+    def _codex_session_usage_record(
+        self, role: str, project_id: int, config: dict[str, Any],
+    ) -> dict[str, int | bool | str] | None:
+        """Recover the final prompt usage from this agent's local Codex session."""
+        session = self.configs.codex_session(role, project_id)
+        session_id = str(session.get("session_id") or "") if session else ""
+        if not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+            return None
+        try:
+            candidates = sorted(
+                self._codex_sessions_root().glob(f"**/*-{session_id}.jsonl"),
+                key=lambda path: path.stat().st_mtime, reverse=True,
             )
+        except OSError:
+            return None
+        for path in candidates:
+            events: list[dict[str, Any]] = []
+            try:
+                with path.open(encoding="utf-8", errors="replace") as stream:
+                    for line in stream:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(event, dict):
+                            events.append(event)
+            except OSError:
+                continue
+            record = self._codex_usage_record(events, config)
             if record:
                 return record
         return None
@@ -2095,16 +2173,18 @@ class AgentTeam:
     async def _codex_chat(self, role: str, message: str, config: dict[str, str], project_id: int = 1,
                           reply_to_id: int | None = None,
                           attachments: list[dict[str, Any]] | None = None,
-                          temporary_access: str = "") -> dict[str, str]:
+                          temporary_access: str = "", workspace_root: Path | None = None,
+                          change_id: str = "") -> dict[str, str]:
         lock = self._codex_chat_locks.setdefault((project_id, role), asyncio.Lock())
         async with lock:
             return await self._codex_chat_locked(
-                role, message, config, project_id, reply_to_id, attachments or [], temporary_access,
+                role, message, config, project_id, reply_to_id, attachments or [], temporary_access, workspace_root, change_id,
             )
 
     async def _codex_chat_locked(self, role: str, message: str, config: dict[str, str], project_id: int,
                                  reply_to_id: int | None, attachments: list[dict[str, Any]],
-                                 temporary_access: str = "") -> dict[str, str]:
+                                 temporary_access: str = "", workspace_root: Path | None = None,
+                                 change_id: str = "") -> dict[str, str]:
         command = self._codex_command()
         if not command:
             raise ProviderError("Codex CLI was not found. Set CODEX_COMMAND or install and sign in to Codex CLI.")
@@ -2116,7 +2196,7 @@ class AgentTeam:
                 status_code=401,
                 code="codex_not_authenticated",
             )
-        working_root = self._project_root(project_id)
+        working_root = Path(workspace_root).resolve() if workspace_root else self._project_root(project_id)
         context_text = self._shared_context_text(role, project_id)
         existing = self.configs.codex_session(role, project_id)
         shared_prompt = f"<current_shared_context>\n{context_text}\n</current_shared_context>"
@@ -2130,7 +2210,7 @@ class AgentTeam:
         if existing:
             prompt = (
                 f"The shared team context, reusable skill assignments, and local toolsets may have changed since the prior turn.\n"
-                f"{workspace_team_prompt}{self._local_workspace_guidance(role, project_id)}{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id)}\n\n"
+                f"{workspace_team_prompt}{self._local_workspace_guidance(role, project_id)}{shared_prompt}{self._action_guidance(role, project_id, temporary_access)}{self._skill_guidance(role, project_id)}{self._tool_guidance(role, project_id)}{self._git_guidance(role, project_id, change_id)}\n\n"
                 f"User: {message}{reply_prompt}{attachment_prompt}"
             )
         else:
@@ -2139,7 +2219,7 @@ class AgentTeam:
                 f"{workspace_team_prompt}\n\n"
                 "You are a persistent conversational team member. Do not inspect secret files such as .env or .env.local. "
                 "Keep continuity with future turns in this Codex session.\n\n"
-                f"{shared_prompt}\n\nUser: {message}{reply_prompt}{attachment_prompt}"
+                f"{shared_prompt}{self._git_guidance(role, project_id, change_id)}\n\nUser: {message}{reply_prompt}{attachment_prompt}"
             )
         with tempfile.TemporaryDirectory(prefix="agent-team-") as temp_dir:
             output_path = Path(temp_dir) / "last-message.txt"
@@ -2658,7 +2738,8 @@ class AgentTeam:
                    record_user_message: bool = True,
                    user_message_id: int | None = None,
                    temporary_access: str = "", run_id: str = "",
-                   automatic_handoff: bool = False) -> dict[str, Any]:
+                   automatic_handoff: bool = False, workspace_root: Path | None = None,
+                   git_change_id: str = "") -> dict[str, Any]:
         config = self.configs.get(role, project_id).copy()
         attachments = self.configs.pending_attachments(attachment_ids or [], role, project_id)
         existing_user_message = None
@@ -2702,6 +2783,7 @@ class AgentTeam:
                 if config["provider"] == "codex":
                     return await self._codex_chat(
                         role, turn_message, config, project_id, reply_to_id, attachments, temporary_access,
+                        workspace_root, git_change_id,
                     )
                 provider_access = {"temporary_access": temporary_access} if temporary_access else {}
                 if config["provider"] == "google":
@@ -2826,7 +2908,7 @@ class AgentTeam:
                 or action_permissions["allow_file_edits"]
                 or self._has_full_workspace_access(role, project_id)
             )
-            project_root = self._project_root(project_id)
+            project_root = Path(workspace_root).resolve() if workspace_root else self._project_root(project_id)
             all_local_commands: list[dict[str, Any]] = []
             all_file_actions: list[dict[str, Any]] = []
             all_tool_calls: list[dict[str, Any]] = []

@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from git_workflow import GitWorkflowError, GitWorkflowStore
+from git_workflow import GitWorkflowStore
 
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
 
 
-def _git(store: GitWorkflowStore, repository, *args: str) -> str:
+def _git(store: GitWorkflowStore, repository: Path, *args: str) -> str:
     return store._run(repository, *args).stdout.strip()
 
 
@@ -19,235 +20,122 @@ def _workflow(tmp_path):
     repository = tmp_path / "workspace"
     repository.mkdir()
     workflow = GitWorkflowStore(tmp_path / "data" / "workspace.db")
-    status = workflow.configure(1, repository, "team-main", initialize=True)
-    _git(workflow, repository, "config", "user.name", "Agent Team Test")
-    _git(workflow, repository, "config", "user.email", "agent-team@example.test")
+    workflow.configure(1, repository, "team-main", initialize=True)
+    _git(workflow, repository, "config", "user.name", "Neel Test")
+    _git(workflow, repository, "config", "user.email", "neel@example.test")
     workflow.set_agent_enabled(1, "programmer", True, repository)
-    return workflow, repository, status
+    return workflow, repository
 
 
-def test_agent_run_commits_on_its_role_branch_and_merges_to_main(tmp_path):
-    workflow, repository, status = _workflow(tmp_path)
+def _change(workflow: GitWorkflowStore, repository: Path, path: str, content: str, message: str):
+    run = workflow.begin_agent_run(1, "programmer", repository, f"run-{path}")
+    target = Path(run["workspace"]) / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return workflow.finish_agent_run(1, "programmer", f"run-{path}", repository, message, run["change_id"])
 
-    assert status["is_repository"] is True
-    assert status["main_branch"] == "team-main"
 
-    run = workflow.begin_agent_run(1, "programmer", repository)
-    assert run["branch"] == "programmer"
-    assert _git(workflow, repository, "branch", "--show-current") == "programmer"
-    (repository / "feature.py").write_text("print('hello')\n", encoding="utf-8")
-    commit = workflow.finish_agent_run(1, "programmer", "run-1", repository, "Add the first feature")
+def test_agent_uses_isolated_workspace_and_commits_on_current_branch(tmp_path):
+    workflow, repository = _workflow(tmp_path)
+    run = workflow.begin_agent_run(1, "programmer", repository, "run-1")
 
-    assert commit is not None
-    assert commit["agent_branch"] == "programmer"
-    assert commit["merge_hash"]
-    assert commit["message"] == "agent(programmer): Add the first feature"
-    assert commit["files"] == [{
-        "path": "feature.py", "previous_path": "", "status": "A", "additions": 1, "deletions": 0,
-    }]
+    assert run["branch"] == "team-main"
     assert _git(workflow, repository, "branch", "--show-current") == "team-main"
-    assert _git(workflow, repository, "rev-parse", "HEAD") == commit["merge_hash"]
-    assert _git(workflow, repository, "merge-base", "--is-ancestor", commit["commit_hash"], "team-main") == ""
-    diff = workflow.file_diff(1, repository, commit["commit_hash"], "feature.py")
-    assert "+print('hello')" in diff["diff"]
-    assert workflow.status(1, repository)["clean"] is True
+    assert not (repository / "feature.py").exists()
+    (Path(run["workspace"]) / "feature.py").write_text("print('hello')\n", encoding="utf-8")
+    commit = workflow.finish_agent_run(1, "programmer", "run-1", repository, "Add feature", run["change_id"])
+
+    assert commit and not commit.get("held")
+    assert commit["message"] == "Add feature"
+    assert commit["agent_branch"] == ""
+    assert (repository / "feature.py").read_text(encoding="utf-8") == "print('hello')\n"
+    assert _git(workflow, repository, "log", "-1", "--format=%an <%ae>") == "Neel Test <neel@example.test>"
+    assert not Path(run["workspace"]).exists()
 
 
-def test_revert_and_head_only_rollback_operate_on_the_main_merge(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
-    workflow.begin_agent_run(1, "programmer", repository)
-    changed = repository / "feature.py"
-    changed.write_text("one\n", encoding="utf-8")
-    first = workflow.finish_agent_run(1, "programmer", "run-1", repository, "Create feature")
-    assert first is not None
+def test_unrelated_local_edits_are_not_staged(tmp_path):
+    workflow, repository = _workflow(tmp_path)
+    (repository / "mine.txt").write_text("keep me local\n", encoding="utf-8")
+    commit = _change(workflow, repository, "agent.txt", "agent work\n", "Add agent work")
 
-    workflow.begin_agent_run(1, "programmer", repository)
-    changed.write_text("two\n", encoding="utf-8")
-    second = workflow.finish_agent_run(1, "programmer", "run-2", repository, "Update feature")
-    assert second is not None
-
-    with pytest.raises(GitWorkflowError, match="current HEAD"):
-        workflow.rollback(1, repository, first["commit_hash"])
-
-    rolled_back = workflow.rollback(1, repository, second["commit_hash"])
-    assert rolled_back["head"] == first["merge_hash"]
-    assert changed.read_text(encoding="utf-8") == "one\n"
-
-    reverted = workflow.revert(1, repository, first["commit_hash"])
-    assert reverted["reverted"] == first["commit_hash"]
-    assert not changed.exists()
-    assert workflow.commit(1, first["commit_hash"])["state"] == "reverted"
+    assert commit and not commit.get("held")
+    assert "mine.txt" in _git(workflow, repository, "status", "--porcelain")
+    assert "mine.txt" not in _git(workflow, repository, "show", "--format=", "--name-only", "HEAD")
 
 
-def test_configure_adds_remote_url_and_pushes_main_and_agent_branches(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
+def test_overlapping_local_edit_holds_patch_without_overwrite(tmp_path):
+    workflow, repository = _workflow(tmp_path)
+    run = workflow.begin_agent_run(1, "programmer", repository, "run-overlap")
+    (Path(run["workspace"]) / "same.txt").write_text("agent\n", encoding="utf-8")
+    (repository / "same.txt").write_text("mine\n", encoding="utf-8")
+
+    held = workflow.finish_agent_run(1, "programmer", "run-overlap", repository, "Change same", run["change_id"])
+    assert held and held["held"] is True
+    assert (repository / "same.txt").read_text(encoding="utf-8") == "mine\n"
+    detail = workflow.change_detail(1, held["change_id"])
+    assert detail["state"] == "held_conflict"
+    assert "same.txt" in detail["diff"]
+
+
+def test_pushes_current_branch_not_role_branch(tmp_path):
+    workflow, repository = _workflow(tmp_path)
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    workflow.configure(1, repository, "team-main", remote="gh", remote_url=str(remote))
 
-    workflow.configure(1, repository, "team-main", remote="main", remote_url=str(remote))
-    assert _git(workflow, repository, "remote", "get-url", "main") == str(remote)
-    workflow.configure(1, repository, "team-main", remote="gh")
-    assert _git(workflow, repository, "remote", "get-url", "gh") == str(remote)
-    assert "main" not in _git(workflow, repository, "remote").splitlines()
-
-    workflow.begin_agent_run(1, "programmer", repository)
-    (repository / "pushed.txt").write_text("remote\n", encoding="utf-8")
-    commit = workflow.finish_agent_run(1, "programmer", "run-remote", repository, "Push change")
-    assert commit is not None
-
-    pushed = workflow.push(1, repository, commit["commit_hash"])
-    assert pushed["remote"] == "gh"
-    assert pushed["main_branch"] == "team-main"
-    remote_refs = subprocess.run(
-        ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    assert "refs/heads/team-main" in remote_refs
-    assert "refs/heads/programmer" in remote_refs
+    commit = _change(workflow, repository, "pushed.txt", "remote\n", "Add remote work")
+    assert commit and commit.get("pushed")
+    refs = subprocess.run(["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"], check=True,
+                          capture_output=True, text=True).stdout
+    assert "refs/heads/team-main" in refs
+    assert "refs/heads/programmer" not in refs
 
 
-def test_main_branch_is_unambiguous_when_a_tag_has_the_same_name(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
-    workflow.begin_agent_run(1, "programmer", repository)
-    (repository / "seed.txt").write_text("seed\n", encoding="utf-8")
-    first = workflow.finish_agent_run(1, "programmer", "run-seed", repository, "Seed main")
-    assert first is not None
-    _git(workflow, repository, "tag", "team-main")
-    _git(workflow, repository, "checkout", "programmer")
-
-    run = workflow.begin_agent_run(1, "programmer", repository)
-
-    assert run["branch"] == "programmer"
-    assert _git(workflow, repository, "branch", "--show-current") == "programmer"
-
-
-def test_version_control_overview_and_branch_management(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
-    workflow.begin_agent_run(1, "programmer", repository)
-    (repository / "topology.txt").write_text("graph\n", encoding="utf-8")
-    assert workflow.finish_agent_run(1, "programmer", "run-graph", repository, "Create graph")
-
-    created = workflow.create_branch(1, repository, "review", "team-main")
-    assert created == {"branch": "review", "source": "team-main"}
+def test_activity_overview_separates_local_and_agent_work(tmp_path):
+    workflow, repository = _workflow(tmp_path)
+    committed = _change(workflow, repository, "agent.txt", "done\n", "Add work")
+    (repository / "my-commit.txt").write_text("committed locally\n", encoding="utf-8")
+    _git(workflow, repository, "add", "my-commit.txt")
+    _git(workflow, repository, "commit", "-m", "Save local work")
+    local_hash = _git(workflow, repository, "rev-parse", "HEAD")
+    (repository / "local.txt").write_text("still local\n", encoding="utf-8")
     overview = workflow.overview(1, repository, [{"role": "programmer", "name": "Programmer"}])
 
-    assert {item["name"] for item in overview["branches"]} >= {"team-main", "programmer", "review"}
-    assert overview["worktrees"][0]["primary"] is True
-    assert overview["agents"] == [{
-        "role": "programmer", "name": "Programmer", "enabled": True, "branch": "programmer",
-        "branch_exists": True, "merged_into_main": True,
+    assert committed and overview["agents"][0]["mode"] == "shared-current-branch"
+    assert any(item["path"] == "local.txt" for item in overview["working_changes"])
+    assert any(item["commit_hash"] == committed["commit_hash"] for item in overview["changes"])
+    agent_change = next(item for item in overview["changes"] if item["commit_hash"] == committed["commit_hash"])
+    assert agent_change["commit"] == {
+        "hash": committed["commit_hash"], "short_hash": committed["commit_hash"][:7],
+        "subject": "Add work", "author": "Neel Test", "date": agent_change["commit"]["date"],
+    }
+    local_commit = next(item for item in overview["local_commits"] if item["hash"] == local_hash)
+    assert local_commit["short_hash"] == local_hash[:7]
+    assert local_commit["subject"] == "Save local work"
+    assert local_commit["files"] == [{
+        "path": "my-commit.txt", "previous_path": "", "status": "A", "additions": 1, "deletions": 0,
     }]
-    assert overview["commits"]
-    assert any(item["agent_commit"] and item["subject"] == "agent(programmer): Create graph" for item in overview["commits"])
-    assert overview["commits_truncated"] is False
 
-    assert workflow.checkout_branch(1, repository, "review")["branch"] == "review"
-    with pytest.raises(GitWorkflowError, match="configured main branch"):
-        workflow.delete_branch(1, repository, "team-main")
+
+def test_discard_held_patch_and_normal_branch_tools_remain_available(tmp_path):
+    workflow, repository = _workflow(tmp_path)
+    run = workflow.begin_agent_run(1, "programmer", repository, "run-held")
+    (Path(run["workspace"]) / "same.txt").write_text("agent\n", encoding="utf-8")
+    (repository / "same.txt").write_text("local\n", encoding="utf-8")
+    held = workflow.finish_agent_run(1, "programmer", "run-held", repository, "Conflict", run["change_id"])
+    assert held and held["held"]
+    assert workflow.discard_change(1, held["change_id"])["state"] == "discarded"
+    (repository / "same.txt").unlink()
+    workflow.create_branch(1, repository, "topic", "team-main")
+    assert workflow.checkout_branch(1, repository, "topic")["branch"] == "topic"
     assert workflow.checkout_branch(1, repository, "team-main")["branch"] == "team-main"
-    assert workflow.delete_branch(1, repository, "review") == {"deleted": "review"}
+    assert workflow.delete_branch(1, repository, "topic") == {"deleted": "topic"}
 
 
-def test_commit_inspection_rebase_merge_and_revert_for_regular_commits(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
-
-    workflow.begin_agent_run(1, "programmer", repository)
-    (repository / "tracked.py").write_text("tracked = True\n", encoding="utf-8")
-    tracked = workflow.finish_agent_run(1, "programmer", "run-detail", repository, "Add tracked file")
-    assert tracked is not None
-    detail = workflow.commit_detail(1, repository, tracked["commit_hash"])
-    assert detail["hash"] == tracked["commit_hash"]
-    assert detail["files"][0]["path"] == "tracked.py"
-    assert "+tracked = True" in workflow.file_diff(1, repository, tracked["commit_hash"], "tracked.py")["diff"]
-
-    workflow.create_branch(1, repository, "topic", "team-main")
-    workflow.checkout_branch(1, repository, "topic")
-    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
-    _git(workflow, repository, "add", "topic.py")
-    _git(workflow, repository, "commit", "-m", "Topic change")
-    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
-
-    workflow.checkout_branch(1, repository, "team-main")
-    (repository / "main.py").write_text("main = True\n", encoding="utf-8")
-    _git(workflow, repository, "add", "main.py")
-    _git(workflow, repository, "commit", "-m", "Main change")
-    main_commit = _git(workflow, repository, "rev-parse", "HEAD")
-
-    rebased = workflow.rebase(1, repository, main_commit, "topic")
-    assert rebased["rebased"] == "topic"
-    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
-    rebased_topic = _git(workflow, repository, "rev-parse", "refs/heads/topic")
-    assert _git(workflow, repository, "merge-base", "--is-ancestor", main_commit, rebased_topic) == ""
-
-    merged = workflow.merge(1, repository, rebased_topic, "team-main")
-    assert merged["target_branch"] == "team-main"
-    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
-    assert (repository / "topic.py").is_file()
-    merge_detail = workflow.commit_detail(1, repository, merged["head"])
-    assert any(item["path"] == "topic.py" for item in merge_detail["files"])
-    assert "+topic = True" in workflow.file_diff(1, repository, merged["head"], "topic.py")["diff"]
-
-    reverted = workflow.revert(1, repository, rebased_topic)
-    assert reverted["reverted"] == rebased_topic
-    assert not (repository / "topic.py").exists()
-
-
-def test_merge_commit_into_all_branches_skips_branches_that_already_contain_it(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
-    workflow.begin_agent_run(1, "programmer", repository)
-    (repository / "base.py").write_text("base = True\n", encoding="utf-8")
-    assert workflow.finish_agent_run(1, "programmer", "run-base", repository, "Create base")
-
-    workflow.create_branch(1, repository, "topic", "team-main")
-    workflow.checkout_branch(1, repository, "topic")
-    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
-    _git(workflow, repository, "add", "topic.py")
-    _git(workflow, repository, "commit", "-m", "Topic change")
-    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
-    workflow.checkout_branch(1, repository, "team-main")
-    (repository / "base.py").write_text("keep my local edit\n", encoding="utf-8")
-
-    result = workflow.merge_into_all_branches(1, repository, topic_commit)
-
-    assert set(result["merged"]) == {"team-main", "programmer"}
-    assert result["skipped"] == ["topic"]
-    assert result["failed"] == []
-    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
-    assert (repository / "base.py").read_text(encoding="utf-8") == "keep my local edit\n"
-    for branch in ("team-main", "programmer"):
-        assert _git(workflow, repository, "merge-base", "--is-ancestor", topic_commit, f"refs/heads/{branch}") == ""
-
-    repeat = workflow.merge_into_all_branches(1, repository, topic_commit)
-    assert repeat["merged"] == []
-    assert set(repeat["skipped"]) == {"team-main", "programmer", "topic"}
-
-
-def test_consolidate_branches_integrates_divergent_heads_into_main_and_retains_refs(tmp_path):
-    workflow, repository, _ = _workflow(tmp_path)
-    workflow.begin_agent_run(1, "programmer", repository)
-    (repository / "base.py").write_text("base = True\n", encoding="utf-8")
-    assert workflow.finish_agent_run(1, "programmer", "run-base", repository, "Create base")
-
-    workflow.create_branch(1, repository, "topic", "team-main")
-    workflow.checkout_branch(1, repository, "topic")
-    (repository / "topic.py").write_text("topic = True\n", encoding="utf-8")
-    _git(workflow, repository, "add", "topic.py")
-    _git(workflow, repository, "commit", "-m", "Topic change")
-    topic_commit = _git(workflow, repository, "rev-parse", "HEAD")
-    workflow.checkout_branch(1, repository, "team-main")
-    (repository / "base.py").write_text("keep my local edit\n", encoding="utf-8")
-
-    result = workflow.consolidate_branches(1, repository)
-
-    assert result["main_branch"] == "team-main"
-    assert result["merged"] == ["topic"]
-    assert "programmer" in result["skipped"]
-    assert result["failed"] == []
-    assert result["consolidated"] is True
-    assert _git(workflow, repository, "merge-base", "--is-ancestor", topic_commit, "refs/heads/team-main") == ""
-    assert _git(workflow, repository, "branch", "--show-current") == "team-main"
-    assert (repository / "base.py").read_text(encoding="utf-8") == "keep my local edit\n"
-    overview = workflow.overview(1, repository, [{"role": "programmer", "name": "Programmer"}])
-    branches = {item["name"]: item for item in overview["branches"]}
-    assert branches["topic"]["merged_into_main"] is True
-    assert branches["programmer"]["merged_into_main"] is True
+def test_revert_remains_available_for_agent_commit(tmp_path):
+    workflow, repository = _workflow(tmp_path)
+    committed = _change(workflow, repository, "agent.txt", "done\n", "Add work")
+    assert committed
+    reverted = workflow.revert(1, repository, committed["commit_hash"])
+    assert reverted["reverted"] == committed["commit_hash"]
+    assert not (repository / "agent.txt").exists()

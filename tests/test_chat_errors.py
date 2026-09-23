@@ -563,7 +563,7 @@ def test_codex_auto_compaction_is_not_sent_as_a_host_command(tmp_path, monkeypat
     assert session["last_auto_compaction_at"]
 
 
-def test_codex_json_usage_includes_effective_context_window(tmp_path):
+def test_codex_context_usage_prefers_final_completed_prompt_input(tmp_path):
     team = AgentTeam(tmp_path)
     record = team._codex_usage_record([
         {"type": "thread.started", "thread_id": "thread-usage"},
@@ -575,13 +575,103 @@ def test_codex_json_usage_includes_effective_context_window(tmp_path):
                 "total_tokens": 1500,
             },
         }},
-        {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 300, "total_tokens": 1500}},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 900, "cached_input_tokens": 700,
+            "output_tokens": 300, "reasoning_output_tokens": 100,
+        }},
     ], {"context_window_tokens": 128000})
 
-    assert record["context_tokens"] == 1500
+    # The completed-turn input is authoritative when present.
+    assert record["context_tokens"] == 900
     assert record["context_window_tokens"] == 258400
-    assert record["source"] == "codex_token_count"
+    assert record["cached_input_tokens"] == 700
+    assert record["source"] == "codex_turn_completed_input"
     assert record["exact"] is True
+
+
+def test_codex_context_usage_uses_last_prompt_token_count_when_needed(tmp_path):
+    team = AgentTeam(tmp_path)
+    record = team._codex_usage_record([{
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 2_000_000, "total_tokens": 2_010_000},
+            "last_token_usage": {
+                "input_tokens": 1234, "cached_input_tokens": 987,
+                "output_tokens": 55, "reasoning_output_tokens": 12, "total_tokens": 1289,
+            },
+            "model_context_window": 258400,
+        }},
+    }], {"context_window_tokens": 128000})
+
+    assert record["input_tokens"] == 1234
+    assert record["context_tokens"] == 1234
+    assert record["cached_input_tokens"] == 987
+    assert record["source"] == "codex_last_prompt_input"
+
+
+def test_codex_context_meter_recovers_last_prompt_input_from_session_log(tmp_path, monkeypatch):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "codex", "gpt-test", "", "")
+    session_id = "01234567-89ab-cdef-0123-456789abcdef"
+    team.configs.save_codex_session("researcher", 1, session_id, "gpt-test", "")
+    # Simulate the old aggregate record that made the context meter unusable.
+    team.configs.save_context_usage(
+        "researcher", 1, "codex", "gpt-test", input_tokens=2_000_000,
+        total_tokens=2_010_000, context_tokens=2_010_000,
+        source="codex_turn_completed", exact=True,
+    )
+    sessions_root = tmp_path / "codex-sessions"
+    log_path = sessions_root / "2026" / "09" / "20" / f"rollout-test-{session_id}.jsonl"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text(json.dumps({
+        "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 2_000_000},
+            "last_token_usage": {"input_tokens": 2222, "cached_input_tokens": 1800, "output_tokens": 31},
+            "model_context_window": 258400,
+        }},
+    }) + "\n")
+    monkeypatch.setattr(team, "_codex_sessions_root", lambda: sessions_root)
+
+    usage = team.context_usage("researcher", 1)
+
+    assert usage["used_tokens"] == 2222
+    assert usage["cached_input_tokens"] == 1800
+    assert usage["context_window_tokens"] == 258400
+    assert usage["usage_source"] == "codex_last_prompt_input"
+    assert team.configs.context_usage("researcher", 1)["input_tokens"] == 2222
+
+
+def test_codex_context_meter_uses_completed_prompt_input(tmp_path):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "codex", "gpt-test", "", "")
+    team.configs.save_context_usage(
+        "researcher", 1, "codex", "gpt-test",
+        input_tokens=1200, cached_input_tokens=500, output_tokens=300,
+        total_tokens=1500, context_tokens=1500, context_window_tokens=258400,
+        source="codex_turn_completed_input", exact=True, context_window_exact=True,
+    )
+
+    usage = team.context_usage("researcher", 1)
+
+    assert usage["used_tokens"] == 1200
+    assert usage["remaining_tokens"] == 257200
+    assert usage["cached_input_tokens"] == 500
+
+
+def test_codex_context_meter_ignores_legacy_token_count_telemetry(tmp_path):
+    team = AgentTeam(tmp_path)
+    team.configs.save("researcher", "codex", "gpt-test", "", "")
+    team.configs.save_context_usage(
+        "researcher", 1, "codex", "gpt-test",
+        input_tokens=1200, output_tokens=300, total_tokens=1500,
+        context_tokens=1500, context_window_tokens=258400,
+        source="codex_token_count", exact=True, context_window_exact=True,
+    )
+
+    usage = team.context_usage("researcher", 1)
+
+    assert usage["used_tokens"] == 0
+    assert usage["usage_source"] == "awaiting_codex_telemetry"
 
 
 def test_api_and_compatible_providers_compact_to_saved_summary(tmp_path, monkeypatch):

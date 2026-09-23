@@ -64,7 +64,7 @@ HARD_IGNORED_NAMES = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "env", "_venv",
     "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", ".idea", ".vscode", "data", "dist", "build",
-    ".ssh", ".aws", ".gnupg",
+    ".ssh", ".aws", ".gnupg", "maw",
 })
 SENSITIVE_PATTERNS = (
     ".env*", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",

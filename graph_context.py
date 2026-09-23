@@ -38,8 +38,19 @@ DEFAULT_IGNORED_NAMES = frozenset(
         "__pycache__",
         ".pytest_cache",
         "data",
+        "maw",
         ".env",
         ".env.local",
+    }
+)
+PROJECT_TREE_COLLAPSED_NAMES = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
     }
 )
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
@@ -131,6 +142,67 @@ class GraphContextStore:
     MAX_FILES = 5_000
     MAX_BYTES = 8 * 1024 * 1024
     MAX_TEXT_CHARS = MAX_TEXT_BYTES
+
+    @classmethod
+    def project_tree(
+        cls,
+        project_root: Path,
+        max_entries: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a lightweight explorer tree without reading file contents.
+
+        ``maw`` is intentionally absent because it contains this application's
+        own runtime state. Large dependency/cache folders remain visible as
+        muted, collapsed stubs so Project view is useful without traversing
+        thousands of generated files.
+        """
+
+        root = cls.resolve_project_root(project_root)
+        limit = max(1, min(int(max_entries or cls.MAX_FILES), cls.MAX_FILES))
+        items: list[dict[str, Any]] = []
+        pending = [root]
+        truncated = False
+
+        while pending:
+            directory = pending.pop()
+            try:
+                children = sorted(directory.iterdir(), key=lambda path: (not path.is_dir(), path.name.casefold()))
+            except OSError:
+                continue
+            descend: list[Path] = []
+            for path in children:
+                if path.is_symlink() or path.name == "maw":
+                    continue
+                if len(items) >= limit:
+                    truncated = True
+                    pending.clear()
+                    break
+                try:
+                    is_directory = path.is_dir()
+                    is_file = path.is_file()
+                    size = 0 if is_directory else path.stat().st_size
+                except OSError:
+                    continue
+                if not is_directory and not is_file:
+                    continue
+                relative = path.relative_to(root).as_posix()
+                collapsed = is_directory and path.name in PROJECT_TREE_COLLAPSED_NAMES
+                items.append(
+                    {
+                        "id": f"project-tree:{relative}",
+                        "path": relative,
+                        "name": path.name,
+                        "node_type": "folder" if is_directory else "file",
+                        "size": size,
+                        "tree_excluded": collapsed or path.name.startswith("."),
+                        "children_omitted": collapsed,
+                    }
+                )
+                if is_directory and not collapsed:
+                    descend.append(path)
+            pending.extend(reversed(descend))
+
+        return {"items": items, "truncated": truncated, "limit": limit}
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)

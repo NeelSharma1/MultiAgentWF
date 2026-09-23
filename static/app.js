@@ -103,9 +103,15 @@ const state={
   activeWorkflowMemoryId: 0,
    contextAgent: null,
    active: 'orchestrator',
-   graphContext: [],
-   selectedGraphNodeId: null,
-   graphContextBusy: false,
+    graphContext: [],
+    graphProjectContext: [],
+    graphScope: 'indexed',
+    graphExpanded: {'': true},
+    graphProjectLoaded: false,
+    graphProjectTruncated: false,
+    selectedGraphNodeId: null,
+    graphContextBusy: false,
+    graphTreeLoading: false,
    ragStatus: null,
    ragJob: null,
    ragPollPromise: null,
@@ -121,6 +127,7 @@ const state={
   providerCommands: [],
   commandHistory: loadCommandHistory(),
   historySearch: '',
+  historyMatchIndex: 0,
   commandIndex: 0,
   drawingLink: null,
   relationshipMode: 'move',
@@ -167,7 +174,7 @@ function stopFollowingMessages(box=$('#messages')){
 function updateLatestMessagesButton(){
   const box=$('#messages'), button=$('#jump-to-latest');
   if(!box||!button)return;
-  const show=!messagesPinnedToLatest&&box.scrollHeight>box.clientHeight+4;
+  const show=!state.historySearch.trim()&&!messagesPinnedToLatest&&box.scrollHeight>box.clientHeight+4;
   button.classList.toggle('hidden',!show);
   button.setAttribute('aria-hidden',String(!show))
 }
@@ -411,10 +418,8 @@ document.querySelectorAll('.settings-tabs a').forEach(tab=>tab.addEventListener(
   event.preventDefault();
   const target=tab.getAttribute('href');
   if(target==='#dashboard')showDashboard();
-   else if(target==='#workspace'||target==='#graph-context'){
-     showWorkspace();
-     if(target==='#graph-context')setTimeout(()=>$('#graph-context')?.scrollIntoView({behavior:'smooth',block:'start'}),0)
-  }else if(target==='#version-control')showVersionControl().catch(err=>alert(err.message));
+  else if(target==='#workspace')showWorkspace();
+  else if(target==='#version-control')showVersionControl().catch(err=>alert(err.message));
   document.querySelectorAll('.settings-tabs a').forEach(item=>item.classList.toggle('active',item===tab));
 }));
 function renderProjects(){
@@ -793,7 +798,7 @@ function gitCommitCard(commit){
   const card=document.createElement('article'), head=document.createElement('div'), title=document.createElement('div'), hash=document.createElement('strong'), meta=document.createElement('span'), actions=document.createElement('div'), files=document.createElement('div');
   card.className='git-commit-card'; head.className='git-commit-head'; actions.className='git-commit-actions'; files.className='git-file-list';
   hash.textContent=commit.commit_hash.slice(0,12);
-  meta.textContent=`${commit.message} / ${commit.agent_branch||commit.role} → ${commit.main_branch||state.gitStatus?.main_branch||state.gitStatus?.branch||'main'} / ${commit.state}${commit.pushed?' / pushed':''}`;
+  meta.textContent=`${commit.message} / ${commit.role} on ${commit.target_branch||commit.main_branch||state.gitStatus?.current_branch||state.gitStatus?.branch||'current branch'} / ${commit.state}${commit.pushed?' / pushed':''}`;
   title.append(hash, meta); head.append(title, actions);
   const invoke=async(path, method, body=null)=>{
     await api(`/api/projects/${state.project.id}/git/commits/${commit.commit_hash}/${path}`, {method, body:body?JSON.stringify(body):undefined});
@@ -1339,6 +1344,7 @@ function renderVersionControl(data){
     ? `On main branch “${main}” · ${data.clean?'working tree clean':'uncommitted changes'}`
     : `On branch “${current}”${main?` · main branch “${main}”`:''} · ${data.clean?'working tree clean':'uncommitted changes'}`;
   status.textContent=state.versionConsolidationStatus?`${baseStatus} · ${state.versionConsolidationStatus}`:baseStatus;
+  renderGitCollaboration(data);
   if(consolidateButton)consolidateButton.disabled=state.versionConsolidationBusy||!main;
   const branchItems=data.branches||[];
   if(state.versionGraphConsolidated&&branchItems.some(item=>!item.main&&!item.merged_into_main)){
@@ -1375,13 +1381,111 @@ function renderVersionControl(data){
     const checkout=document.createElement('button'); checkout.type='button'; checkout.className='secondary compact'; checkout.textContent=item.current?'Checked out':'Checkout'; checkout.disabled=item.current;
     checkout.onclick=async()=>{try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}/checkout`,{method:'POST'});await loadVersionControl()}catch(err){alert(err.message)}};
     const agentBranch=(data.agents||[]).some(agent=>agent.enabled&&agent.branch===item.name);
-    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent='Delete'; remove.disabled=item.main||item.current||agentBranch;
-    remove.onclick=async()=>{if(!confirm(`Delete branch '${item.name}'?`))return;try{await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}`,{method:'DELETE'});await loadVersionControl()}catch(err){alert(err.message)}};
+    const remove=document.createElement('button'); remove.type='button'; remove.className='danger compact'; remove.textContent=agentBranch?'Disable Git & delete':'Delete'; remove.disabled=item.main||item.current;
+    remove.title=item.main?'The configured main branch cannot be deleted.':item.current?'Check out another branch before deleting this branch.':agentBranch?'Disable this agent’s Git workflow and safely delete its branch.':'Delete this merged local branch.';
+    remove.onclick=async()=>{
+      const message=agentBranch
+        ? `Disable Git for the '${item.name}' agent and delete its local branch? Git will only delete it when it is already merged.`
+        : `Delete branch '${item.name}'? Git will only delete it when it is already merged.`;
+      if(!confirm(message))return;
+      try{
+        const suffix=agentBranch?'?disable_agent=true':'';
+        await api(`/api/projects/${state.project.id}/git/branches/${encodeURIComponent(item.name)}${suffix}`,{method:'DELETE'});
+        await loadVersionControl()
+      }catch(err){alert(err.message)}
+    };
     actions.append(checkout,remove); row.append(info,actions); branches.append(row)
   });
   const selected=branchItems.filter(item=>selectedNames.has(item.name));
   $('#version-branch-detail').textContent=selected.length?`${selected.map(item=>item.name).join(', ')} highlighted · ${selected.length===1?(selected[0].main?'configured main branch':selected[0].current?'checked out':'local branch'):'multiple branches selected'}`:'Select a branch to inspect it.';
   renderVersionAgentList(data)
+}
+function renderGitCollaboration(data){
+  const list=$('#version-collaboration-list');
+  if(!list)return;
+  list.innerHTML='';
+  const local=data.working_changes||[], changes=data.changes||[], localCommits=data.local_commits||[];
+  if(!local.length&&!changes.length&&!localCommits.length){list.innerHTML='<div class="version-empty">No local edits or agent changes are currently being tracked.</div>';return}
+  if(local.length){
+    const row=document.createElement('article');row.className='git-commit-card local-activity-card';
+    const head=document.createElement('div');head.className='git-commit-head';
+    const title=document.createElement('div'), name=document.createElement('strong'), meta=document.createElement('span');
+    name.textContent='Uncommitted local edits · current working tree';
+    meta.textContent=`${local.length} file${local.length===1?'':'s'} · protected from agent staging`;
+    title.append(name,meta);head.append(title);
+    const files=local.map(item=>({
+      path:item.path, status:item.state==='new'?'A':item.state==='deleted'?'D':'M',
+      additions:item.additions, deletions:item.deletions,
+    }));
+    row.append(head,createChangeFileSummary(files,'local edits'));
+    list.append(row)
+  }
+  const timestamp=value=>{
+    const time=Date.parse(value||'');
+    return Number.isFinite(time)?time:0
+  };
+  const history=[
+    ...changes.map(change=>({kind:'agent',value:change,timestamp:change.updated_at||change.created_at})),
+    ...localCommits.map(commit=>({kind:'local',value:commit,timestamp:commit.timestamp||commit.date})),
+  ].sort((left,right)=>timestamp(right.timestamp)-timestamp(left.timestamp));
+  history.forEach(item=>{
+    if(item.kind==='local'){
+      const commit=item.value, row=document.createElement('article');row.className='git-commit-card local-commit-card';
+      const head=document.createElement('div');head.className='git-commit-head';
+      const title=document.createElement('div'), name=document.createElement('strong'), meta=document.createElement('span');
+      name.textContent=`${commit.short_hash||String(commit.hash||'').slice(0,7)} · ${commit.subject||'Local commit'}`;
+      meta.textContent=`Local commit · ${commit.author||'Unknown author'} · ${commit.date||''}`;
+      title.append(name,meta);head.append(title);
+      const actions=document.createElement('div');actions.className='git-commit-actions';
+      const inspect=document.createElement('button');inspect.type='button';inspect.className='secondary compact';inspect.textContent='Inspect commit';
+      inspect.onclick=()=>selectVersionCommit(commit.hash);
+      actions.append(inspect);head.append(actions);
+      row.append(head,createChangeFileSummary(commit.files||[],'committed'));list.append(row);
+      return
+    }
+    const change=item.value;
+    const row=document.createElement('article');row.className='git-commit-card';
+    const head=document.createElement('div');head.className='git-commit-head';
+    const title=document.createElement('div'), name=document.createElement('strong'), meta=document.createElement('span');
+    const commit=change.commit;
+    name.textContent=commit
+      ? `${change.role} · ${commit.short_hash} · ${commit.subject||'Agent commit'}`
+      : `${change.role} · ${change.state}`;
+    meta.textContent=commit
+      ? `Agent commit · ${change.state} · ${commit.date||''}`
+      : `${change.target_branch} · ${(change.files||[]).map(file=>file.path).join(', ')||'waiting for files'}`;
+    title.append(name,meta);head.append(title);
+    const actions=document.createElement('div');actions.className='git-commit-actions';
+    const inspect=document.createElement('button');inspect.type='button';inspect.className='secondary compact';inspect.textContent='Inspect patch';
+    inspect.onclick=async()=>{try{const detail=await api(`/api/projects/${state.project.id}/git/changes/${encodeURIComponent(change.id)}`);alert(`${detail.state}\n\n${detail.diff||detail.review_detail||'No retained patch.'}`)}catch(err){alert(err.message)}};
+    actions.append(inspect);
+    if(['held_conflict','prepared','push_failed','rejected'].includes(change.state)){
+      const discard=document.createElement('button');discard.type='button';discard.className='danger compact';discard.textContent='Discard';
+      discard.onclick=async()=>{if(!confirm('Discard this retained agent patch?'))return;try{await api(`/api/projects/${state.project.id}/git/changes/${encodeURIComponent(change.id)}/discard`,{method:'POST'});await loadVersionControl()}catch(err){alert(err.message)}};
+      actions.append(discard)
+    }
+    head.append(actions);row.append(head,createChangeFileSummary(change.files||[],change.state));list.append(row)
+  })
+}
+function createChangeFileSummary(files, state='completed'){
+  const card=document.createElement('section');card.className='change-file-summary';
+  const complete=['committed','pushed','completed'].includes(state), header=document.createElement('div');header.className='change-file-summary-status';
+  const local=state==='local edits';
+  header.innerHTML=`<span>${complete?'✓':'•'}</span><strong>${complete?'Done':local?'Local changes':state.replaceAll('_',' ')}</strong>`;card.append(header);
+  const groups=[['Changed Files',files.filter(file=>!['A','?'].includes(String(file.status||'').charAt(0)))],['New Files',files.filter(file=>['A','?'].includes(String(file.status||'').charAt(0)))]];
+  groups.forEach(([label,items])=>{
+    if(!items.length)return;
+    const group=document.createElement('div');group.className='change-file-summary-group';
+    const heading=document.createElement('strong');heading.textContent=label;group.append(heading);
+    items.forEach(file=>{
+      const row=document.createElement('div');row.className='change-file-summary-row';
+      const path=document.createElement('code'), stats=document.createElement('span');path.textContent=file.path||'unknown file';
+      const add=Number(file.additions), remove=Number(file.deletions);
+      stats.innerHTML=`${Number.isFinite(add)?`<b>+${add}</b>`:''}${Number.isFinite(remove)?`<em>-${remove}</em>`:''}`;
+      row.append(path,stats);group.append(row)
+    });card.append(group)
+  });
+  return card
 }
 async function openVersionControl(){
   return showVersionControl()
@@ -1548,6 +1652,10 @@ async function selectProject(id){
   state.ragStatus=null;
   state.ragJob=null;
   state.ragPollPromise=null;
+  state.graphProjectLoaded=false;
+  state.graphProjectContext=[];
+  state.graphProjectTruncated=false;
+  state.graphExpanded={'':true};
   state.graphContextBusy=false;
   state.busy.clear();
   localStorage.setItem('multiagent-project', String(id));
@@ -1688,9 +1796,11 @@ function renderContextMeter(){
   const used=formatTokenCount(usage.used_tokens ?? usage.estimated_tokens);
   if(agent.runtime?.provider==='codex'){
     const window=Number(usage.context_window_tokens)||0;
+    const cached=Number(usage.cached_input_tokens)||0;
     const compacted=Number(usage.auto_compaction_count)||0;
     const last=usage.last_auto_compaction_at?` · auto-compacted ${new Date(usage.last_auto_compaction_at).toLocaleString()}`:compacted?` · auto-compacted ${compacted}×`:'';
-    $('#context-detail').textContent=window?`${used} of ${formatTokenCount(window)} tokens · Codex reported${last}`:`Codex reports its active context after a run${last}`;
+    const cacheDetail=cached?` · ${formatTokenCount(cached)} cached (included)`:'';
+    $('#context-detail').textContent=window?`${used} of ${formatTokenCount(window)} context tokens · latest completed Codex prompt${cacheDetail}${last}`:`Codex reports its active context after a run${last}`;
   }else{
     $('#context-detail').textContent=`${used} input tokens · compacts at ${formatTokenCount(usage.context_window_tokens)} · locally counted`;
   }
@@ -3121,8 +3231,9 @@ function renderRunEvents(events=[]){
     }
     if(event.event_type==='git_summary'){
       appendRunEventText(body,'Commit',payload.commit_hash);
-      appendRunEventText(body,'Branch',payload.agent_branch&&payload.main_branch?`${payload.agent_branch} → ${payload.main_branch}`:payload.agent_branch);
-      (payload.files||[]).forEach(file=>appendRunEventText(body,file.status||'Changed',file.path,'run-event-code'))
+      appendRunEventText(body,'Branch',payload.target_branch||payload.main_branch);
+      appendRunEventText(body,'Status',payload.held?payload.detail:(payload.pushed?'Committed and pushed':'Committed'));
+      if((payload.files||[]).length)body.append(createChangeFileSummary(payload.files,payload.held?'held_conflict':payload.pushed?'pushed':'committed'));
     }
     if(event.event_type==='tool'){
       appendRunEventText(body,'Tool',[payload.toolset,payload.tool].filter(Boolean).join('/'));
@@ -3165,18 +3276,76 @@ function wireSourceCitations(container, events=[]){
     node.replaceWith(fragment)
   })
 }
-function renderMessages(){
+function escapeHistorySearch(value){
+  return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')
+}
+function highlightHistoryMatches(container, query){
+  if(!query)return;
+  const expression=new RegExp(escapeHistorySearch(query),'gi'), nodes=[];
+  const walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT,{
+    acceptNode(node){
+      const parent=node.parentElement, value=node.nodeValue||'';
+      if(!value.toLowerCase().includes(query.toLowerCase())||parent?.closest('button,script,style,mark.history-match'))return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT
+    }
+  });
+  while(walker.nextNode())nodes.push(walker.currentNode);
+  nodes.forEach(node=>{
+    const value=node.nodeValue||'', fragment=document.createDocumentFragment();
+    let cursor=0, match;
+    expression.lastIndex=0;
+    while((match=expression.exec(value))){
+      if(match.index>cursor)fragment.append(document.createTextNode(value.slice(cursor,match.index)));
+      const mark=document.createElement('mark');
+      mark.className='history-match';
+      mark.textContent=match[0];
+      fragment.append(mark);
+      cursor=match.index+match[0].length
+    }
+    if(cursor<value.length)fragment.append(document.createTextNode(value.slice(cursor)));
+    node.replaceWith(fragment)
+  })
+}
+function updateHistoryMatchSelection({scroll=false}={}){
+  const query=state.historySearch.trim(), matches=[...document.querySelectorAll('#messages mark.history-match')];
+  const count=$('#history-count'), previous=$('#history-match-previous'), next=$('#history-match-next');
+  previous?.toggleAttribute('disabled',!matches.length);
+  next?.toggleAttribute('disabled',!matches.length);
+  if(!query)return;
+  if(!matches.length){
+    state.historyMatchIndex=0;
+    if(count)count.textContent='No matches';
+    return
+  }
+  state.historyMatchIndex=((state.historyMatchIndex%matches.length)+matches.length)%matches.length;
+  matches.forEach((match,index)=>{
+    const active=index===state.historyMatchIndex;
+    match.classList.toggle('active',active);
+    if(active)match.setAttribute('aria-current','true');
+    else match.removeAttribute('aria-current')
+  });
+  if(count)count.textContent=`${state.historyMatchIndex+1} of ${matches.length} matches`;
+  if(scroll)matches[state.historyMatchIndex].scrollIntoView({block:'center',inline:'nearest'})
+}
+function navigateHistoryMatches(direction){
+  const matches=document.querySelectorAll('#messages mark.history-match');
+  if(!matches.length)return;
+  state.historyMatchIndex=(state.historyMatchIndex+direction+matches.length)%matches.length;
+  updateHistoryMatchSelection({scroll:true})
+}
+function renderMessages({scrollToHistoryMatch=false}={}){
   const box=$('#messages'),
   allItems=(state.messages[state.active]||[]).filter(m=>!m.internal),
   query=state.historySearch.trim().toLowerCase(),
   items=query?allItems.filter(m=>`${m.text||''} ${m.by||''}`.toLowerCase().includes(query)):allItems;
-  const preserveScrollPosition=!messagesPinnedToLatest,
+  const preserveScrollPosition=Boolean(query)||!messagesPinnedToLatest,
   previousScrollTop=box.scrollTop;
   messagesRendering=true;
   observeMessagesForAutoScroll();
+  box.classList.toggle('searching',Boolean(query));
   box.innerHTML=items.length?'': `<div class="empty"><strong>${query?'No matching messages':'Start a conversation'}</strong><span>${query?'Try a different search term.':'Type / to browse commands. This role keeps its own transcript.'}</span></div>`;
   const count=$('#history-count');
-  if(count)count.textContent=query?`${items.length} of ${allItems.length} messages`:allItems.length?`${allItems.length} messages`:'';
+  if(count)count.textContent=query?'Searching…':allItems.length?`${allItems.length} messages`:'';
   items.forEach(m=>{
     const wrap=document.createElement('article');
     const compiled=Boolean(m.compiled&&m.compiled_parts?.length);
@@ -3312,6 +3481,7 @@ function renderMessages(){
     const activity=renderRunEvents(m.events);
     if(activity)wrap.append(activity);
     wrap.append(bubble, actions);
+    if(query)highlightHistoryMatches(wrap,query);
     box.append(wrap)
   });
   const liveEvents=state.runEvents[state.active]||[], liveRun=String(state.runs[state.active]||'');
@@ -3326,7 +3496,15 @@ function renderMessages(){
   // Every agent has its own transcript. Keep pinned chats at the newest
   // message, but preserve the user's position when they are reading above it.
   observeMessagesForAutoScroll();
-  scrollMessagesToLatest()
+  if(query){
+    messagesPinnedToLatest=false;
+    cancelScheduledMessagesScroll();
+    updateHistoryMatchSelection({scroll:scrollToHistoryMatch});
+    updateLatestMessagesButton()
+  }else{
+    updateHistoryMatchSelection();
+    scrollMessagesToLatest()
+  }
 }
 async function respondToPermissionRequest(message, approved){
   const request=message.permission_request, role=state.active, projectId=state.project?.id;
@@ -3542,7 +3720,90 @@ async function loadTemplates(){
   const box=$('#agent-template-select');
   box.innerHTML='<option value="">No template</option>'+state.templates.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')
 }
-function graphNodeById(id){return state.graphContext.find(node=>String(node.id)===String(id))||null}
+function graphScopeItems(){
+  const documents=state.ragStatus?.documents_detail||state.graphContext||[];
+  if(state.graphScope==='indexed')return documents.map(node=>({...node,tree_hidden:false}));
+  const indexed=new Map(documents.map(item=>[String(item.path||''),item]));
+  return state.graphProjectContext.map(node=>{
+    const path=String(node.path||''), document=indexed.get(path), tracked=Boolean(document);
+    return {...node, node_type:node.node_type==='project'?'folder':node.node_type,
+      rag_status:node.node_type==='file'?(document?.status||'not-indexed'):'',
+      chunk_count:Number(document?.chunk_count||0), rag_document_id:document?.id||null,
+      size:Number(document?.size||node.size||0), indexed_at:document?.indexed_at||'',
+      tree_hidden:Boolean(node.tree_excluded)||!tracked};
+  });
+}
+function graphNodeById(id){return graphScopeItems().find(node=>String(node.id)===String(id))||null}
+function buildGraphTree(items){
+  const root={id:'graph-root',path:'',name:state.project?.name||'Project',node_type:'folder',children:[],tree_hidden:false};
+  const byPath=new Map([['',root]]);
+  [...items].sort((a,b)=>String(a.path||'').localeCompare(String(b.path||''),undefined,{numeric:true,sensitivity:'base'})).forEach(item=>{
+    const path=String(item.path||'').replace(/^\/+|\/+$/g,''); if(!path)return;
+    const parts=path.split('/'); let parent=root; let currentPath='';
+    parts.forEach((part,index)=>{
+      currentPath=currentPath?`${currentPath}/${part}`:part;
+      let node=byPath.get(currentPath);
+      if(!node){node={id:`graph-folder:${currentPath}`,path:currentPath,name:part,node_type:index===parts.length-1?(item.node_type||'file'):'folder',children:[],tree_hidden:false};byPath.set(currentPath,node);parent.children.push(node)}
+      if(index===parts.length-1)Object.assign(node,item,{path:currentPath,name:item.name||part,children:node.children||[]});
+      parent=node;
+    });
+  });
+  const prepare=node=>{
+    node.children.sort((a,b)=>{const af=a.node_type!=='file',bf=b.node_type!=='file';return af!==bf?(af?-1:1):a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'})});
+    const hasVisibleChild=node.children.map(prepare).some(Boolean);
+    if(node.node_type!=='file'&&node.id!=='graph-root'&&state.graphScope==='project')node.tree_hidden=!hasVisibleChild;
+    return node.node_type==='file'?!node.tree_hidden:hasVisibleChild
+  };
+  prepare(root); return root;
+}
+function graphNodeStatus(node){return String(node.rag_status||node.status||'').toLowerCase()}
+function graphFileKind(name){
+  const lower=String(name||'').toLowerCase(), extension=lower.split('.').pop();
+  if(lower.startsWith('.env'))return 'env';
+  if(lower==='.gitignore'||lower==='.gitattributes'||lower==='.gitmodules')return 'git';
+  if(extension==='py')return 'python';
+  if(['js','jsx','mjs','cjs'].includes(extension))return 'javascript';
+  if(['ts','tsx'].includes(extension))return 'typescript';
+  if(['html','htm','vue','svelte'].includes(extension))return 'html';
+  if(['css','scss','sass','less'].includes(extension))return 'css';
+  if(['rb','go','rs','java','kt','swift','c','cc','cpp','h','hpp'].includes(extension))return 'code';
+  if(['md','mdx','txt','rst','pdf','doc','docx'].includes(extension))return 'document';
+  if(['json','jsonl','yaml','yml','toml','xml','csv','tsv','sql'].includes(extension))return 'data';
+  if(['env','ini','cfg','conf','lock'].includes(extension)||String(name||'').startsWith('.'))return 'config';
+  return 'generic'
+}
+function graphFolderKind(name){
+  const lower=String(name||'').toLowerCase();
+  if(lower==='.agents')return 'agents';
+  if(['.venv','venv'].includes(lower))return 'python';
+  if(['static','public','web','frontend'].includes(lower))return 'web';
+  if(['test','tests','__tests__'].includes(lower))return 'tests';
+  if(lower==='maw')return 'runtime';
+  if(lower==='node_modules'||lower.endsWith('.egg-info'))return 'generated';
+  return 'generic'
+}
+function graphIconLabel(kind){return {javascript:'JS',typescript:'TS',html:'<>',css:'≋',python:'Py',env:'☷',git:'◇',data:'{}',document:'≡',code:'</>'}[kind]||''}
+function toggleGraphFolder(path){state.graphExpanded[path]=!state.graphExpanded[path];renderGraphContext()}
+function renderGraphTreeNode(node,parent,depth=1){
+  const wrapper=document.createElement('div');wrapper.className='graph-context-tree-node';
+  const row=document.createElement('div');row.className='graph-context-tree-row';row.tabIndex=0;row.setAttribute('role','treeitem');row.setAttribute('aria-level',String(depth));
+  const folder=node.node_type!=='file',hasChildren=folder&&node.children?.length>0,expanded=Boolean(state.graphExpanded[node.path]);
+  row.classList.toggle('folder',folder);row.classList.toggle('file',!folder);row.classList.toggle('muted',Boolean(node.tree_hidden));row.classList.toggle('root',node.id==='graph-root');
+  if(folder)row.setAttribute('aria-expanded',String(expanded));
+  const toggle=document.createElement('button');toggle.type='button';toggle.className=`graph-context-tree-toggle ${expanded?'expanded':''} ${hasChildren?'':'empty'}`;toggle.tabIndex=-1;toggle.setAttribute('aria-label',`${expanded?'Collapse':'Expand'} ${node.name}`);toggle.onclick=event=>{event.stopPropagation();if(hasChildren)toggleGraphFolder(node.path)};
+  const iconKind=folder?(node.id==='graph-root'?'project':graphFolderKind(node.name)):graphFileKind(node.name);
+  const icon=document.createElement('span');icon.className=`graph-context-tree-icon ${folder?`folder ${iconKind}`:`file ${iconKind}`} ${expanded?'open':''}`;icon.dataset.label=graphIconLabel(iconKind);icon.setAttribute('aria-hidden','true');
+  const name=document.createElement('span');name.className='graph-context-tree-name';name.textContent=node.name||node.path||'.';
+  const status=graphNodeStatus(node),dot=document.createElement('span');dot.className=`graph-context-tree-status ${status||'none'}`;dot.setAttribute('aria-hidden','true');
+  if(!folder&&status&&status!=='not-indexed')dot.title=status.replace('-', ' ');
+  const meta=document.createElement('span');meta.className='graph-context-tree-meta';meta.textContent=node.children_omitted?'…':'';if(node.children_omitted)meta.title='Generated folder contents are collapsed';
+  const detail=!folder?(status==='not-indexed'?'Not included in RAG':`${status||'indexed'}${node.chunk_count?` · ${node.chunk_count} chunks`:''}`):(node.children_omitted?'Generated folder contents are collapsed':node.path||'Project root');
+  row.title=`${node.path||state.project?.root_path||node.name}${detail?` — ${detail}`:''}`;
+  row.append(toggle,icon,name,dot,meta);row.classList.toggle('selected',String(node.id)===String(state.selectedGraphNodeId));
+  const activate=()=>{if(folder){if(hasChildren)toggleGraphFolder(node.path)}else selectGraphNode(node,status!=='not-indexed')};
+  row.onclick=activate;row.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();activate()}else if(event.key==='ArrowRight'&&folder&&!expanded)toggleGraphFolder(node.path);else if(event.key==='ArrowLeft'&&folder&&expanded)toggleGraphFolder(node.path)};
+  wrapper.append(row);if(folder&&hasChildren&&expanded){const children=document.createElement('div');children.className='graph-context-tree-children';children.setAttribute('role','group');node.children.forEach(child=>renderGraphTreeNode(child,children,depth+1));wrapper.append(children)}parent.append(wrapper);
+}
 function ragSettingsPayload(){
   const provider=$('#rag-provider').value||'ollama';
   return {
@@ -3590,41 +3851,30 @@ async function testRagEmbedding(){
 function renderGraphContext(){
   const box=$('#graph-context-list');
   if(!box)return;
-  const status=state.ragStatus||{}, selected=graphNodeById(state.selectedGraphNodeId), summary=$('#graph-context-scope-summary');
-  $('#graph-context-count').textContent=status.enabled?`${status.chunks||0}`:'Off';
+  const status=state.ragStatus||{}, summary=$('#graph-context-scope-summary'), items=graphScopeItems(), files=items.filter(item=>item.node_type==='file'), fileCount=files.length, hiddenCount=files.filter(item=>item.tree_hidden).length;
+  if($('#graph-context-scope'))$('#graph-context-scope').value=state.graphScope;
+  $('#graph-context-count').textContent=`${fileCount}`;
   $('#scan-graph-context').textContent=status.enabled?'Disable retrieval':'Enable retrieval';
   $('#generate-project-graph').disabled=!status.enabled||!status.ready||state.graphContextBusy;
   if(summary){
-    if(!state.project?.root_path)summary.textContent='Set a project folder before indexing project knowledge.';
-    else if(!status.enabled)summary.textContent=`Retrieval is off · ${status.eligible_file_count||0} eligible text files`;
-    else if(!status.ready)summary.textContent=status.embedding?.error||'The selected embedding model is unavailable.';
+    if(state.graphTreeLoading)summary.textContent='Scanning the project tree…';
     else if(state.graphContextBusy){
       const job=state.ragJob||status.job||{}, total=Number(job.total_files||0), done=Number(job.processed_files||0);
       summary.textContent=`Indexing ${done}${total?` of ${total}`:''} files · ${job.embedded_chunks||0} chunks embedded`;
-    }else summary.textContent=`${status.documents||0} files · ${status.chunks||0} searchable chunks · ${status.grounding_policy||'grounded'} policy${status.indexing?.watching?' · watching':''}${status.last_indexed?` · updated ${formatTime(status.last_indexed)}`:''}`;
+    }else if(state.graphScope==='project')summary.textContent=`${fileCount-hiddenCount} indexed · ${hiddenCount} additional file${hiddenCount===1?'':'s'} shown muted${state.graphProjectTruncated?' · tree limited':''}`;
+    else if(!state.project?.root_path)summary.textContent='Set a project folder before indexing project knowledge.';
+    else if(!status.enabled)summary.textContent=`Retrieval is off · ${status.eligible_file_count||0} eligible text files`;
+    else if(!status.ready)summary.textContent=status.embedding?.error||'The selected embedding model is unavailable.';
+    else summary.textContent=`${status.documents||0} files · ${status.chunks||0} searchable chunks · ${status.grounding_policy||'grounded'} policy${status.indexing?.watching?' · watching':''}${status.last_indexed?` · updated ${formatTime(status.last_indexed)}`:''}`;
   }
   box.replaceChildren();
-  if(!state.graphContext.length){
+  box.className='graph-context-tree';box.dataset.scope=state.graphScope;box.setAttribute('role','tree');box.setAttribute('aria-label',state.graphScope==='project'?'Project files, with non-RAG files muted':'RAG-indexed files');
+  if(!items.length){
     const empty=document.createElement('p');
     empty.className='graph-context-empty';
-    empty.textContent=status.enabled?'No files have been indexed yet.':'Enable retrieval to build a private, searchable project index.';
+    empty.textContent=state.graphScope==='project'?'No project files were found.':status.enabled?'No files have been indexed yet.':'Enable retrieval to build a private, searchable project index.';
     box.append(empty);
-  }
-  state.graphContext.forEach(node=>{
-    const card=document.createElement('article');
-    card.className=`graph-context-card ${String(node.id)===String(state.selectedGraphNodeId)?'selected':''}`;
-    card.setAttribute('role','listitem');
-    card.setAttribute('aria-selected',String(String(node.id)===String(state.selectedGraphNodeId)));
-    const heading=document.createElement('h3'), type=document.createElement('span'), detail=document.createElement('p');
-    heading.textContent=node.path||'.'; type.className=`graph-context-type status-${node.status||'unknown'}`; type.textContent=node.status||'unknown';
-    detail.textContent=`${node.chunk_count||0} chunk${Number(node.chunk_count)===1?'':'s'} · ${Math.max(0,Number(node.size||0)/1024).toFixed(1)} KB${node.language?` · ${node.language}`:''}`;
-    const tags=document.createElement('div'); tags.className='graph-context-tags';
-    const indexed=document.createElement('span'); indexed.className='graph-context-tag'; indexed.textContent=node.indexed_at?`Indexed ${formatTime(node.indexed_at)}`:'Not indexed'; tags.append(indexed);
-    if(node.error){const error=document.createElement('span');error.className='graph-context-tag error';error.textContent=node.error;tags.append(error)}
-    card.append(heading,type,detail,tags);
-    card.onclick=()=>selectGraphNode(node,true);
-    box.append(card)
-  });
+  }else renderGraphTreeNode(buildGraphTree(items),box);
   $('#generate-selected-graph').disabled=true;
 }
 function selectGraphNode(node, open=false){
@@ -3645,10 +3895,17 @@ function openGraphContext(node){
 }
 async function loadGraphContext(){
   if(!state.project){
-    state.graphContext=[]; state.ragStatus=null; state.selectedGraphNodeId=null; renderGraphContext(); return
+    state.graphContext=[]; state.graphProjectContext=[]; state.ragStatus=null; state.selectedGraphNodeId=null; renderGraphContext(); return
   }
   state.ragStatus=await api(`/api/projects/${state.project.id}/rag/status`);
   state.graphContext=state.ragStatus.documents_detail||[];
+  if(!state.graphProjectLoaded){
+    state.graphTreeLoading=state.graphScope==='project'; if(state.graphTreeLoading)renderGraphContext();
+    try{
+      const tree=await api(`/api/projects/${state.project.id}/files`);
+      state.graphProjectContext=tree.items||[]; state.graphProjectTruncated=Boolean(tree.truncated);state.graphProjectLoaded=true;
+    }finally{state.graphTreeLoading=false}
+  }
   const job=state.ragStatus.job;
   if(job&&['queued','running'].includes(job.status)){
     state.ragJob=job;state.graphContextBusy=true;
@@ -3656,6 +3913,11 @@ async function loadGraphContext(){
   }
   if(!graphNodeById(state.selectedGraphNodeId))state.selectedGraphNodeId=null;
   renderGraphContext()
+}
+async function setGraphScope(scope){
+  if(!['indexed','project'].includes(scope)||scope===state.graphScope)return;
+  state.graphScope=scope; state.selectedGraphNodeId=null; renderGraphContext();
+  try{await loadGraphContext()}catch(err){state.graphTreeLoading=false;renderGraphContext();alert(err.message)}
 }
 async function scanGraphContext(){
   if(!state.project)return;
@@ -3687,7 +3949,7 @@ function watchRagIndex(projectId,jobId){
   })().finally(async()=>{
     if(state.ragPollPromise===tracked)state.ragPollPromise=null;
     if(state.project?.id===projectId){
-      state.graphContextBusy=false;state.ragJob=null;
+      state.graphContextBusy=false;state.ragJob=null;state.graphProjectLoaded=false;
       await loadGraphContext()
     }
   });
@@ -4229,6 +4491,7 @@ function selectedSkillRoles(){
 function selectedToolsetRoles(){
   return [...document.querySelectorAll('#toolset-agent-checks input:checked')].map(input=>input.value)
 }
+$('#graph-context-scope').onchange=event=>setGraphScope(event.currentTarget.value);
 $('#scan-graph-context').onclick=()=>scanGraphContext();
 $('#generate-project-graph').onclick=()=>generateGraphContext(true);
 $('#generate-selected-graph').onclick=()=>generateGraphContext(true);
@@ -4930,20 +5193,32 @@ async function init(){
 }
 function setupChatEnhancements(){
   const heading=document.querySelector('.agent-heading'), form=$('#chat-form');
-  if($('#history-search')){
-    const input=$('#history-search');
-    input.oninput=()=>{state.historySearch=input.value;renderMessages()};
-    if(!$('#clear-history-search')){
-      const clear=document.createElement('button'); clear.type='button'; clear.id='clear-history-search'; clear.className='composer-action'; clear.textContent='Clear'; clear.title='Clear search';
-      clear.onclick=()=>{input.value='';state.historySearch='';renderMessages();input.focus()}; input.parentElement.append(clear)
-    }
-  }else if(heading){
+  if(!$('#history-search')&&heading){
     const tools=document.createElement('div'); tools.className='chat-tools';
-    tools.innerHTML='<label class="history-search"><span>Search chat</span><input id="history-search" type="search" placeholder="Search this transcript" autocomplete="off"><button id="clear-history-search" type="button" title="Clear search" aria-label="Clear search">×</button></label><span id="history-count" class="history-count"></span>';
-    heading.insertBefore(tools, heading.querySelector('#external-access-button'));
-    const input=tools.querySelector('input');
-    input.oninput=()=>{state.historySearch=input.value;renderMessages()};
-    tools.querySelector('button').onclick=()=>{input.value='';state.historySearch='';renderMessages();input.focus()};
+    tools.innerHTML='<label class="history-search"><span class="sr-only">Search this conversation</span><input id="history-search" type="search" placeholder="Search conversation…" autocomplete="off"><button id="clear-history-search" type="button" title="Clear search" aria-label="Clear search">×</button></label><div class="history-search-results"><span id="history-count" class="history-count" aria-live="polite"></span><button id="history-match-previous" type="button" title="Previous match" aria-label="Previous search match" disabled>↑</button><button id="history-match-next" type="button" title="Next match" aria-label="Next search match" disabled>↓</button></div>';
+    heading.insertBefore(tools, heading.querySelector('#external-access-button'))
+  }
+  const input=$('#history-search'), clear=$('#clear-history-search');
+  if(input){
+    input.oninput=()=>{
+      state.historySearch=input.value;
+      state.historyMatchIndex=0;
+      renderMessages({scrollToHistoryMatch:Boolean(input.value.trim())})
+    };
+    input.onkeydown=event=>{
+      if(event.key!=='Enter'||!state.historySearch.trim())return;
+      event.preventDefault();
+      navigateHistoryMatches(event.shiftKey?-1:1)
+    };
+    if(clear)clear.onclick=()=>{
+      input.value='';
+      state.historySearch='';
+      state.historyMatchIndex=0;
+      renderMessages();
+      input.focus()
+    };
+    $('#history-match-previous')?.addEventListener('click',()=>navigateHistoryMatches(-1));
+    $('#history-match-next')?.addEventListener('click',()=>navigateHistoryMatches(1))
   }
   if(form&&!$('#clear-composer')){
     const send=$('#send-button'), actions=document.createElement('div'); actions.className='composer-actions';

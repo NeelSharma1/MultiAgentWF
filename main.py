@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import os
+import re
 import signal
 import shutil
 import socket
@@ -63,7 +64,8 @@ skill_credentials = LocalCredentialStore(ROOT / "maw" / ".skill-secrets.local")
 projects = ProjectStore(ROOT / "maw" / "workspace.db")
 chat_tasks: set[asyncio.Task] = set()
 rag_tasks: dict[tuple[int, str], asyncio.Task] = {}
-git_run_locks: dict[int, asyncio.Lock] = {}
+# Agent providers may run concurrently in isolated worktrees.  GitWorkflowStore
+# serializes only final patch adoption for each project.
 agent_dispatch_task: asyncio.Task | None = None
 workspace_mcp_http_app = workspace_mcp.streamable_http_app()
 
@@ -830,6 +832,26 @@ async def git_overview(project_id: int):
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.get("/api/projects/{project_id}/git/changes/{change_id}")
+async def git_change_detail(project_id: int, change_id: str):
+    try:
+        return await asyncio.to_thread(team.git.change_detail, project_id, change_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/git/changes/{change_id}/discard")
+async def discard_git_change(project_id: int, change_id: str):
+    try:
+        return await asyncio.to_thread(team.git.discard_change, project_id, change_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GitWorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.put("/api/projects/{project_id}/git")
 async def configure_git(project_id: int, payload: GitWorkflowInput):
     try:
@@ -880,9 +902,12 @@ async def checkout_git_branch(project_id: int, branch: str):
 
 
 @app.delete("/api/projects/{project_id}/git/branches/{branch}")
-async def delete_git_branch(project_id: int, branch: str):
+async def delete_git_branch(project_id: int, branch: str, disable_agent: bool = False):
     try:
-        return await asyncio.to_thread(team.git.delete_branch, project_id, _git_project_root(project_id), branch)
+        return await asyncio.to_thread(
+            team.git.delete_branch, project_id, _git_project_root(project_id), branch,
+            disable_agent=disable_agent,
+        )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except GitWorkflowError as exc:
@@ -1832,43 +1857,71 @@ async def run_chat(run_id: str, role: str, payload: ChatInput) -> None:
             flush=True,
         )
         team.configs.update_chat_run(run_id, "running")
-        async def call_provider() -> dict[str, Any]:
+        async def call_provider(workspace_root: Path | None = None, change_id: str = "") -> dict[str, Any]:
             return await team.chat(
                 role, payload.message.strip(), payload.model, payload.reasoning_effort, payload.project_id,
                 payload.reply_to_id, payload.attachment_ids, payload.record_user_message,
                 payload.user_message_id, payload.temporary_access, run_id, payload.automatic_handoff,
+                workspace_root, change_id,
             )
 
         if team.git.agent_enabled(payload.project_id, role):
-            lock = git_run_locks.setdefault(payload.project_id, asyncio.Lock())
-            async with lock:
-                root = team._project_root(payload.project_id)
-                await asyncio.to_thread(team.git.begin_agent_run, payload.project_id, role, root)
-                result = await call_provider()
+            root = team._project_root(payload.project_id)
+            run = await asyncio.to_thread(team.git.begin_agent_run, payload.project_id, role, root, run_id)
+            result = await call_provider(Path(run["workspace"]), run["change_id"])
+            review_decision = re.search(
+                r"\[\[GIT_REVIEW_(APPROVE|REJECT)\s+change=([a-f0-9]{16,64})\]\]", str(result.get("response") or ""), re.I,
+            )
+            if review_decision:
+                verdict, reviewed_change = review_decision.group(1).lower(), review_decision.group(2)
                 try:
-                    commit = await asyncio.to_thread(
-                        team.git.finish_agent_run, payload.project_id, role, run_id, root, payload.message,
+                    reviewed = await asyncio.to_thread(
+                        team.git.resolve_review, payload.project_id, reviewed_change, role, verdict,
+                        f"{role} returned {verdict}",
                     )
-                except GitWorkflowError as exc:
-                    message = f"Git workflow could not commit this agent run: {exc}"
-                    team.configs.add_message(role, "error", message, "git", "", payload.project_id)
-                    result["ok"] = False
-                    result["response"] = message
-                else:
-                    if commit:
-                        result["git_commit"] = commit
-                        team.configs.add_run_event(
-                            run_id, payload.project_id, role, "git_summary", "completed",
-                            f"Committed {len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''}",
-                            commit,
-                        )
-                        team.configs.add_message(
-                            role, "app",
-                            f"Committed {commit['commit_hash'][:12]} on agent branch '{commit['agent_branch']}' and "
-                            f"merged it into the main branch '{commit['main_branch']}': {commit['message']} "
-                            f"({len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''}).",
-                            "git", commit["commit_hash"], payload.project_id, run_id=run_id,
-                        )
+                    if verdict == "approve":
+                        adopted = await asyncio.to_thread(team.git._adopt_change, reviewed_change, "Apply reviewed change")
+                        result["reviewed_git_change"] = adopted
+                except (KeyError, GitWorkflowError) as exc:
+                    result["response"] += f"\n\nGit review decision could not be applied: {exc}"
+            review_request = re.search(r"\[\[GIT_REVIEW\s+supervisor=([a-z0-9_]{2,80})\]\]", str(result.get("response") or ""), re.I)
+            if review_request:
+                reviewer = review_request.group(1).lower()
+                try:
+                    team.definitions.get(reviewer, payload.project_id)
+                    await asyncio.to_thread(team.git.request_review, payload.project_id, run["change_id"], role, reviewer)
+                    team.send_agent_message(
+                        role, reviewer,
+                        f"Review isolated change {run['change_id']}. Inspect the Git collaboration activity and reply with "
+                        f"[[GIT_REVIEW_APPROVE change={run['change_id']}]] or [[GIT_REVIEW_REJECT change={run['change_id']}]].",
+                        "command", payload.project_id,
+                    )
+                except (KeyError, ValueError, GitWorkflowError) as exc:
+                    result["response"] += f"\n\nGit review could not be routed: {exc}"
+            try:
+                commit = await asyncio.to_thread(
+                    team.git.finish_agent_run, payload.project_id, role, run_id, root, payload.message, run["change_id"],
+                )
+            except GitWorkflowError as exc:
+                message = f"Git workflow could not finalize this agent run: {exc}"
+                team.configs.add_message(role, "error", message, "git", "", payload.project_id)
+                result["ok"] = False
+                result["response"] = message
+            else:
+                if commit:
+                    result["git_commit"] = commit
+                    held = bool(commit.get("held"))
+                    team.configs.add_run_event(
+                        run_id, payload.project_id, role, "git_summary", "warning" if held else "completed",
+                        ("Held agent patch" if held else f"Committed {len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''}"),
+                        commit,
+                    )
+                    if held:
+                        text = f"Held isolated agent patch {commit['change_id'][:12]}: {commit['detail']}"
+                    else:
+                        push_detail = " and pushed" if commit.get("pushed") else " (push pending or unavailable)"
+                        text = f"Committed {commit['commit_hash'][:12]} on your current branch{push_detail}: {commit['message']} ({len(commit['files'])} changed file{'s' if len(commit['files']) != 1 else ''})."
+                    team.configs.add_message(role, "app", text, "git", commit.get("commit_hash", ""), payload.project_id, run_id=run_id)
         else:
             result = await call_provider()
         status = "error" if result.get("ok") is False else "completed"
@@ -2424,6 +2477,22 @@ async def scan_graph_context(payload: GraphScanInput):
         )
         result["items"] = graph_store.list(payload.project_id)
         return result
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except GraphContextError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/files")
+async def project_file_tree(project_id: int):
+    """Return the filesystem shape used by the Project Knowledge explorer."""
+
+    try:
+        project = projects.get(project_id)
+        return await asyncio.to_thread(
+            graph_store.project_tree,
+            graph_project_root(project),
+        )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except GraphContextError as exc:

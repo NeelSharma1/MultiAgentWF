@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -34,11 +35,14 @@ def _relative_git_path(value: str) -> str:
 
 
 class GitWorkflowStore:
-    """Project Git configuration plus durable, per-agent commit summaries."""
+    """Shared-branch Git collaboration with isolated agent worktrees."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
         self.artifact_root = Path(self.db_path).parent / "git-diffs"
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
+        self._apply_locks: dict[int, threading.Lock] = {}
+        self._runs: dict[str, dict[str, Any]] = {}
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS project_git_workflows (
@@ -58,6 +62,22 @@ class GitWorkflowStore:
                 message TEXT NOT NULL, files_json TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL DEFAULT 'committed',
                 pushed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS git_change_sets (
+                id TEXT PRIMARY KEY, project_id INTEGER NOT NULL, role TEXT NOT NULL,
+                run_id TEXT NOT NULL DEFAULT '', target_branch TEXT NOT NULL, base_commit TEXT NOT NULL,
+                patch_path TEXT NOT NULL DEFAULT '', files_json TEXT NOT NULL DEFAULT '[]',
+                state TEXT NOT NULL DEFAULT 'running', review_status TEXT NOT NULL DEFAULT 'not_requested',
+                review_role TEXT NOT NULL DEFAULT '', review_detail TEXT NOT NULL DEFAULT '',
+                commit_hash TEXT NOT NULL DEFAULT '', push_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS git_change_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, change_id TEXT NOT NULL, project_id INTEGER NOT NULL,
+                origin TEXT NOT NULL, event_type TEXT NOT NULL, title TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_git_change_sets_project ON git_change_sets(project_id, created_at DESC)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_git_change_events_change ON git_change_events(change_id, id)")
             workflow_columns = {row[1] for row in db.execute("PRAGMA table_info(project_git_workflows)")}
             if "main_branch" not in workflow_columns:
                 db.execute("ALTER TABLE project_git_workflows ADD COLUMN main_branch TEXT NOT NULL DEFAULT ''")
@@ -140,20 +160,13 @@ class GitWorkflowStore:
         configuration = self.configuration(project_id)
         if enabled and not configuration:
             raise GitWorkflowError("Configure the shared Git branch before enabling Git for an agent")
-        branch = ""
-        if enabled and configuration:
-            repository = self._repository(project_root) if project_root else None
-            if repository:
-                branch = self._agent_branch(repository, role)
-                if self._run(repository, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
-                    self._checkout_main(repository, self._main_branch(configuration))
-                    self._prepare_agent_branch(repository, branch, self._main_branch(configuration))
-                    self._checkout_main(repository, self._main_branch(configuration))
         with self._connect() as db:
             db.execute("""INSERT INTO project_agent_git_settings(project_id,role,enabled) VALUES(?,?,?)
                 ON CONFLICT(project_id,role) DO UPDATE SET enabled=excluded.enabled""",
                        (project_id, role, int(enabled)))
-        return {"project_id": project_id, "role": role, "enabled": bool(enabled), "branch": branch or role}
+        # Role-named branches are legacy-only.  A Git-enabled agent now works
+        # against an isolated snapshot of whichever branch the user has open.
+        return {"project_id": project_id, "role": role, "enabled": bool(enabled), "branch": ""}
 
     def remove_agent(self, project_id: int, role: str) -> None:
         with self._connect() as db:
@@ -163,7 +176,12 @@ class GitWorkflowStore:
         with self._connect() as db:
             db.execute("DELETE FROM project_agent_git_settings WHERE project_id=?", (project_id,))
             db.execute("DELETE FROM agent_git_commits WHERE project_id=?", (project_id,))
+            rows = db.execute("SELECT patch_path FROM git_change_sets WHERE project_id=?", (project_id,)).fetchall()
+            db.execute("DELETE FROM git_change_events WHERE project_id=?", (project_id,))
+            db.execute("DELETE FROM git_change_sets WHERE project_id=?", (project_id,))
             db.execute("DELETE FROM project_git_workflows WHERE project_id=?", (project_id,))
+        for row in rows:
+            Path(str(row[0] or "")).unlink(missing_ok=True)
 
     def configure(self, project_id: int, project_root: Path, main_branch: str, *,
                   initialize: bool = False, remote: str = "", remote_url: str = "") -> dict[str, Any]:
@@ -270,14 +288,10 @@ class GitWorkflowStore:
         agent_items: list[dict[str, Any]] = []
         for agent in agents:
             role = str(agent["role"])
-            branch = self._agent_branch(repository, role)
-            exists = self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
-            merged = bool(main_branch and exists and self._run(
-                repository, "merge-base", "--is-ancestor", f"refs/heads/{branch}", f"refs/heads/{main_branch}", check=False,
-            ).returncode == 0)
             agent_items.append({
                 "role": role, "name": str(agent.get("name") or role), "enabled": self.agent_enabled(project_id, role),
-                "branch": branch, "branch_exists": exists, "merged_into_main": merged,
+                "branch": "", "branch_exists": False, "merged_into_main": False,
+                "mode": "shared-current-branch",
             })
         agent_hashes = {
             value for record in self.agent_commits(project_id)
@@ -285,23 +299,84 @@ class GitWorkflowStore:
         }
         raw_commits = self._run(
             repository, "log", "--all", "--topo-order", "--date=short",
-            "--pretty=format:%H%x1f%P%x1f%D%x1f%h%x1f%an%x1f%ad%x1f%s%x1e",
+            "--pretty=format:%H%x1f%P%x1f%D%x1f%h%x1f%an%x1f%ad%x1f%aI%x1f%s%x1e",
         ).stdout
         commits: list[dict[str, Any]] = []
         for record in raw_commits.split("\x1e"):
             values = record.strip().split("\x1f")
-            if len(values) != 7 or not values[0]:
+            if len(values) != 8 or not values[0]:
                 continue
-            commit_hash, parents, decorations, short_hash, author, date, subject = values
+            commit_hash, parents, decorations, short_hash, author, date, timestamp, subject = values
             commits.append({
                 "hash": commit_hash, "short_hash": short_hash, "parents": parents.split() if parents else [],
-                "decorations": decorations.strip(), "author": author, "date": date, "subject": subject,
+                "decorations": decorations.strip(), "author": author, "date": date, "timestamp": timestamp,
+                "subject": subject,
                 "agent_commit": commit_hash in agent_hashes,
             })
+        # Agent commits intentionally use the configured user's Git identity.  The
+        # workflow database is therefore the authoritative source for separating
+        # them from ordinary commits made directly in this working copy.
+        local_commits = [
+            {**commit, "files": self._file_summaries(repository, commit["hash"])}
+            for commit in commits if not commit["agent_commit"]
+        ]
+        commits_by_hash = {commit["hash"]: commit for commit in commits}
+        with self._connect() as db:
+            change_rows = db.execute("SELECT * FROM git_change_sets WHERE project_id=? ORDER BY created_at DESC LIMIT 100", (project_id,)).fetchall()
+        changes = []
+        for row in change_rows:
+            item = dict(row)
+            item["files"] = json.loads(item.pop("files_json") or "[]")
+            commit = commits_by_hash.get(item.get("commit_hash") or "")
+            if commit:
+                item["commit"] = {
+                    "hash": commit["hash"], "short_hash": commit["short_hash"],
+                    "subject": commit["subject"], "author": commit["author"], "date": commit["date"],
+                }
+            changes.append(item)
+        numstats: dict[str, tuple[int, int]] = {}
+        for line in self._run(repository, "diff", "--numstat", "HEAD").stdout.splitlines():
+            added, removed, path = (line.split("\t", 2) + ["", "", ""])[:3]
+            numstats[path] = (0 if added == "-" else int(added or 0), 0 if removed == "-" else int(removed or 0))
+        working_changes = []
+        for line in self._run(repository, "status", "--porcelain=v1").stdout.splitlines():
+            if len(line) < 4:
+                continue
+            code, path = line[:2], line[3:]
+            if code == "??":
+                state, additions, deletions = "new", 0, 0
+                file_path = path
+            else:
+                file_path = path.split(" -> ")[-1]
+                additions, deletions = numstats.get(file_path, (0, 0))
+                state = "deleted" if "D" in code else "modified"
+            working_changes.append({
+                "path": file_path, "origin": "local", "state": state,
+                "additions": additions, "deletions": deletions,
+            })
+        working_changes.sort(key=lambda item: (item["state"] == "new", item["path"].lower()))
         return {
             **result, "branches": branches, "worktrees": worktrees, "agents": agent_items,
-            "commits": commits, "commits_truncated": False,
+            "commits": commits, "commits_truncated": False, "changes": changes,
+            "working_changes": working_changes, "local_commits": local_commits,
         }
+
+    def change_detail(self, project_id: int, change_id: str) -> dict[str, Any]:
+        change = self._change(change_id)
+        if int(change["project_id"]) != project_id:
+            raise KeyError(f"Unknown Git change {change_id}")
+        patch_path = Path(change.get("patch_path") or "")
+        change["diff"] = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
+        return change
+
+    def discard_change(self, project_id: int, change_id: str) -> dict[str, Any]:
+        change = self.change_detail(project_id, change_id)
+        if change["state"] in {"committed", "pushed"}:
+            raise GitWorkflowError("Committed changes cannot be discarded from the collaboration queue")
+        with self._connect() as db:
+            db.execute("UPDATE git_change_sets SET state='discarded',updated_at=CURRENT_TIMESTAMP WHERE id=?", (change_id,))
+        self._event(change_id, project_id, "user", "discarded", "Discarded held agent patch")
+        return self._change(change_id)
 
     def create_branch(self, project_id: int, project_root: Path, name: str, source: str = "") -> dict[str, str]:
         repository = self._repository(project_root)
@@ -328,17 +403,28 @@ class GitWorkflowStore:
         self._run(repository, "checkout", "--no-guess", branch)
         return {"branch": branch, "main_branch": self._main_branch(configuration)}
 
-    def delete_branch(self, project_id: int, project_root: Path, name: str) -> dict[str, str]:
+    def delete_branch(self, project_id: int, project_root: Path, name: str, *,
+                      disable_agent: bool = False) -> dict[str, Any]:
         configuration, repository = self._configured_repository(project_id, project_root)
         branch = self._validate_branch(repository, name)
         if branch == self._main_branch(configuration):
             raise GitWorkflowError("The configured main branch cannot be deleted")
         if self._run(repository, "branch", "--show-current").stdout.strip() == branch:
             raise GitWorkflowError("Check out another branch before deleting this branch")
-        if self.agent_enabled(project_id, branch):
+        agent_enabled = self.agent_enabled(project_id, branch)
+        if agent_enabled and not disable_agent:
             raise GitWorkflowError("Disable this agent's Git workflow before deleting its branch")
         self._run(repository, "branch", "-d", branch)
-        return {"deleted": branch}
+        if agent_enabled:
+            with self._connect() as db:
+                db.execute(
+                    "UPDATE project_agent_git_settings SET enabled=0 WHERE project_id=? AND role=?",
+                    (project_id, branch),
+                )
+        result: dict[str, Any] = {"deleted": branch}
+        if agent_enabled:
+            result["disabled_agent_git"] = branch
+        return result
 
     def _configured_repository(self, project_id: int, project_root: Path) -> tuple[dict[str, Any], Path]:
         configuration = self.configuration(project_id)
@@ -374,82 +460,222 @@ class GitWorkflowStore:
         else:
             self._run(repository, "symbolic-ref", "HEAD", f"refs/heads/{main_branch}")
 
-    def _prepare_agent_branch(self, repository: Path, agent_branch: str, main_branch: str) -> None:
-        """Start an agent branch at main only after its previous work is merged."""
-        exists = self._run(repository, "show-ref", "--verify", "--quiet", f"refs/heads/{agent_branch}", check=False)
-        if exists.returncode == 0:
-            merged = self._run(repository, "merge-base", "--is-ancestor", f"refs/heads/{agent_branch}",
-                               f"refs/heads/{main_branch}", check=False)
-            if merged.returncode:
-                raise GitWorkflowError(
-                    f"Agent branch '{agent_branch}' has unmerged work. Resolve it before starting another run."
-                )
-            self._run(repository, "branch", "-f", agent_branch, f"refs/heads/{main_branch}")
-            self._run(repository, "checkout", "--no-guess", agent_branch)
-        else:
-            self._run(repository, "checkout", "-b", agent_branch, f"refs/heads/{main_branch}")
-
     def _ensure_initial_main_commit(self, repository: Path, main_branch: str) -> None:
         if self._run(repository, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
             return
-        self._checkout_main(repository, main_branch)
+        # The caller is already on the target branch.  Do not require a clean
+        # worktree merely to establish the empty base commit: untracked local
+        # edits must be allowed alongside an agent run.
         self._run(repository, "commit", "--allow-empty", "-m", "Initialize agent workflow")
 
-    def begin_agent_run(self, project_id: int, role: str, project_root: Path) -> dict[str, str]:
+    @staticmethod
+    def _status_paths(repository: Path) -> set[str]:
+        raw = GitWorkflowStore._run(repository, "status", "--porcelain=v1", "-z").stdout
+        parts = raw.split("\0")
+        paths: set[str] = set()
+        for item in parts:
+            if not item or len(item) < 4:
+                continue
+            paths.add(item[3:].replace("\\", "/"))
+        return paths
+
+    def _event(self, change_id: str, project_id: int, origin: str, event_type: str, title: str,
+               payload: dict[str, Any] | None = None) -> None:
+        with self._connect() as db:
+            db.execute("""INSERT INTO git_change_events(change_id,project_id,origin,event_type,title,payload_json)
+                VALUES(?,?,?,?,?,?)""", (change_id, project_id, origin, event_type, title,
+                                              json.dumps(payload or {}, default=str)))
+
+    def _change(self, change_id: str) -> dict[str, Any]:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM git_change_sets WHERE id=?", (change_id,)).fetchone()
+            events = db.execute("SELECT * FROM git_change_events WHERE change_id=? ORDER BY id", (change_id,)).fetchall()
+        if not row:
+            raise KeyError(f"Unknown Git change {change_id}")
+        result = dict(row)
+        result["files"] = json.loads(result.pop("files_json") or "[]")
+        result["events"] = [{**dict(event), "payload": json.loads(event["payload_json"] or "{}")}
+                            for event in events]
+        return result
+
+    def begin_agent_run(self, project_id: int, role: str, project_root: Path, run_id: str = "") -> dict[str, str]:
+        """Create a detached throwaway worktree without changing the user's checkout."""
         if not self.agent_enabled(project_id, role):
             return {}
         configuration, repository = self._configured_repository(project_id, project_root)
-        if self._run(repository, "status", "--porcelain").stdout.strip():
-            raise GitWorkflowError("The shared working tree has uncommitted changes; resolve them before an agent run")
         name = self._run(repository, "config", "user.name", check=False).stdout.strip()
         email = self._run(repository, "config", "user.email", check=False).stdout.strip()
         if not name or not email:
             raise GitWorkflowError("Configure git user.name and user.email before Git-enabled agents can commit")
-        main_branch = self._main_branch(configuration)
-        self._checkout_main(repository, main_branch, configuration.get("remote", ""))
-        self._ensure_initial_main_commit(repository, main_branch)
-        agent_branch = self._agent_branch(repository, role)
-        self._prepare_agent_branch(repository, agent_branch, main_branch)
+        current_branch = self._run(repository, "branch", "--show-current").stdout.strip()
+        if not current_branch:
+            raise GitWorkflowError("Check out a branch before starting a Git-enabled agent")
+        self._ensure_initial_main_commit(repository, current_branch)
         head = self._run(repository, "rev-parse", "--verify", "HEAD").stdout.strip()
-        return {"repository": str(repository), "base_commit": head, "branch": agent_branch, "main_branch": main_branch}
+        change_id = uuid.uuid4().hex
+        scratch = Path(tempfile.mkdtemp(prefix="maw-agent-worktree-"))
+        try:
+            self._run(repository, "worktree", "add", "--detach", str(scratch), head, timeout=90)
+        except Exception:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
+        self._runs[change_id] = {
+            "repository": repository, "scratch": scratch, "project_id": project_id, "role": role,
+            "run_id": run_id, "base_commit": head, "target_branch": current_branch,
+            "initial_dirty": self._status_paths(repository),
+        }
+        with self._connect() as db:
+            db.execute("""INSERT INTO git_change_sets
+                (id,project_id,role,run_id,target_branch,base_commit,state) VALUES(?,?,?,?,?,?, 'running')""",
+                       (change_id, project_id, role, run_id, current_branch, head))
+        self._event(change_id, project_id, "agent", "workspace_created", "Created isolated agent workspace",
+                    {"branch": current_branch, "base_commit": head, "role": role})
+        return {"repository": str(repository), "base_commit": head, "branch": current_branch,
+                "main_branch": current_branch, "change_id": change_id, "workspace": str(scratch)}
 
     def finish_agent_run(self, project_id: int, role: str, run_id: str, project_root: Path,
-                         user_message: str) -> dict[str, Any] | None:
-        configuration, repository = self._configured_repository(project_id, project_root)
-        agent_branch = self._agent_branch(repository, role)
-        current = self._run(repository, "branch", "--show-current").stdout.strip()
-        if current != agent_branch:
-            raise GitWorkflowError("The agent changed the shared Git branch; no automatic commit was created")
-        if not self._run(repository, "status", "--porcelain").stdout.strip():
-            self._checkout_main(repository, self._main_branch(configuration), configuration.get("remote", ""))
-            return None
-        subject = " ".join(str(user_message or "").split())[:72] or "update workspace"
-        message = f"agent({role}): {subject}"
-        self._run(repository, "add", "-A")
-        self._run(repository, "commit", "-m", message, timeout=60)
-        commit_hash = self._run(repository, "rev-parse", "HEAD").stdout.strip()
-        parent = self._run(repository, "rev-parse", "HEAD^", check=False).stdout.strip()
-        files = self._file_summaries(repository, commit_hash)
-        main_branch = self._main_branch(configuration)
-        self._checkout_main(repository, main_branch, configuration.get("remote", ""))
-        main_parent = self._run(repository, "rev-parse", "HEAD").stdout.strip()
-        merge_message = f"Merge agent {role}: {subject}"
+                         user_message: str, change_id: str = "") -> dict[str, Any] | None:
+        """Persist an isolated patch, then atomically adopt it only if paths remain safe."""
+        run = self._runs.pop(change_id, None)
+        if not run:
+            raise GitWorkflowError("The isolated agent workspace is no longer available")
+        repository, scratch = run["repository"], run["scratch"]
         try:
-            self._run(repository, "merge", "--no-ff", f"refs/heads/{agent_branch}", "-m", merge_message, timeout=60)
-        except GitWorkflowError as exc:
-            raise GitWorkflowError(
-                f"Automatic merge of '{agent_branch}' into '{main_branch}' failed. Resolve the Git merge conflict, then retry. {exc}"
-            ) from exc
-        merge_hash = self._run(repository, "rev-parse", "HEAD").stdout.strip()
+            untracked = self._run(scratch, "ls-files", "--others", "--exclude-standard", "-z").stdout.split("\0")
+            paths = [path for path in untracked if path]
+            if paths:
+                self._run(scratch, "add", "-N", "--", *paths)
+            patch = self._run(scratch, "diff", "--binary", "--full-index", run["base_commit"], timeout=90).stdout
+            names = self._run(scratch, "diff", "--name-status", run["base_commit"]).stdout.splitlines()
+            changed_paths: list[str] = []
+            files: list[dict[str, Any]] = []
+            for entry in names:
+                if not entry:
+                    continue
+                fields = entry.split("\t")
+                status, path = fields[0], fields[-1]
+                if path not in changed_paths:
+                    changed_paths.append(path)
+                    files.append({"path": path, "status": status[:1]})
+            if not patch or not changed_paths:
+                with self._connect() as db:
+                    db.execute("UPDATE git_change_sets SET state='completed',updated_at=CURRENT_TIMESTAMP WHERE id=?", (change_id,))
+                self._event(change_id, project_id, "agent", "no_changes", "Agent made no file changes")
+                return None
+            artifact = self.artifact_root / f"{change_id}.patch"
+            artifact.write_text(patch, encoding="utf-8")
+            with self._connect() as db:
+                db.execute("""UPDATE git_change_sets SET patch_path=?,files_json=?,state='prepared',updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?""", (str(artifact), json.dumps(files), change_id))
+            self._event(change_id, project_id, "agent", "patch_prepared", f"Prepared {len(files)} file change(s)", {"files": files})
+        finally:
+            self._run(repository, "worktree", "remove", "--force", str(scratch), check=False, timeout=90)
+            shutil.rmtree(scratch, ignore_errors=True)
+        change = self._change(change_id)
+        if change["review_status"] in {"requested", "delegated"}:
+            return self._hold(change_id, f"Awaiting review from {change['review_role']}")
+        return self._adopt_change(change_id, user_message, run)
+
+    def _hold(self, change_id: str, detail: str) -> dict[str, Any]:
         with self._connect() as db:
-            db.execute("""INSERT OR IGNORE INTO agent_git_commits
-                (project_id,role,run_id,commit_hash,parent_hash,merge_hash,main_parent_hash,agent_branch,message,files_json,state,pushed)
-                VALUES(?,?,?,?,?,?,?,?,?,?,'committed',0)""",
-                       (project_id, role, run_id, commit_hash, parent, merge_hash, main_parent, agent_branch,
-                        message, json.dumps(files)))
-        record = self.commit(project_id, commit_hash)
-        record["main_branch"] = main_branch
-        return record
+            db.execute("""UPDATE git_change_sets SET state='held_conflict',review_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                       (detail, change_id))
+        change = self._change(change_id)
+        self._event(change_id, int(change["project_id"]), "system", "held", detail, {"files": change["files"]})
+        return {"held": True, "change_id": change_id, "detail": detail, "files": change["files"]}
+
+    def request_review(self, project_id: int, change_id: str, editor_role: str, reviewer_role: str) -> None:
+        change = self._change(change_id)
+        if int(change["project_id"]) != project_id or change["role"] != editor_role:
+            raise GitWorkflowError("Only the editing agent can request review for its active change")
+        with self._connect() as db:
+            db.execute("""UPDATE git_change_sets SET review_status='requested',review_role=?,state='review_requested',
+                updated_at=CURRENT_TIMESTAMP WHERE id=?""", (reviewer_role, change_id))
+        self._event(change_id, project_id, "agent", "review_requested", f"Requested review from {reviewer_role}")
+
+    def resolve_review(self, project_id: int, change_id: str, reviewer_role: str, verdict: str,
+                       detail: str = "", delegate_role: str = "") -> dict[str, Any]:
+        change = self._change(change_id)
+        if int(change["project_id"]) != project_id or change.get("review_role") != reviewer_role:
+            raise GitWorkflowError("Only the selected reviewer can resolve this change")
+        if verdict == "delegate":
+            if not delegate_role:
+                raise GitWorkflowError("A delegated review needs a recipient role")
+            with self._connect() as db:
+                db.execute("UPDATE git_change_sets SET review_role=?,review_status='delegated',state='reviewing',review_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                           (delegate_role, detail, change_id))
+            self._event(change_id, project_id, "agent", "review_delegated", f"Review delegated to {delegate_role}")
+            return self._change(change_id)
+        if verdict not in {"approve", "reject"}:
+            raise GitWorkflowError("Review verdict must be approve, reject, or delegate")
+        state = "approved" if verdict == "approve" else "rejected"
+        with self._connect() as db:
+            db.execute("UPDATE git_change_sets SET review_status=?,state=?,review_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (verdict, state, detail, change_id))
+        self._event(change_id, project_id, "agent", f"review_{verdict}", f"Review {verdict}d", {"detail": detail})
+        return self._change(change_id)
+
+    def _adopt_change(self, change_id: str, user_message: str, run: dict[str, Any] | None = None) -> dict[str, Any]:
+        change = self._change(change_id)
+        repository = Path(run["repository"]) if run else Path((self.configuration(int(change["project_id"])) or {})["repository"])
+        lock = self._apply_locks.setdefault(int(change["project_id"]), threading.Lock())
+        with lock:
+            current_branch = self._run(repository, "branch", "--show-current").stdout.strip()
+            if current_branch != change["target_branch"]:
+                return self._hold(change_id, "Your checked-out branch changed while the agent was working")
+            paths = [str(item["path"]) for item in change["files"]]
+            dirty = self._status_paths(repository)
+            initial_dirty = set((run or {}).get("initial_dirty") or [])
+            overlap = sorted(set(paths) & (dirty | initial_dirty))
+            if overlap:
+                return self._hold(change_id, "Local changes overlap agent paths: " + ", ".join(overlap))
+            head = self._run(repository, "rev-parse", "HEAD").stdout.strip()
+            changed_since_base = [path for path in paths if self._run(repository, "diff", "--quiet", change["base_commit"], head, "--", path, check=False).returncode]
+            if changed_since_base:
+                return self._hold(change_id, "Accepted changes overlap agent paths: " + ", ".join(changed_since_base))
+            patch_path = Path(change["patch_path"])
+            try:
+                self._run(repository, "apply", "--index", "--binary", str(patch_path), timeout=90)
+            except GitWorkflowError as exc:
+                return self._hold(change_id, f"Could not safely apply the agent patch: {exc}")
+            subject = " ".join(str(user_message or "").split())[:72].rstrip(".") or "Update workspace"
+            subject = subject[:1].upper() + subject[1:]
+            try:
+                self._run(repository, "commit", "--only", "-m", subject, "--", *paths, timeout=90)
+            except GitWorkflowError as exc:
+                return self._hold(change_id, f"Patch applied but could not commit only agent paths: {exc}")
+            commit_hash = self._run(repository, "rev-parse", "HEAD").stdout.strip()
+            files = self._file_summaries(repository, commit_hash)
+            with self._connect() as db:
+                db.execute("""INSERT OR IGNORE INTO agent_git_commits
+                    (project_id,role,run_id,commit_hash,parent_hash,message,files_json,state,pushed)
+                    VALUES(?,?,?,?,?,?,?,'committed',0)""",
+                    (change["project_id"], change["role"], change["run_id"], commit_hash,
+                     self._run(repository, "rev-parse", "HEAD^").stdout.strip(), subject, json.dumps(files)))
+                db.execute("UPDATE git_change_sets SET state='committed',commit_hash=?,files_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                           (commit_hash, json.dumps(files), change_id))
+            self._event(change_id, int(change["project_id"]), "agent", "committed", f"Committed {len(files)} file change(s)",
+                        {"commit_hash": commit_hash, "subject": subject})
+            record = self.commit(int(change["project_id"]), commit_hash)
+            record.update({"change_id": change_id, "main_branch": current_branch, "target_branch": current_branch})
+            configuration = self.configuration(int(change["project_id"])) or {}
+            remote = str(configuration.get("remote") or "")
+            if remote:
+                try:
+                    self._run(repository, "push", remote, f"HEAD:refs/heads/{current_branch}", timeout=120)
+                    with self._connect() as db:
+                        db.execute("UPDATE agent_git_commits SET pushed=1 WHERE project_id=? AND commit_hash=?",
+                                   (change["project_id"], commit_hash))
+                        db.execute("UPDATE git_change_sets SET state='pushed',updated_at=CURRENT_TIMESTAMP WHERE id=?", (change_id,))
+                    record["pushed"] = 1
+                    self._event(change_id, int(change["project_id"]), "agent", "pushed", "Pushed current branch", {"remote": remote})
+                except GitWorkflowError as exc:
+                    with self._connect() as db:
+                        db.execute("UPDATE git_change_sets SET state='push_failed',push_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                                   (str(exc), change_id))
+                    record["push_error"] = str(exc)
+                    self._event(change_id, int(change["project_id"]), "system", "push_failed", "Commit created but push failed", {"detail": str(exc)})
+            return record
 
     def _file_summaries(self, repository: Path, commit_hash: str) -> list[dict[str, Any]]:
         # --root ensures the first commit is summarized as a diff against an
@@ -617,7 +843,7 @@ class GitWorkflowStore:
             raise GitWorkflowError("The working tree must be clean before reverting a commit")
         main_branch = self._main_branch(configuration)
         self._checkout_main(repository, main_branch, configuration.get("remote", ""))
-        target = self._resolve_commit(repository, record.get("merge_hash") if record else resolved)
+        target = self._resolve_commit(repository, (record.get("merge_hash") or resolved) if record else resolved)
         parent_count = len(self._run(repository, "show", "-s", "--format=%P", target).stdout.strip().split())
         args = ["revert", "--no-edit"]
         if parent_count > 1:
@@ -814,13 +1040,11 @@ class GitWorkflowStore:
         remotes = self._run(repository, "remote").stdout.splitlines()
         if selected not in remotes:
             raise GitWorkflowError(f"Remote '{selected}' does not exist")
-        main_branch = self._main_branch(configuration)
-        main_ref = f"refs/heads/{main_branch}:refs/heads/{main_branch}"
-        self._run(repository, "push", "--set-upstream", selected, main_ref, timeout=120)
-        agent_branch = record.get("agent_branch") or self._agent_branch(repository, record["role"])
-        agent_ref = f"refs/heads/{agent_branch}:refs/heads/{agent_branch}"
-        self._run(repository, "push", "--set-upstream", selected, agent_ref, timeout=120)
+        branch = self._run(repository, "branch", "--show-current").stdout.strip()
+        if not branch:
+            raise GitWorkflowError("Check out a branch before pushing a shared-workspace change")
+        self._run(repository, "push", selected, f"HEAD:refs/heads/{branch}", timeout=120)
         with self._connect() as db:
             db.execute("UPDATE agent_git_commits SET pushed=1 WHERE project_id=? AND commit_hash=?",
                        (project_id, commit_hash))
-        return {"pushed": commit_hash, "remote": selected, "main_branch": main_branch, "agent_branch": agent_branch}
+        return {"pushed": commit_hash, "remote": selected, "branch": branch}
